@@ -361,10 +361,7 @@ impl<'a> Conn<'a> {
             }
         };
         let setup = format!("set up in {} ms: windows {} ms, capture {} ms", t0.elapsed().as_millis(), t_windows.as_millis(), (t0.elapsed() - t_windows).as_millis());
-        #[cfg(windows)]
-        let pid = if self.sh.demo { 0 } else { input::win::pid_of(id) };
-        #[cfg(not(windows))]
-        let pid = 0;
+        let pid = if self.sh.demo { 0 } else { input::pid_of(id) };
         let fps = fps.filter(|f| f.is_finite()).unwrap_or(30.0).clamp(1.0, 60.0);
         let kind = cap.as_ref().map(|c| c.kind()).unwrap_or("demo");
         crate::log(&format!("watch \"{}\" ({}×{}) with {kind} at {fps:.0} fps (input: {}; {setup})", w.title, w.w, w.h, self.inj.mode.name()));
@@ -512,10 +509,10 @@ impl<'a> Conn<'a> {
             };
             Ok(input::Outcome { applied: true, pointer: p })
         } else {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             {
                 // toujours la meme fenetre de Live (meme processus) qu'a la verification de « watch »
-                if input::win::pid_of(top) != pid {
+                if input::pid_of(top) != pid {
                     let _ = self.input_ack(&raw, recv, now_f(), merged, Some("the plugin window is gone"));
                     return self.stop_watch(Some("the plugin window is gone"));
                 }

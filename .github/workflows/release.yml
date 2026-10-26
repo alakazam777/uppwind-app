@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+# Uppwind Link -- a release, on a tag v*: builds uppwind-companion.exe exactly as RELEASING.md step 4 says, checks it
+# (step 5), attests its provenance and publishes ONLY the exe and SHA256SUMS (never the .pdb or target/).
+# macOS is not released yet (not notarized, not yet tried in a real DAW).
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.99.1"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  release:
+    name: Windows release
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+          rustc -V
+      - name: The tag matches the companion's version
+        run: |
+          $line = Select-String -Path companion/Cargo.toml -Pattern '^version = "(.+)"$' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME but companion/Cargo.toml says $version" }
+          "version $version"
+      - name: Tests
+        run: |
+          cargo test --release --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I tests/test_protocol.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I tests/test_fl_script.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I tests/test_ableton.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I dev/third_party_notices.py --check
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      # RELEASING.md step 4: from the repository folder (.cargo/config.toml applies), the path remapping added with
+      # --config (never RUSTFLAGS), a fresh target folder, --locked
+      - name: Build (RELEASING.md step 4)
+        run: |
+          if ($env:CARGO_HOME) { $cargoHome = $env:CARGO_HOME } else { $cargoHome = Join-Path $env:USERPROFILE '.cargo' }
+          $src = $env:GITHUB_WORKSPACE
+          if (Test-Path companion/target) { Remove-Item -Recurse -Force companion/target }
+          "CARGO_HOME=$cargoHome"
+          "checkout folder=$src"
+          cargo --config "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$cargoHome=/cargo', '--remap-path-prefix=$src=/src']" build --release --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Check the program (RELEASING.md step 5)
+        run: python -I dev/release_check.py companion/target/release/uppwind-companion.exe
+      - name: The files of the release
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item companion/target/release/uppwind-companion.exe dist/uppwind-companion.exe
+          $hash = (Get-FileHash -Algorithm SHA256 dist/uppwind-companion.exe).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'dist/SHA256SUMS'), "$hash  uppwind-companion.exe`n")
+          Get-Content dist/SHA256SUMS
+          Get-ChildItem dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/uppwind-companion.exe
+            dist/SHA256SUMS
+      - name: Release notes
+        run: |
+          $rustc = (rustc -V)
+          $hash = (Get-Content dist/SHA256SUMS).Split(' ')[0]
+          $repo = $env:GITHUB_REPOSITORY
+          $notes = @(
+            "Uppwind Link companion $env:GITHUB_REF_NAME for Windows 10 (version 2004 or later) and Windows 11, 64-bit."
+            ""
+            "**What it is.** ``uppwind-companion.exe`` is the local program that lets Uppwind Studio (https://uppwind.lucasmoreau.fr/atelier) show and play the windows of the plugins hosted in Ableton Live, and bring the sound of Ableton Live or FL Studio back to the studio without a virtual cable. It listens on 127.0.0.1 only and never connects to the internet. Double-click it: a setup window installs it for your Windows account (no administrator rights) and the DAW scripts you tick. See the README for the security model and the pairing."
+            ""
+            "**Unsigned:** Windows SmartScreen will show *More info* → *Run anyway*. Verify the file first:"
+            ""
+            "- SHA-256 (also in ``SHA256SUMS``): ``$hash``"
+            "  - PowerShell: ``Get-FileHash uppwind-companion.exe``"
+            "- Built by GitHub Actions from this tag, with an artifact attestation: ``gh attestation verify uppwind-companion.exe --repo $repo``"
+            ""
+            "**Rebuild it byte for byte** (RELEASING.md, steps 4 and 5): $rustc, Visual Studio build tools of the ``windows-2025`` runner, build folder ``$env:GITHUB_WORKSPACE``, ``cargo build --release --locked`` with the ``--remap-path-prefix`` flags of RELEASING.md."
+            ""
+            "Assets: ``uppwind-companion.exe`` and ``SHA256SUMS`` only. The DAW scripts are in the repository (and inside the exe)."
+            ""
+            "**macOS coming:** the companion builds and passes its tests on macOS, but it is not notarized nor tried in a real DAW yet, so there is no Mac download in this release."
+          )
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'notes.md'), ($notes -join "`n") + "`n")
+          Get-Content (Join-Path $env:RUNNER_TEMP 'notes.md')
+      - name: Publish the GitHub release (the exe and SHA256SUMS, nothing else)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME dist/uppwind-companion.exe dist/SHA256SUMS --repo $env:GITHUB_REPOSITORY --title "Uppwind Link companion $env:GITHUB_REF_NAME" --notes-file (Join-Path $env:RUNNER_TEMP 'notes.md') --verify-tag
+          if ($LASTEXITCODE -ne 0) { exit 1 }

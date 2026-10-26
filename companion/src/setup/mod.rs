@@ -239,12 +239,21 @@ fn machine_checks(r: &Report) -> Vec<Check> {
             (Some(_), true) => "create them in loopMIDI (type the name, click +)",
             (Some(_), false) => "start loopMIDI (its tray icon has Autostart), then create them",
             (None, _) if cfg!(windows) => "install loopMIDI (tobias-erichsen.de), then create them",
-            (None, _) => "Audio MIDI Setup › IAC Driver: Device is online, add the two buses",
+            // (26 oct.) macOS : le compagnon cree lui-meme les deux ports (CoreMIDI, midi_ports.rs) tant qu'il tourne
+            (None, _) => "start the companion (it creates them on macOS while it runs), or Audio MIDI Setup › IAC Driver: Device is online, add the two buses",
         };
         c.push(Check::todo("midi.ports", &format!("MIDI port{} {} missing: {how}.", if miss.len() > 1 { "s" } else { "" }, miss.join(" and "))));
     }
     if all && r.midi.loopmidi.is_some() && !r.midi.loopmidi_running {
         c.push(Check::info("midi.loopmidi", "The ports exist but loopMIDI is not running: another driver provides them."));
+    }
+    if cfg!(target_os = "macos") {
+        // (26 oct.) pas encore de capture d'un processus sur Mac (Core Audio process taps, macOS 14.2+ : a faire) :
+        // le son revient par le plugin
+        c.push(Check::info(
+            "audio.return",
+            "Audio return on macOS: put the \"Uppwind Link Return\" plugin (VST3, ~/Library/Audio/Plug-Ins/VST3) on your DAW's master; it sends the sound to the companion. No virtual cable needed.",
+        ));
     }
     if cfg!(windows) {
         // le son du DAW revient par le compagnon lui-meme (la capture d'un processus, Windows 10 2004 et apres) :
@@ -530,17 +539,25 @@ fn print_text(r: &Report) {
     }
     println!();
     println!("Computer: {}{}", r.os.name, if r.os.build > 0 { format!(" (build {})", r.os.build) } else { String::new() });
-    let lm = r.midi.loopmidi.as_ref().map(|p| format!("loopMIDI {}{}", p.version, if r.midi.loopmidi_running { ", running" } else { ", not running" })).unwrap_or("loopMIDI not installed".into());
+    let lm = if cfg!(target_os = "macos") && !r.fake_machine {
+        "CoreMIDI".to_string()
+    } else {
+        r.midi.loopmidi.as_ref().map(|p| format!("loopMIDI {}{}", p.version, if r.midi.loopmidi_running { ", running" } else { ", not running" })).unwrap_or("loopMIDI not installed".into())
+    };
     println!("MIDI: {lm}; inputs: {}", if r.midi.inputs.is_empty() { "none".into() } else { r.midi.inputs.join(", ") });
     println!("      outputs: {}", if r.midi.outputs.is_empty() { "none".into() } else { r.midi.outputs.join(", ") });
     let ep = |e: &Option<Endpoint>| e.as_ref().map(|e| format!("\"{}\" {} Hz", e.name, e.rate)).unwrap_or("missing".into());
-    println!(
-        "Audio return: {}; VB-CABLE (optional fallback) {}, playback {}, recording {}",
-        if r.os.build >= NO_CABLE_BUILD { "by the companion, no cable needed" } else { "this Windows needs VB-CABLE" },
-        if r.audio.vbcable.is_some() { "installed" } else { "not installed" },
-        ep(&r.audio.cable_input),
-        ep(&r.audio.cable_output)
-    );
+    if cfg!(target_os = "macos") && !r.fake_machine {
+        println!("Audio return: the \"Uppwind Link Return\" plugin on the DAW's master");
+    } else {
+        println!(
+            "Audio return: {}; VB-CABLE (optional fallback) {}, playback {}, recording {}",
+            if r.os.build >= NO_CABLE_BUILD { "by the companion, no cable needed" } else { "this Windows needs VB-CABLE" },
+            if r.audio.vbcable.is_some() { "installed" } else { "not installed" },
+            ep(&r.audio.cable_input),
+            ep(&r.audio.cable_output)
+        );
+    }
     println!();
     let a = &r.ableton;
     if a.found() {
@@ -981,10 +998,16 @@ pub(crate) mod tests {
         assert!(r.scripts[0].dir.ends_with(Path::new("User Library").join("Remote Scripts").join("UppwindLink")));
         assert!(r.scripts[1].dir.ends_with(Path::new("Image-Line").join("FL Studio").join("Settings").join("Hardware").join("Uppwind Link")));
         assert_eq!(state(&r, "midi.ports"), Some(State::Ok));
-        // (24 oct.) le son revient par le compagnon : VB-CABLE, installe ici, n'est qu'un secours
-        assert_eq!(state(&r, "audio.return"), Some(State::Ok));
-        assert_eq!(state(&r, "audio.cable"), Some(State::Info));
-        assert_eq!(state(&r, "audio.rate"), Some(State::Info), "CABLE Input at 44.1 kHz only matters with the cable");
+        // (24 oct.) le son revient par le compagnon : VB-CABLE, installe ici, n'est qu'un secours ; (26 oct.) sur Mac,
+        // par le plugin Return (une information, pas de VB-CABLE)
+        if cfg!(windows) {
+            assert_eq!(state(&r, "audio.return"), Some(State::Ok));
+            assert_eq!(state(&r, "audio.cable"), Some(State::Info));
+            assert_eq!(state(&r, "audio.rate"), Some(State::Info), "CABLE Input at 44.1 kHz only matters with the cable");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(state(&r, "audio.return"), Some(State::Info));
+            assert_eq!(state(&r, "audio.cable"), None);
+        }
         assert_eq!(state(&r, "ableton.script"), Some(State::Todo));
         assert_eq!(state(&r, "ableton.rate"), Some(State::Info), "44.1 kHz is fine without the cable");
         assert!(r.checks.iter().all(|c| !(c.state == State::Todo && c.text.contains("VB-CABLE"))), "VB-CABLE is never a to-do here: {:#?}", r.checks);
@@ -1103,8 +1126,9 @@ pub(crate) mod tests {
         std::fs::write(dir.join("mine.txt"), "keep me").unwrap();
         let r = gather(&p, &o, "20261024-090100");
         assert_eq!(r.scripts[0].action, Action::Update);
-        // un script dont un nom de fichier est interdit par Windows : l'ecriture echoue apres la sauvegarde
-        static BAD: &[(&str, &[u8])] = &[("device_UppwindLink.py", b"SCRIPT_VERSION = \"2.0.0\"\n"), ("bad<name>.py", b"x")];
+        // un script dont un nom de fichier est interdit (un NUL : refuse par Windows comme par macOS) : l'ecriture
+        // echoue apres la sauvegarde
+        static BAD: &[(&str, &[u8])] = &[("device_UppwindLink.py", b"SCRIPT_VERSION = \"2.0.0\"\n"), ("bad\0name.py", b"x")];
         let b = scripts::Bundle { daw: Daw::Fl, folder: "Uppwind Link", files: BAD, version_file: "device_UppwindLink.py" };
         let e = scripts::apply_with(&r.scripts[0], &b).unwrap_err();
         assert!(e.contains("put back"), "{e}");

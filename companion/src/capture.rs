@@ -197,9 +197,15 @@ pub fn best_offset(surf: &Frame, reference: &Frame, guess: (i32, i32), r: i32, s
     best
 }
 
-#[cfg(not(windows))]
+/// macOS (26 oct.) : CGWindowListCreateImage (macos.rs), la seule voie pour l'instant (--capture n'y change rien).
+#[cfg(target_os = "macos")]
+pub fn open(id: u64, _force: Option<&str>) -> Result<Box<dyn Capturer>, String> {
+    Ok(Box::new(crate::macos::WindowCapture::open(id)?))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn open(_hwnd: u64, _force: Option<&str>) -> Result<Box<dyn Capturer>, String> {
-    Err("capture needs Windows".into())
+    Err("capture needs Windows or macOS".into())
 }
 
 /// Le rectangle (x, y, w, h) de la zone client dans l'image de la fenetre entiere, borne a l'image.

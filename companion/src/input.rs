@@ -334,11 +334,14 @@ pub struct Injector {
     key_target: u64,
     /// FOCUS : le geste en cours, rejoue au relachement.
     pending: Vec<Step>,
+    /// macOS : le nombre de clics du dernier appui (2 apres un double clic), repris par le relachement
+    #[allow(dead_code)]
+    mac_clicks: i64,
 }
 
 impl Default for Injector {
     fn default() -> Self {
-        Injector { mode: Mode::Direct, drag: None, key_target: 0, pending: Vec::new() }
+        Injector { mode: Mode::Direct, drag: None, key_target: 0, pending: Vec::new(), mac_clicks: 1 }
     }
 }
 
@@ -454,10 +457,235 @@ impl Injector {
         }
     }
 
-    #[cfg(not(windows))]
-    pub fn handle(&mut self, _top: u64, _ev: &InputEvent) -> Result<Outcome, String> {
-        Err("input needs Windows".into())
+    /// macOS (26 oct.) : les gestes postes a l'appli de la fenetre (CGEventPostToPid), en coordonnees de l'ecran.
+    /// L'image du studio couvre la fenetre entiere (sa barre de titre comprise) : le point de l'image → le point de la
+    /// fenetre (en points) → l'ecran. Un seul mode (direct) ; FOCUS n'existe pas encore sur Mac.
+    #[cfg(target_os = "macos")]
+    pub fn handle(&mut self, top: u64, ev: &InputEvent) -> Result<Outcome, String> {
+        let w = crate::macos::window(top).ok_or("the plugin window is gone")?;
+        let (pid, b) = (w.pid.max(0) as u32, w.bounds);
+        let (cw, ch) = (b.size.width.round() as i32, b.size.height.round() as i32);
+        let screen = |p: (i32, i32)| (b.origin.x + p.0 as f64, b.origin.y + p.1 as f64);
+        match ev {
+            InputEvent::Pointer { action, pt, button, buttons, mods } => {
+                let p = map_point(pt, cw, ch);
+                if matches!(action, PointerAction::DblClick) {
+                    self.mac_clicks = 2;
+                } else if matches!(action, PointerAction::Down) {
+                    self.mac_clicks = 1;
+                }
+                for m in mac_pointer_events(*action, *button, *buttons, *mods, screen(p), self.mac_clicks) {
+                    crate::macos::post_mouse(pid, &m)?;
+                }
+                match action {
+                    PointerAction::Down | PointerAction::DblClick => self.drag = Some(top),
+                    PointerAction::Up if *buttons == 0 => self.drag = None,
+                    _ => {}
+                }
+                Ok(Outcome { applied: true, pointer: Some(p) })
+            }
+            InputEvent::Wheel { pt, dx, dy, mods } => {
+                let p = map_point(pt, cw, ch);
+                let (wx, wy) = mac_wheel(*dx, *dy);
+                crate::macos::post_wheel(pid, screen(p), wx, wy, mac_flags(*mods))?;
+                Ok(Outcome { applied: true, pointer: Some(p) })
+            }
+            InputEvent::Key { down, key, code, mods } => {
+                let Some(kc) = mac_keycode_of_code(code) else { return Err("this key is not sent to plugins".into()) };
+                let text: Vec<u16> = if *down { chars_for_key(key, *mods) } else { Vec::new() };
+                crate::macos::post_key(pid, kc, *down, &text, mac_flags(*mods))?;
+                Ok(Outcome { applied: true, pointer: None })
+            }
+            InputEvent::Text { text } => {
+                // une touche neutre (Espace, code 49) qui porte le texte : AppKit lit les caracteres de l'evenement
+                let u: Vec<u16> = text.encode_utf16().collect();
+                for chunk in u.chunks(20) {
+                    crate::macos::post_key(pid, 49, true, chunk, 0)?;
+                    crate::macos::post_key(pid, 49, false, chunk, 0)?;
+                }
+                Ok(Outcome { applied: true, pointer: None })
+            }
+        }
     }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn handle(&mut self, _top: u64, _ev: &InputEvent) -> Result<Outcome, String> {
+        Err("input needs Windows or macOS".into())
+    }
+}
+
+/// Le pid de l'appli d'une fenetre (0 : fermee, ou un systeme sans gestes).
+pub fn pid_of(id: u64) -> u32 {
+    #[cfg(windows)]
+    {
+        win::pid_of(id)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::window_pid(id)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = id;
+        0
+    }
+}
+
+// ── macOS : les evenements CoreGraphics (fonctions pures, testees partout ; l'envoi est dans macos.rs) ──────────
+
+#[allow(unused_imports)]
+pub use mac_events::*;
+
+/// (appeles seulement sur Mac ; compiles et testes partout)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod mac_events {
+use super::PointerAction;
+
+/// Les types CGEventType utilises.
+pub const CG_LEFT_DOWN: u32 = 1;
+pub const CG_LEFT_UP: u32 = 2;
+pub const CG_RIGHT_DOWN: u32 = 3;
+pub const CG_RIGHT_UP: u32 = 4;
+pub const CG_MOVED: u32 = 5;
+pub const CG_LEFT_DRAGGED: u32 = 6;
+pub const CG_RIGHT_DRAGGED: u32 = 7;
+pub const CG_OTHER_DOWN: u32 = 25;
+pub const CG_OTHER_UP: u32 = 26;
+pub const CG_OTHER_DRAGGED: u32 = 27;
+
+/// Un evenement souris de CoreGraphics : type, bouton (0 gauche, 1 droit, 2 milieu), point de l'ecran, nombre de
+/// clics (kCGMouseEventClickState), drapeaux des touches de modification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MacMouse {
+    pub ty: u32,
+    pub button: u32,
+    pub x: f64,
+    pub y: f64,
+    pub clicks: i64,
+    pub flags: u64,
+}
+
+/// Maj 1, Ctrl 2, Alt 4, Meta 8 (le studio) → kCGEventFlagMask{Shift, Control, Alternate, Command}.
+pub fn mac_flags(mods: u8) -> u64 {
+    let mut f = 0;
+    if mods & 1 != 0 {
+        f |= 0x0002_0000;
+    }
+    if mods & 2 != 0 {
+        f |= 0x0004_0000;
+    }
+    if mods & 4 != 0 {
+        f |= 0x0008_0000;
+    }
+    if mods & 8 != 0 {
+        f |= 0x0010_0000;
+    }
+    f
+}
+
+/// Un geste du studio → les evenements CoreGraphics. Le bouton du DOM : 0 gauche, 1 milieu, 2 droit ; `buttons` : les
+/// boutons tenus (1 gauche, 2 droit, 4 milieu). Un double clic : un appui avec clicks = 2 (AppKit compte les clics par
+/// ce champ, pas par le temps entre deux evenements postes).
+pub fn mac_pointer_events(action: PointerAction, button: u8, buttons: u8, mods: u8, at: (f64, f64), clicks: i64) -> Vec<MacMouse> {
+    let (down, up, cg_button) = match button {
+        2 => (CG_RIGHT_DOWN, CG_RIGHT_UP, 1),
+        1 => (CG_OTHER_DOWN, CG_OTHER_UP, 2),
+        _ => (CG_LEFT_DOWN, CG_LEFT_UP, 0),
+    };
+    let flags = mac_flags(mods);
+    let ev = |ty: u32, b: u32, c: i64| MacMouse { ty, button: b, x: at.0, y: at.1, clicks: c, flags };
+    match action {
+        PointerAction::Down => vec![ev(down, cg_button, 1)],
+        PointerAction::DblClick => vec![ev(down, cg_button, 2)],
+        PointerAction::Up => vec![ev(up, cg_button, clicks.max(1))],
+        PointerAction::Move => {
+            let (ty, b) = if buttons & 1 != 0 {
+                (CG_LEFT_DRAGGED, 0)
+            } else if buttons & 2 != 0 {
+                (CG_RIGHT_DRAGGED, 1)
+            } else if buttons & 4 != 0 {
+                (CG_OTHER_DRAGGED, 2)
+            } else {
+                (CG_MOVED, 0)
+            };
+            vec![ev(ty, b, 0)]
+        }
+    }
+}
+
+/// La molette du DOM (pixels, vers le bas positif) → (horizontal, vertical) de CoreGraphics en pixels (vers le haut
+/// positif), bornes.
+pub fn mac_wheel(dx: f64, dy: f64) -> (i32, i32) {
+    let c = |v: f64| (-v).round().clamp(-10_000.0, 10_000.0) as i32;
+    (c(dx), c(dy))
+}
+
+/// KeyboardEvent.code → le code virtuel macOS (kVK_*, la position sur un clavier ANSI ; le caractere, lui, part avec
+/// l'evenement depuis `key`). None : pas envoye aux plugins.
+pub fn mac_keycode_of_code(code: &str) -> Option<u16> {
+    const LETTERS: [u16; 26] = [
+        0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F, 0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06,
+    ];
+    const DIGITS: [u16; 10] = [0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19];
+    const PAD: [u16; 10] = [0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5B, 0x5C];
+    const FKEYS: [u16; 20] = [0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F, 0x69, 0x6B, 0x71, 0x6A, 0x40, 0x4F, 0x50, 0x5A];
+    let b = code.as_bytes();
+    if code.len() == 4 && code.starts_with("Key") && b[3].is_ascii_uppercase() {
+        return Some(LETTERS[(b[3] - b'A') as usize]);
+    }
+    if code.len() == 6 && code.starts_with("Digit") && b[5].is_ascii_digit() {
+        return Some(DIGITS[(b[5] - b'0') as usize]);
+    }
+    if code.len() == 7 && code.starts_with("Numpad") && b[6].is_ascii_digit() {
+        return Some(PAD[(b[6] - b'0') as usize]);
+    }
+    if let Some(n) = code.strip_prefix('F').and_then(|s| s.parse::<usize>().ok()) {
+        return (1..=20).contains(&n).then(|| FKEYS[n - 1]);
+    }
+    Some(match code {
+        "Enter" => 0x24,
+        "NumpadEnter" => 0x4C,
+        "Escape" => 0x35,
+        "Backspace" => 0x33,
+        "Tab" => 0x30,
+        "Space" => 0x31,
+        "ArrowLeft" => 0x7B,
+        "ArrowRight" => 0x7C,
+        "ArrowDown" => 0x7D,
+        "ArrowUp" => 0x7E,
+        "PageUp" => 0x74,
+        "PageDown" => 0x79,
+        "End" => 0x77,
+        "Home" => 0x73,
+        "Delete" => 0x75,
+        "ShiftLeft" => 0x38,
+        "ShiftRight" => 0x3C,
+        "ControlLeft" => 0x3B,
+        "ControlRight" => 0x3E,
+        "AltLeft" => 0x3A,
+        "AltRight" => 0x3D,
+        "MetaLeft" => 0x37,
+        "MetaRight" => 0x36,
+        "NumpadMultiply" => 0x43,
+        "NumpadAdd" => 0x45,
+        "NumpadSubtract" => 0x4E,
+        "NumpadDecimal" => 0x41,
+        "NumpadDivide" => 0x4B,
+        "Semicolon" => 0x29,
+        "Equal" => 0x18,
+        "Comma" => 0x2B,
+        "Minus" => 0x1B,
+        "Period" => 0x2F,
+        "Slash" => 0x2C,
+        "Backquote" => 0x32,
+        "BracketLeft" => 0x21,
+        "Backslash" => 0x2A,
+        "BracketRight" => 0x1E,
+        "Quote" => 0x27,
+        "IntlBackslash" => 0x0A,
+        _ => return None,
+    })
+}
 }
 
 #[cfg(windows)]
@@ -1122,5 +1350,48 @@ mod tests {
         assert!(s.len() <= MAX_STEPS + 2, "{}", s.len());
         assert_eq!(s[0], Step::Down { button: 0, p: (0, 0) });
         assert_eq!(s.last(), Some(&Step::Up { button: 0, p: (399, 399) }));
+    }
+}
+
+/// (26 oct.) les evenements macOS, composes sans macOS.
+#[cfg(test)]
+mod mac_tests {
+    use super::*;
+
+    #[test]
+    fn mac_mouse_events_for_clicks_drags_and_double_clicks() {
+        let at = (100.0, 50.0);
+        assert_eq!(mac_pointer_events(PointerAction::Down, 0, 1, 0, at, 1), vec![MacMouse { ty: CG_LEFT_DOWN, button: 0, x: 100.0, y: 50.0, clicks: 1, flags: 0 }]);
+        assert_eq!(mac_pointer_events(PointerAction::Move, 0, 1, 0, at, 1)[0].ty, CG_LEFT_DRAGGED);
+        assert_eq!(mac_pointer_events(PointerAction::Move, 0, 0, 0, at, 1)[0].ty, CG_MOVED);
+        assert_eq!(mac_pointer_events(PointerAction::Move, 0, 4, 0, at, 1)[0].ty, CG_OTHER_DRAGGED);
+        let r = mac_pointer_events(PointerAction::Down, 2, 2, 1, at, 1);
+        assert_eq!((r[0].ty, r[0].button, r[0].flags), (CG_RIGHT_DOWN, 1, 0x0002_0000));
+        assert_eq!(mac_pointer_events(PointerAction::DblClick, 0, 1, 0, at, 2)[0].clicks, 2);
+        assert_eq!(mac_pointer_events(PointerAction::Up, 0, 0, 0, at, 2)[0], MacMouse { ty: CG_LEFT_UP, button: 0, x: 100.0, y: 50.0, clicks: 2, flags: 0 });
+        assert_eq!(mac_pointer_events(PointerAction::Up, 1, 0, 0, at, 1)[0].ty, CG_OTHER_UP);
+    }
+
+    #[test]
+    fn mac_modifiers_wheel_and_keys() {
+        assert_eq!(mac_flags(1 | 2 | 4 | 8), 0x001E_0000);
+        assert_eq!(mac_wheel(0.0, 100.0), (0, -100), "down in the DOM is a negative wheel in CoreGraphics");
+        assert_eq!(mac_wheel(-30.4, 0.0), (30, 0));
+        assert_eq!(mac_keycode_of_code("KeyA"), Some(0x00));
+        assert_eq!(mac_keycode_of_code("KeyZ"), Some(0x06));
+        assert_eq!(mac_keycode_of_code("KeyQ"), Some(0x0C));
+        assert_eq!(mac_keycode_of_code("Digit0"), Some(0x1D));
+        assert_eq!(mac_keycode_of_code("Digit5"), Some(0x17));
+        assert_eq!(mac_keycode_of_code("F1"), Some(0x7A));
+        assert_eq!(mac_keycode_of_code("F12"), Some(0x6F));
+        assert_eq!(mac_keycode_of_code("F21"), None);
+        assert_eq!(mac_keycode_of_code("Space"), Some(0x31));
+        assert_eq!(mac_keycode_of_code("ArrowUp"), Some(0x7E));
+        assert_eq!(mac_keycode_of_code("Numpad7"), Some(0x59));
+        assert_eq!(mac_keycode_of_code("AudioVolumeUp"), None);
+        // toutes les touches que Windows envoie, macOS aussi (Insert mis a part : pas de touche Insert sur Mac)
+        for c in ["Enter", "Escape", "Backspace", "Tab", "Semicolon", "Quote", "Backquote", "IntlBackslash", "NumpadDivide", "Delete", "Home"] {
+            assert!(vk_of_code(c).is_some() && mac_keycode_of_code(c).is_some(), "{c}");
+        }
     }
 }

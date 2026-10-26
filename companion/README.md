@@ -134,6 +134,23 @@ Limits: text messages up to 16 KB, at most 1000 messages per second, a connectio
 
 Known limits: the Live and companion state files are readable by any program running under your account (like your other files); the program is not signed yet; a program that names itself `Ableton Live….exe` and imitates Live's windows would be treated as Live (it already runs as you).
 
+## macOS (first milestone, 26 Oct 2026)
+
+`sh dev/build-macos.sh` (from `tools/uppwind-link`) builds the companion and the plugins for Apple silicon and Intel, joins them with `lipo` and signs them ad hoc. The console companion works the same way as on Windows, with these differences:
+
+| Part | macOS | Status |
+|---|---|---|
+| Plugin windows of Live | `CGWindowListCopyWindowInfo`, Live's windows titled `plugin/track` (`src/macos.rs`, `plugins.rs`) | built; titles need **Screen Recording** |
+| Capture | `CGWindowListCreateImage` for one window, looked up at run time | built; needs **Screen Recording**. TODO: ScreenCaptureKit once Apple removes it |
+| Clicks, wheel, keys | `CGEventPostToPid` to Live, in screen coordinates (`input.rs`) | built; needs **Accessibility**; Focus mode does not exist on Mac yet |
+| MIDI ports | the companion creates `Uppwind Link` and `Uppwind Link Back` itself (CoreMIDI, `src/midi_ports.rs`) while it runs; `--no-midi-ports` turns them off | built, not yet tried with FL or Chrome |
+| DAW's sound | the **Uppwind Link Return** plugin on the master (tested end to end with the test host) | works. TODO: Core Audio process taps (macOS 14.2+) to capture an app without the plugin |
+| `--install`, `--autostart`, `--background`, `--stop` | `~/Library/Application Support/Uppwind Link/uppwind-companion`, a LaunchAgent `~/Library/LaunchAgents/com.uppwind.link.companion.plist` (written, never loaded by the companion: it starts at the next login) | built and tested in a temporary folder |
+| `--setup` | Live: `~/Library/Preferences/Ableton`, `~/Music/Ableton/User Library`; FL: `/Applications/FL Studio *.app`, `~/Documents/Image-Line` | built; FL's MIDI settings are not read on Mac (no registry) |
+| Setup window, notification icon | `src/ui` builds on WKWebView; the icon (`src/tray`) and the setup window's install steps stay Windows-only | TODO |
+
+`--list` prints whether Screen Recording and Accessibility are allowed, without asking (no macOS prompt). The first capture makes macOS ask.
+
 ## Files
 
 `src/main.rs` (options, state file, listening), `src/session.rs` (a connection: handshake, pairing, messages, frames, audio), `src/security.rs` (Host, Origin, token), `src/protocol.rs`, `src/plugins.rs` (Live's plugin windows), `src/popups.rs` (a plugin's menus), `src/capture.rs` (WGC, DWM surface, PrintWindow), `src/stream.rs` (the capture thread: tiles, gestures), `src/encode.rs` (JPEG), `src/input.rs` (Direct and Focus input), `src/live.rs` (the Live script's local channel), `src/link_relay.rs` (the studio's link to the Live script without MIDI ports), `src/audio/` (process loopback, packets, the allow-list), `src/plugin_link/` (the Uppwind Link plugins' listener: Return's sound, Notes' MIDI), `src/install.rs`, `src/setup/` (`--setup`), `src/wizard/` (first launch, the setup window's steps, install and uninstall, the *Installed apps* entry), `src/ui/` (the WebView2 window, its IPC, the pages in `web/`), `src/tray/` (the icon, the single instance, the status window), `src/bench.rs`, `src/testwin.rs`, `build.rs` (embeds the DAW scripts and the UI assets: explicit lists), `build/winres.rs` (the exe's icon and version block, written without `rc.exe`).

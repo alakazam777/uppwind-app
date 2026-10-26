@@ -74,18 +74,20 @@ version = "0.62"
 # src/tray) : WebView2 (wry), la fenetre et sa boucle (tao), l'icone et son menu (tray-icon, muda). MIT OR Apache-2.0
 # (tao : Apache-2.0), compatibles GPL-3.0. Aucune page distante : les pages sont des chaines de l'exe. Et de `windows` :
 # le presse-papiers (le bouton Copy du code d'appairage).
-[target.'cfg(windows)'.dependencies.wry]
+# (26 oct.) macOS : les memes crates (wry sur WKWebView, tao sur AppKit) ; src/ui se construit sur Mac, l'icone
+# (src/tray) pas encore (voir README, « macOS »).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies.wry]
 version = "0.57"
 default-features = false
 # (sous Windows, « os-webview » ne tire rien de plus : ses dependances sont celles de Linux ; il donne webview_version)
 features = ["os-webview"]
 
-[target.'cfg(windows)'.dependencies.tao]
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies.tao]
 version = "0.37"
 default-features = false
 features = ["rwh_06"]
 
-[target.'cfg(windows)'.dependencies.tray-icon]
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies.tray-icon]
 version = "0.25"
 default-features = false
 

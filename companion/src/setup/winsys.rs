@@ -332,11 +332,20 @@ impl Registry for RealRegistry {
         None
     }
 }
-#[cfg(not(windows))]
+// (26 oct.) macOS : les ports de CoreMIDI (lecture seule)
+#[cfg(target_os = "macos")]
+pub fn midi_inputs() -> Vec<String> {
+    crate::midi_ports::endpoints().0
+}
+#[cfg(target_os = "macos")]
+pub fn midi_outputs() -> Vec<String> {
+    crate::midi_ports::endpoints().1
+}
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn midi_inputs() -> Vec<String> {
     vec![]
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn midi_outputs() -> Vec<String> {
     vec![]
 }

@@ -114,7 +114,8 @@ pub fn user_library_from_cfg(xml: &str) -> Option<PathBuf> {
 
 pub fn default_user_library(probe: &Probe) -> PathBuf {
     if cfg!(target_os = "macos") {
-        crate::home_dir().join("Music").join("Ableton").join("User Library")
+        // (26 oct.) le dossier de l'utilisateur de la sonde (UWC_SETUP_ROOT le remplace : jamais le vrai ~/Music en essai)
+        probe.paths.home.join("Music").join("Ableton").join("User Library")
     } else {
         probe.paths.documents.join("Ableton").join("User Library")
     }
@@ -174,8 +175,20 @@ pub fn detect(probe: &Probe) -> Ableton {
             }
         }
     }
+    // macOS (26 oct.) : /Applications/Ableton Live 12 Suite.app (program_data est /Applications)
+    if cfg!(target_os = "macos") {
+        if let Ok(rd) = std::fs::read_dir(&probe.paths.program_data) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("Ableton Live") && n.ends_with(".app") {
+                    a.exes.push(e.path());
+                }
+            }
+        }
+    }
     a.exes.sort();
-    let prefs_root = if cfg!(target_os = "macos") { crate::home_dir().join("Library").join("Preferences").join("Ableton") } else { probe.paths.roaming.join("Ableton") };
+    // les preferences : %APPDATA%\Ableton (Windows), ~/Library/Preferences/Ableton (macOS : paths.roaming y pointe)
+    let prefs_root = probe.paths.roaming.join("Ableton");
     if let Ok(rd) = std::fs::read_dir(&prefs_root) {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
@@ -254,12 +267,16 @@ pub fn checks(a: &Ableton) -> Vec<Check> {
     let cable = dev.to_ascii_lowercase().contains("cable input") || dev.to_ascii_lowercase().contains("blackhole");
     let driver = s.driver.clone().unwrap_or_default();
     // (24 oct.) sous Windows le son revient par le compagnon (sans cable) : Live doit jouer par Windows (pas ASIO), vers
-    // une sortie qu'on n'ecoute pas ; VB-CABLE reste un secours. Sur macOS : BlackHole.
+    // une sortie qu'on n'ecoute pas ; VB-CABLE reste un secours. (26 oct.) Sur macOS : le plugin Uppwind Link Return
+    // sur le master (pas encore de capture d'un processus ; BlackHole reste possible a la main).
     if !cfg!(windows) {
         if cable {
             c.push(Check::ok("ableton.audio", &format!("Audio output: {dev} ({}).", if driver.is_empty() { "?" } else { &driver })));
         } else {
-            c.push(Check::todo("ableton.audio", &format!("Settings › Audio: Live plays to \"{}\". Set Audio Output Device \"BlackHole 2ch\".", if dev.is_empty() { "?" } else { &dev })));
+            c.push(Check::info(
+                "ableton.audio",
+                &format!("Audio output: \"{}\". Live's sound comes back to the studio through the \"Uppwind Link Return\" plugin on Live's Master track.", if dev.is_empty() { "?" } else { &dev }),
+            ));
         }
     } else if cable {
         c.push(Check::ok("ableton.audio", &format!("Audio output: {dev} ({}): VB-CABLE, the fallback way back to the studio.", if driver.is_empty() { "?" } else { &driver })));
@@ -278,7 +295,7 @@ pub fn checks(a: &Ableton) -> Vec<Check> {
     }
     match s.sample_rate {
         Some(48000) => c.push(Check::ok("ableton.rate", "Sample rate 48000 Hz.")),
-        Some(r) if cable || !cfg!(windows) => c.push(Check::todo("ableton.rate", &format!("Sample rate {r} Hz: use 48000 Hz, the cable's rate."))),
+        Some(r) if cable => c.push(Check::todo("ableton.rate", &format!("Sample rate {r} Hz: use 48000 Hz, the cable's rate."))),
         Some(r) => c.push(Check::info("ableton.rate", &format!("Sample rate {r} Hz: fine for the companion's audio return (use 48000 Hz if you ever switch to VB-CABLE)."))),
         None => {}
     }
@@ -342,9 +359,10 @@ mod tests {
         assert_eq!(state("ableton.surface"), Some(super::super::State::Todo));
         assert_eq!(state("ableton.input"), Some(super::super::State::Todo), "Remote off");
         assert_eq!(state("ableton.output"), Some(super::super::State::Todo));
-        assert_eq!(state("ableton.audio"), Some(super::super::State::Todo), "ASIO: the companion cannot hear it");
-        let want_rate = if cfg!(windows) { super::super::State::Info } else { super::super::State::Todo };
-        assert_eq!(state("ableton.rate"), Some(want_rate), "44.1 kHz only matters with the cable");
+        // (26 oct.) sur Mac le son revient par le plugin Return : la sortie de Live n'est qu'une information
+        let want_audio = if cfg!(windows) { super::super::State::Todo } else { super::super::State::Info };
+        assert_eq!(state("ableton.audio"), Some(want_audio), "ASIO: the companion cannot hear it");
+        assert_eq!(state("ableton.rate"), Some(super::super::State::Info), "44.1 kHz only matters with the cable");
         // MME/DirectX vers des haut-parleurs : le compagnon capte Live, sans cable
         let mut s = parse_log(&LOG[..LOG.find("2026-10-22").unwrap()]);
         s.driver = Some("MME/DirectX".into());

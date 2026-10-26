@@ -160,6 +160,20 @@ pub fn detect(probe: &Probe) -> Fl {
     f.exe = reg.str(&format!(r"{IL}\Shared\Paths"), "FL Studio").or_else(|| reg.str(&format!(r"{IL_LM}\Shared\Paths"), "FL Studio")).map(PathBuf::from);
     f.registry_versions = reg.subkeys(IL).iter().filter_map(|k| k.strip_prefix("FL Studio ").and_then(|v| v.parse().ok())).collect();
     f.registry_versions.sort();
+    // macOS (26 oct.) : pas de registre. FL est /Applications/FL Studio <annee>.app, ses donnees ~/Documents/Image-Line
+    // (le dossier Hardware des scripts est le meme), ses reglages MIDI et audio dans ses propres preferences (pas lues :
+    // `settings` reste None, --setup dit seulement ou regarder).
+    if cfg!(target_os = "macos") {
+        if let Ok(rd) = std::fs::read_dir(&probe.paths.program_data) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if let Some(name) = n.strip_suffix(".app").filter(|s| is_fl_program(s)) {
+                    f.programs.push(Program { name: name.to_string(), version: String::new(), location: e.path().display().to_string() });
+                    f.exe.get_or_insert(e.path());
+                }
+            }
+        }
+    }
     // le dossier de donnees : celui de l'utilisateur d'abord, et seulement s'il existe (HKLM peut nommer un vieux disque)
     let candidates = [reg.str(&format!(r"{IL}\Shared\Paths"), "Shared data"), reg.str(&format!(r"{IL_LM}\Shared\Paths"), "Shared data")];
     f.user_data = candidates.iter().flatten().map(PathBuf::from).find(|p| p.is_dir());
@@ -212,7 +226,13 @@ pub fn audio_out(s: &Settings) -> AudioOut {
 pub fn checks(f: &Fl) -> Vec<Check> {
     let mut c = Vec::new();
     let Some(s) = &f.settings else {
-        if f.found() {
+        if f.found() && cfg!(target_os = "macos") {
+            // (26 oct.) FL pour Mac range ses reglages hors du registre : le compagnon ne les lit pas encore
+            c.push(Check::info(
+                "fl.settings",
+                "FL Studio for Mac: check by hand in Options › MIDI settings that the \"Uppwind Link\" input is enabled with Controller type \"Uppwind Link (user)\" and a Port number, and that the \"Uppwind Link Back\" output has the same Port.",
+            ));
+        } else if f.found() {
             c.push(Check::info("fl.settings", "FL Studio's MIDI settings are unknown (FL saves them when it closes)."));
         }
         return c;
@@ -262,7 +282,9 @@ pub fn checks(f: &Fl) -> Vec<Check> {
     let out = audio_out(s);
     match out {
         AudioOut::Cable => c.push(Check::ok("fl.audio", &format!("Audio output: {shown}: the virtual cable{}.", if cfg!(windows) { ", the fallback way back to the studio" } else { "" }))),
-        _ if !cfg!(windows) => c.push(Check::todo("fl.audio", &format!("Options › Audio settings: FL plays to {shown}. Set the output device to \"BlackHole 2ch\"."))),
+        // (26 oct.) hors Windows, le son revient par le plugin Uppwind Link Return sur le master de FL (pas de capture
+        // d'un processus par le compagnon pour l'instant ; BlackHole reste possible a la main)
+        _ if !cfg!(windows) => c.push(Check::info("fl.audio", &format!("Audio output: {shown}. FL's sound comes back to the studio through the \"Uppwind Link Return\" plugin on FL's master."))),
         AudioOut::Windows => c.push(Check::ok(
             "fl.audio",
             &format!("Audio output: {shown}: the companion captures FL's sound from there (check with uppwind-companion --capture-test fl). Pick an output you don't listen to, or you hear it twice."),
@@ -279,7 +301,7 @@ pub fn checks(f: &Fl) -> Vec<Check> {
     }
     match s.sample_rate {
         Some(48000) => c.push(Check::ok("fl.rate", "Sample rate 48000 Hz.")),
-        Some(r) if out == AudioOut::Cable || !cfg!(windows) => c.push(Check::todo("fl.rate", &format!("Sample rate {r} Hz: use 48000 Hz, the cable's rate."))),
+        Some(r) if out == AudioOut::Cable => c.push(Check::todo("fl.rate", &format!("Sample rate {r} Hz: use 48000 Hz, the cable's rate."))),
         Some(r) => c.push(Check::info("fl.rate", &format!("Sample rate {r} Hz: fine for the companion's audio return (use 48000 Hz if you ever switch to VB-CABLE)."))),
         None => {}
     }
@@ -343,7 +365,8 @@ mod tests {
         assert_eq!(state("fl.input"), Some(State::Ok));
         assert_eq!(state("fl.output"), Some(State::Ok));
         assert_eq!(state("fl.loop"), Some(State::Warn), "{c:#?}");
-        assert_eq!(state("fl.audio"), Some(State::Todo), "an unplugged output");
+        // hors Windows (26 oct.) : le son revient par le plugin Return, la sortie de FL n'est qu'une information
+        assert_eq!(state("fl.audio"), Some(if cfg!(windows) { State::Todo } else { State::Info }), "an unplugged output");
         assert_eq!(state("fl.rate"), Some(State::Ok));
         assert_eq!(state("fl.back_input"), None);
         assert_eq!(audio_out(s), AudioOut::Unplugged);
@@ -354,7 +377,7 @@ mod tests {
         let f2 = Fl { settings: Some(s2.clone()), ..f.clone() };
         let c2 = checks(&f2);
         let a = c2.iter().find(|x| x.id == "fl.audio").unwrap();
-        assert!(a.state == State::Ok && !a.text.contains("CABLE Input"), "{a:?}");
+        assert!(a.state == if cfg!(windows) { State::Ok } else { State::Info } && !a.text.contains("CABLE Input"), "{a:?}");
         s2.audio_device = Some("Focusrite USB ASIO".into());
         assert_eq!(audio_out(&s2), AudioOut::OtherAsio, "a sound card's own ASIO driver");
         let _ = std::fs::remove_dir_all(&root);

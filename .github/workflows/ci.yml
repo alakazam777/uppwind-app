@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+# Uppwind Link -- the tests and the supply-chain checks, on every push and pull request (see RELEASING.md).
+# Every action is pinned by its full commit SHA; every tool by its version (and gitleaks by its SHA-256).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.99.1"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    name: Windows (companion, scripts, notices)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+          rustc -V
+          cargo -V
+      # from the repository folder, so that cargo reads .cargo/config.toml (the same flags as a release);
+      # the_real_registry_in_a_test_key runs here: it writes HKCU\Software\UppwindLinkTest on the runner and deletes it
+      - name: Companion tests
+        run: cargo test --release --locked --manifest-path companion/Cargo.toml
+      - name: Python tests
+        run: |
+          python --version
+          python -I tests/test_protocol.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I tests/test_fl_script.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I tests/test_ableton.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      # offline: reads the crates the tests above downloaded into the cargo registry
+      - name: Third-party notices up to date
+        run: python -I dev/third_party_notices.py --check
+
+  macos:
+    name: macOS arm64 (companion, build and tests only)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustc -V
+          uname -m
+      - name: Companion tests
+        run: cargo test --release --locked --manifest-path companion/Cargo.toml
+
+  supply-chain:
+    name: Dependencies (cargo audit, cargo deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_AUDIT_VERSION: "0.22.2"
+      CARGO_DENY_VERSION: "0.20.2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Install cargo-audit and cargo-deny (pinned, from crates.io, with their own Cargo.lock)
+        run: |
+          cargo install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
+          cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - name: cargo audit
+        run: cargo audit --deny warnings --file companion/Cargo.lock
+      - name: cargo deny
+        run: cargo deny --manifest-path companion/Cargo.toml check --config deny.toml advisories bans licenses sources
+
+  secrets:
+    name: Secrets (gitleaks, tree and history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install gitleaks (official binary, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
+      - name: gitleaks (the files)
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" detect --no-git --source . --redact --no-banner'
+      - name: gitleaks (the git history)
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" detect --source . --redact --no-banner'

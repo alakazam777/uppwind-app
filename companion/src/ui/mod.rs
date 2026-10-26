@@ -95,7 +95,12 @@ pub fn open_url(url: &str) {
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
         let _ = ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
     }
-    #[cfg(not(windows))]
+    // (26 oct.) macOS : /usr/bin/open (seulement les adresses https de ipc::Link)
+    #[cfg(target_os = "macos")]
+    if url.starts_with("https://") {
+        let _ = std::process::Command::new("/usr/bin/open").arg(url).stdin(std::process::Stdio::null()).spawn();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = url;
 }
 
@@ -158,7 +163,20 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         let _ = CloseClipboard();
         r
     }
-    #[cfg(not(windows))]
+    // (26 oct.) macOS : /usr/bin/pbcopy, le texte par son entree standard (jamais en argument)
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        let mut c = std::process::Command::new("/usr/bin/pbcopy").stdin(std::process::Stdio::piped()).spawn().map_err(|e| format!("cannot run pbcopy ({e})"))?;
+        c.stdin.take().ok_or("no pipe to pbcopy")?.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        let st = c.wait().map_err(|e| e.to_string())?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err("pbcopy failed".into())
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = text;
         Err("no clipboard".into())
@@ -218,7 +236,7 @@ pub fn remove_data_dir(dir: &Path) {
     crate::wizard::cleanup_after_exit(&[], &[], &[dir.to_path_buf()]);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub use win::{apply as apply_out, event_loop, run_page, smoke_test, UiWindow, UserEvent};
 
 /// Une boite de message (la fenetre d'etat sans WebView2).
@@ -233,7 +251,10 @@ pub fn message_box(title: &str, text: &str) {
     let _ = (title, text);
 }
 
-#[cfg(windows)]
+/// (26 oct.) macOS : le meme module, sur WKWebView (wry) et AppKit (tao). Differences : la boucle tourne sur le fil
+/// principal (AppKit l'exige ; `run_window` n'ouvre pas de fil), pas d'icone tiree des ressources de l'exe, pas de
+/// reglage des raccourcis du navigateur (propre a WebView2). Construit, pas encore essaye a l'ecran.
+#[cfg(any(windows, target_os = "macos"))]
 mod win {
     use super::ipc::{self, Request};
     use super::pages::{run_job, Out, View};
@@ -243,17 +264,22 @@ mod win {
     use tao::event::{Event, StartCause, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
     use tao::platform::run_return::EventLoopExtRunReturn;
+    #[cfg(windows)]
     use tao::platform::windows::{EventLoopBuilderExtWindows, IconExtWindows};
 
     /// La boucle des fenetres, sur un fil a elle (pas le fil principal) : tao y entre dans l'appartement STA que
     /// WebView2 demande, et le reste du compagnon garde son MTA (capture::keep_com_alive, les connexions, --setup).
+    /// macOS : sur le fil principal.
     pub fn event_loop() -> EventLoop<UserEvent> {
         let mut b = EventLoopBuilder::<UserEvent>::with_user_event();
+        #[cfg(windows)]
         b.with_any_thread(true);
         b.build()
     }
     use tao::window::{Icon, Theme, Window, WindowBuilder};
-    use wry::{NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
+    #[cfg(windows)]
+    use wry::WebViewBuilderExtWindows;
+    use wry::{NewWindowResponse, PermissionResponse, WebContext, WebView, WebViewBuilder};
 
     /// Ce qui reveille la boucle des fenetres.
     pub enum UserEvent {
@@ -288,9 +314,13 @@ mod win {
                 .with_min_inner_size(LogicalSize::new(520.0, 420.0))
                 .with_theme(Some(Theme::Dark))
                 .with_visible(false);
+            // l'icone des ressources de l'exe (Windows) ; macOS : celle du Dock, rien a donner a la fenetre
+            #[cfg(windows)]
             if let Ok(icon) = Icon::from_resource(1, None) {
                 wb = wb.with_window_icon(Some(icon));
             }
+            #[cfg(not(windows))]
+            let _: (&mut WindowBuilder, Option<Icon>) = (&mut wb, None);
             let window = wb.build(target).map_err(|e| format!("cannot open a window ({e})"))?;
             if let Some(m) = window.current_monitor() {
                 let (ms, mp, ws) = (m.size(), m.position(), window.outer_size());
@@ -302,7 +332,7 @@ mod win {
             let p2 = proxy.clone();
             let trace = std::env::var_os("UWC_UI_TRACE").is_some();
             let first = std::cell::Cell::new(true);
-            let webview = WebViewBuilder::new_with_web_context(&mut ctx)
+            let builder = WebViewBuilder::new_with_web_context(&mut ctx)
                 .with_html(html(page, &nonce(), None))
                 .with_ipc_handler(move |req: wry::http::Request<String>| {
                     let _ = p2.send_event(UserEvent::Ipc(req.into_body()));
@@ -322,12 +352,15 @@ mod win {
                 .with_drag_drop_handler(|_| true)
                 .with_devtools(cfg!(debug_assertions))
                 .with_hotkeys_zoom(false)
-                .with_background_color((12, 8, 22, 255))
+                .with_background_color((12, 8, 22, 255));
+            // les menus contextuels, les raccourcis du navigateur et la saisie automatique : des reglages de WebView2
+            // seulement
+            #[cfg(windows)]
+            let builder = builder
                 .with_default_context_menus(false)
                 .with_browser_accelerator_keys(false)
-                .with_general_autofill_enabled(false)
-                .build(&window)
-                .map_err(|e| format!("cannot open WebView2 ({e})"))?;
+                .with_general_autofill_enabled(false);
+            let webview = builder.build(&window).map_err(|e| format!("cannot open the web view ({e})"))?;
             window.set_visible(true);
             window.set_focus();
             Ok(UiWindow { webview, _ctx: ctx, window, page })
@@ -380,6 +413,10 @@ mod win {
     /// l'essai, qui se ferme 3 s apres que la page s'est dessinee (et echoue si elle ne le fait pas en 25 s). Sur un fil
     /// a elle (voir `event_loop`).
     pub fn run_window(view: Box<dyn View + Send>, smoke: bool) -> i32 {
+        if cfg!(target_os = "macos") {
+            // AppKit : la boucle des fenetres sur le fil principal, celui qui appelle
+            return run_window_here(view, smoke);
+        }
         std::thread::spawn(move || run_window_here(view, smoke)).join().unwrap_or(1)
     }
 
@@ -426,6 +463,7 @@ mod win {
                             println!("smoke test: the {} window drew itself in {} ms (WebView2 {})", win.page.name(), t0.elapsed().as_millis(), webview2_version().unwrap_or_default());
                             deadline = Some(Instant::now() + Duration::from_secs(3));
                             *cf = ControlFlow::WaitUntil(deadline.unwrap());
+                            #[cfg(windows)]
                             if let Some(p) = shot_path() {
                                 use tao::platform::windows::WindowExtWindows;
                                 shot_later(win.window.hwnd() as u64, p);
@@ -461,7 +499,7 @@ mod win {
     /// --smoke-test [wizard|status|uninstall] : la vraie fenetre s'ouvre, se dessine, se ferme apres 3 s. Rien ne
     /// s'installe ni ne se desinstalle (la page refuse ces gestes).
     pub fn smoke_test(kind: &str) -> i32 {
-        if webview2_version().is_none() {
+        if cfg!(windows) && webview2_version().is_none() {
             eprintln!("smoke test: WebView2 is not installed ({})", crate::wizard::WEBVIEW2_URL);
             return 2;
         }
@@ -483,11 +521,11 @@ mod win {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn run_page(_view: Box<dyn pages::View + Send>) -> i32 {
     1
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn smoke_test(_kind: &str) -> i32 {
     1
 }

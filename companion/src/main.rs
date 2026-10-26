@@ -22,6 +22,12 @@
 //!   le retour audio sans cable (audio/) : --capture-test PID|NOM|tone [--seconds N] · --tone · serveur : --test-tone
 //!   l'installation par le compagnon (wizard/, ui/, tray/) : un double-clic → la fenetre d'installation ; --app (l'icone
 //!   et la fenetre d'etat) · --uninstall [--quiet] · --sandbox DIR · --wizard · --smoke-test [wizard|status|uninstall]
+//!
+//! (26 oct.) macOS : la meme console (fenetres, capture, gestes, --setup, --install, --autostart, --background,
+//! --stop, plugins) ; pas encore la fenetre d'installation ni l'icone (voir README, « macOS »).
+
+// hors Windows, une bonne part du code (la capture WGC/DWM, la fenetre d'installation, l'icone) n'est pas appelee
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 mod audio;
 mod bench;
@@ -31,6 +37,11 @@ mod input;
 mod install;
 mod link_relay;
 mod live;
+// (26 oct.) macOS : fenetres, capture, gestes, autorisations (CoreGraphics) ; ports MIDI virtuels (CoreMIDI)
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+mod midi_ports;
 mod plugin_link;
 mod plugins;
 mod popups;
@@ -92,11 +103,14 @@ pub fn shown_path(p: &std::path::Path) -> String {
     shown_path_in(p, &home_dir())
 }
 
+/// Ce qui remplace le dossier de l'utilisateur dans un chemin affiche : %USERPROFILE% (Windows), ~ (macOS, Linux).
+pub const HOME_SHOWN: &str = if cfg!(windows) { "%USERPROFILE%" } else { "~" };
+
 pub fn shown_path_in(p: &std::path::Path, home: &std::path::Path) -> String {
     let s = p.display().to_string();
     let h = home.display().to_string();
     if h.len() > 3 && s.len() >= h.len() && s[..h.len()].eq_ignore_ascii_case(&h) && (s.len() == h.len() || s[h.len()..].starts_with(['\\', '/'])) {
-        return format!("%USERPROFILE%{}", &s[h.len()..]);
+        return format!("{HOME_SHOWN}{}", &s[h.len()..]);
     }
     s
 }
@@ -140,6 +154,8 @@ struct Args {
     /// (25 oct.) l'ecoute des plugins Uppwind Link (plugin_link) : son port (defaut : au hasard), ou pas d'ecoute
     plugin_port: Option<u16>,
     no_plugins: bool,
+    #[allow(dead_code)]
+    no_midi_ports: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -202,6 +218,8 @@ fn parse_args() -> Result<Args, String> {
             "--pairing-code" => a.pairing_code = true,
             "--plugin-port" => a.plugin_port = Some(val("--plugin-port")?.parse().map_err(|_| "bad --plugin-port")?),
             "--no-plugins" => a.no_plugins = true,
+            // (26 oct.) macOS : pas de ports MIDI virtuels (midi_ports.rs) ; sans effet ailleurs
+            "--no-midi-ports" => a.no_midi_ports = true,
             // le retour audio (audio/mod.rs les lit lui-meme)
             o if audio::is_server_flag(o).is_some() => {
                 if audio::is_server_flag(o) == Some(true) {
@@ -230,7 +248,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!("Uppwind Link companion {}. {NOTICE}", env!("CARGO_PKG_VERSION"));
-                println!("uppwind-companion [--list | --probe TITLE [--seconds S]] [--port N] [--new-token] [--capture wgc|dwm|print] [--dev-origins] [--allow-origin URL] [--studio-origin URL|none] [--state-file PATH] [--demo] [--test-window [--test-window-at X,Y] [--test-window-unaware] [--test-window-ghost]] [--bench TITLE [--bench-clicks \"x,y;x,y\"] [--bench-out DIR]] [--background] [--plugin-port N | --no-plugins]");
+                println!("uppwind-companion [--list | --probe TITLE [--seconds S]] [--port N] [--new-token] [--capture wgc|dwm|print] [--dev-origins] [--allow-origin URL] [--studio-origin URL|none] [--state-file PATH] [--demo] [--test-window [--test-window-at X,Y] [--test-window-unaware] [--test-window-ghost]] [--bench TITLE [--bench-clicks \"x,y;x,y\"] [--bench-out DIR]] [--background] [--plugin-port N | --no-plugins] [--no-midi-ports (macOS)]");
                 println!("  Studio origin accepted by default: {} (only that one). --dev-origins adds http://localhost and http://127.0.0.1 on ports 5174 and 5747; --allow-origin adds one https:// or local origin (for your own development server only).", security::default_studio_origin());
                 println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH]");
                 println!("{}", setup::HELP);
@@ -254,6 +272,16 @@ fn dpi_aware() {
 fn dpi_aware() {}
 
 fn print_windows() {
+    #[cfg(target_os = "macos")]
+    {
+        // lues sans rien demander (aucune fenetre de macOS ne s'ouvre)
+        let (screen, access) = macos::permissions();
+        let yn = |b: bool| if b { "allowed" } else { "NOT allowed yet" };
+        println!("macOS permissions for this program: Screen Recording {} (window titles and pictures), Accessibility {} (clicks and keys).", yn(screen), yn(access));
+        if !screen || !access {
+            println!("  System Settings › Privacy & Security › Screen Recording / Accessibility: add the program that runs the companion (Terminal, or uppwind-companion itself).");
+        }
+    }
     let all = plugins::enumerate();
     if !plugins::live_running(&all) {
         println!("Ableton Live is not running.");
@@ -414,7 +442,11 @@ fn run_installer(a: &Args) -> i32 {
         Ok(()) => {
             if a.install {
                 println!();
-                println!("Start it from the Start Menu: \"Uppwind Link Companion\".");
+                if cfg!(windows) {
+                    println!("Start it from the Start Menu: \"Uppwind Link Companion\".");
+                } else {
+                    println!("Start it from a Terminal: \"{}\" (or --autostart on, for every login).", shown_path(&dirs.exe()));
+                }
                 println!("The pairing code stays in {}: the studio stays paired.", shown_path(&state));
                 println!("A companion that is already running keeps the old version until you close its window.");
             }
@@ -641,6 +673,13 @@ fn main() {
         }
     }
     audio::server_start(&raw, args.demo);
+    #[cfg(target_os = "macos")]
+    if !args.no_midi_ports && !args.demo {
+        match midi_ports::start() {
+            Ok(p) => println!("MIDI ports (CoreMIDI, while the companion runs): {}", p.join(", ")),
+            Err(e) => eprintln!("warning: {e} (make the ports in Audio MIDI Setup › IAC Driver instead)"),
+        }
+    }
     match plugin_port {
         Some(p) => println!("Uppwind Link plugins (Return, Notes): listening on 127.0.0.1:{p} (port and secret in the state file)"),
         None => println!("Uppwind Link plugins: off"),
@@ -699,8 +738,9 @@ mod tests {
     #[test]
     fn shown_paths_hide_the_account_name() {
         let home = Path::new(r"C:\Users\someone");
-        assert_eq!(shown_path_in(Path::new(r"C:\Users\someone\.uppwind-companion.json"), home), r"%USERPROFILE%\.uppwind-companion.json");
-        assert_eq!(shown_path_in(Path::new(r"c:\users\SOMEONE\AppData\Local\Uppwind Link\x.exe"), home), r"%USERPROFILE%\AppData\Local\Uppwind Link\x.exe");
+        assert_eq!(shown_path_in(Path::new(r"C:\Users\someone\.uppwind-companion.json"), home), format!(r"{HOME_SHOWN}\.uppwind-companion.json"));
+        assert_eq!(shown_path_in(Path::new(r"c:\users\SOMEONE\AppData\Local\Uppwind Link\x.exe"), home), format!(r"{HOME_SHOWN}\AppData\Local\Uppwind Link\x.exe"));
+        assert_eq!(shown_path_in(Path::new("/Users/someone/Library/x"), Path::new("/Users/someone")), format!("{HOME_SHOWN}/Library/x"));
         assert_eq!(shown_path_in(Path::new(r"C:\Users\someone2\x"), home), r"C:\Users\someone2\x", "another account");
         assert_eq!(shown_path_in(Path::new(r"D:\state.json"), home), r"D:\state.json");
     }

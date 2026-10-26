@@ -57,6 +57,13 @@ pub fn write_allowed(path: &str, test: bool) -> bool {
 }
 
 /// Les dossiers de l'utilisateur.
+///
+/// macOS (26 oct.) : les memes roles, d'autres dossiers (`from_lookup_macos`) :
+///   roaming      ~/Library/Preferences            (Live : ~/Library/Preferences/Ableton/Live x.y)
+///   local        ~/Library/Application Support    (le dossier du compagnon, ses sauvegardes)
+///   documents    ~/Documents                      (FL : ~/Documents/Image-Line, comme sous Windows)
+///   program_data /Applications                    (Live : /Applications/Ableton Live 12 Suite.app)
+///   home         ~                                (Live : ~/Music/Ableton/User Library par defaut)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Paths {
     /// %APPDATA% (Roaming) : les preferences de Live
@@ -67,6 +74,9 @@ pub struct Paths {
     pub documents: PathBuf,
     /// %ProgramData% : Live s'installe dessous
     pub program_data: PathBuf,
+    /// le dossier de l'utilisateur (%USERPROFILE%, $HOME) ; UWC_SETUP_ROOT le remplace aussi : les essais ne lisent
+    /// jamais le vrai ~/Music ni le vrai ~/Library
+    pub home: PathBuf,
 }
 
 impl Paths {
@@ -76,7 +86,23 @@ impl Paths {
             local: root.join("AppData").join("Local"),
             documents: root.join("Documents"),
             program_data: root.join("ProgramData"),
+            home: root.to_path_buf(),
         }
+    }
+    /// macOS : tout vient de $HOME (voir `Paths`).
+    pub fn from_lookup_macos(get: impl Fn(&str) -> Option<OsString>) -> Result<Paths, String> {
+        if let Some(root) = get(ROOT_ENV).filter(|v| !v.is_empty()) {
+            return Ok(Paths::in_root(Path::new(&root)));
+        }
+        let home = get("HOME").filter(|v| !v.is_empty()).map(PathBuf::from).ok_or("HOME is not set")?;
+        let lib = home.join("Library");
+        Ok(Paths {
+            roaming: lib.join("Preferences"),
+            local: lib.join("Application Support"),
+            documents: home.join("Documents"),
+            program_data: PathBuf::from("/Applications"),
+            home,
+        })
     }
     /// `get` lit une variable d'environnement ; `documents` donne le dossier Documents connu de Windows.
     pub fn from_lookup(get: impl Fn(&str) -> Option<OsString>, documents: impl Fn() -> Option<PathBuf>) -> Result<Paths, String> {
@@ -89,7 +115,7 @@ impl Paths {
         let home = var("USERPROFILE").or_else(|| var("HOME")).ok_or("USERPROFILE is not set")?;
         let documents = documents().unwrap_or_else(|| home.join("Documents"));
         let program_data = var("ProgramData").or_else(|| var("PROGRAMDATA")).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        Ok(Paths { roaming, local, documents, program_data })
+        Ok(Paths { roaming, local, documents, program_data, home })
     }
     /// Les sauvegardes des dossiers de scripts remplaces : hors des dossiers de Live et de FL (sinon Live listerait la
     /// copie comme une autre surface de controle, et FL comme un autre type de controleur).
@@ -407,7 +433,7 @@ impl Probe {
         if let Some(root) = std::env::var_os(ROOT_ENV).filter(|v| !v.is_empty()) {
             return Ok(Probe::from_root(Path::new(&root)));
         }
-        let paths = Paths::from_lookup(|k| std::env::var_os(k), super::winsys::documents_folder)?;
+        let paths = if cfg!(target_os = "macos") { Paths::from_lookup_macos(|k| std::env::var_os(k))? } else { Paths::from_lookup(|k| std::env::var_os(k), super::winsys::documents_folder)? };
         Ok(Probe {
             paths,
             reg: Box::new(super::winsys::RealRegistry),
@@ -466,6 +492,23 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// (26 oct.) macOS : tout vient de HOME ; UWC_SETUP_ROOT passe devant, home compris.
+    #[test]
+    fn macos_paths_come_from_home() {
+        let env: HashMap<&str, OsString> = HashMap::from([("HOME", OsString::from("/Users/x"))]);
+        let p = Paths::from_lookup_macos(|k| env.get(k).cloned()).unwrap();
+        assert_eq!(p.roaming, Path::new("/Users/x").join("Library").join("Preferences"));
+        assert_eq!(p.local, Path::new("/Users/x").join("Library").join("Application Support"));
+        assert_eq!(p.documents, Path::new("/Users/x").join("Documents"));
+        assert_eq!(p.home, PathBuf::from("/Users/x"));
+        assert_eq!(p.backups(), Path::new("/Users/x").join("Library").join("Application Support").join("Uppwind Link").join("backups"));
+        let env2: HashMap<&str, OsString> = HashMap::from([(ROOT_ENV, OsString::from("/tmp/t")), ("HOME", OsString::from("/Users/x"))]);
+        let p2 = Paths::from_lookup_macos(|k| env2.get(k).cloned()).unwrap();
+        assert_eq!(p2.home, PathBuf::from("/tmp/t"), "the tests never read the real home");
+        assert!(Paths::from_lookup_macos(|_| None).is_err());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn paths_come_from_the_environment_or_the_override() {
         let env: HashMap<&str, OsString> = HashMap::from([

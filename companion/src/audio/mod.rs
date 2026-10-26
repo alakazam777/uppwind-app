@@ -118,6 +118,13 @@ pub fn server_start(raw: &[String], demo: bool) {
     let (build, ubr) = wasapi::windows_build();
     #[cfg(not(windows))]
     let (build, ubr) = (0u32, 0u32);
+    if cfg!(target_os = "macos") {
+        // (26 oct.) TODO macOS 14.2+ : Core Audio process taps (AudioHardwareCreateProcessTap + un aggregate device)
+        // pour capter le DAW sans plugin ; en attendant, le plugin Uppwind Link Return sur le master
+        println!("Audio return: through the \"Uppwind Link Return\" plugin on the DAW's master (capturing an app's sound directly is not done on macOS yet)");
+        let _ = (build, ubr);
+        return;
+    }
     match available() {
         Ok(ms) => println!("Audio return (no cable): available — Windows build {build}.{ubr} captures a single app (checked in {ms:.0} ms)"),
         Err(e) => println!("Audio return (no cable): NOT available on Windows build {build}.{ubr} ({e}) — use the virtual cable"),

@@ -339,7 +339,15 @@ pub fn prepare(reg: &dyn Registry, base: &str, fl: &Fl, probe: &Probe, o: &Opts,
 fn prepare_install(x: &mut FlSettings, reg: &dyn Registry, base: &str, fl: &Fl, probe: &Probe, o: &Opts, backups: &Path, stamp: &str) {
     let Some(s) = fl.settings.as_ref().filter(|_| fl.found()) else {
         x.action = "none".into();
-        x.reason = if fl.found() { "FL Studio has not saved its MIDI settings yet: start FL once, close it, then run the setup again" } else { "FL Studio is not installed" }.into();
+        x.reason = if fl.found() && cfg!(target_os = "macos") {
+            // (26 oct.) FL pour Mac ne range pas ses reglages dans un registre : --fl-settings est pour Windows
+            "FL Studio for Mac: its MIDI settings are set by hand in FL (--fl-settings is for Windows)"
+        } else if fl.found() {
+            "FL Studio has not saved its MIDI settings yet: start FL once, close it, then run the setup again"
+        } else {
+            "FL Studio is not installed"
+        }
+        .into();
         return;
     };
     let root = format!(r"{base}\{}", s.key);

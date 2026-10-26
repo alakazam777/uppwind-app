@@ -1,6 +1,8 @@
 # build output: it holds the build machine's paths (the .pdb, the .d files), never commit it
 companion/target/
 target/
+# dev/build-macos.sh
+dist/
 *.pdb
 # Python
 __pycache__/

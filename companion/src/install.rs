@@ -19,8 +19,20 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+// macOS (26 oct.) : les memes options, d'autres dossiers (rien dans /Applications ni /Library, pas de sudo) :
+//   --install          copie le programme dans ~/Library/Application Support/Uppwind Link/uppwind-companion ;
+//   --autostart on|off un LaunchAgent ~/Library/LaunchAgents/com.uppwind.link.companion.plist (RunAtLoad), ECRIT
+//                      mais pas charge : il part a la prochaine ouverture de session (ou `launchctl bootstrap
+//                      gui/<uid> <plist>`, que le compagnon ne lance jamais lui-meme) ;
+//   --background       la sortie au journal (dup2), --stop : SIGTERM au pid du fichier d'etat s'il est bien a nous.
+
 pub const APP_DIR: &str = "Uppwind Link";
+#[cfg(windows)]
 pub const EXE_NAME: &str = "uppwind-companion.exe";
+#[cfg(not(windows))]
+pub const EXE_NAME: &str = "uppwind-companion";
+/// macOS : l'etiquette (Label) et le nom du LaunchAgent.
+pub const AGENT_LABEL: &str = "com.uppwind.link.companion";
 pub const SHORTCUT_NAME: &str = "Uppwind Link Companion.lnk";
 pub const LOG_NAME: &str = "companion.log";
 pub const ROOT_ENV: &str = "UWC_INSTALL_ROOT";
@@ -43,9 +55,19 @@ impl Dirs {
             let r = PathBuf::from(root);
             return Ok(Dirs { local: r.join("LocalAppData"), roaming: r.join("AppData") });
         }
+        if cfg!(target_os = "macos") {
+            // local : ~/Library/Application Support ; roaming : ~/Library (LaunchAgents est dessous)
+            let home = get("HOME").filter(|v| !v.is_empty()).ok_or("HOME is not set")?;
+            let lib = PathBuf::from(home).join("Library");
+            return Ok(Dirs { local: lib.join("Application Support"), roaming: lib });
+        }
         let local = get("LOCALAPPDATA").filter(|v| !v.is_empty()).ok_or("LOCALAPPDATA is not set")?;
         let roaming = get("APPDATA").filter(|v| !v.is_empty()).ok_or("APPDATA is not set")?;
         Ok(Dirs { local: PathBuf::from(local), roaming: PathBuf::from(roaming) })
+    }
+    /// macOS : ~/Library/LaunchAgents/com.uppwind.link.companion.plist
+    pub fn launch_agent(&self) -> PathBuf {
+        self.roaming.join("LaunchAgents").join(format!("{AGENT_LABEL}.plist"))
     }
     pub fn from_env() -> Result<Dirs, String> {
         Self::from_lookup(|k| std::env::var_os(k))
@@ -68,6 +90,28 @@ impl Dirs {
     pub fn startup_link(&self) -> PathBuf {
         self.programs().join("Startup").join(SHORTCUT_NAME)
     }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// macOS : le LaunchAgent qui lance `exe` (avec `--background` ou non) a l'ouverture de session, sa sortie dans `log`.
+/// Pas de KeepAlive : un compagnon arrete (--stop, le menu) n'est pas relance.
+pub fn launch_agent_plist(exe: &Path, background: bool, log: &Path) -> String {
+    let mut args = format!("\t\t<string>{}</string>\n", xml_escape(&exe.display().to_string()));
+    if background {
+        args.push_str("\t\t<string>--background</string>\n");
+    }
+    let log = xml_escape(&log.display().to_string());
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{AGENT_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n{args}\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<false/>\n\t<key>ProcessType</key>\n\t<string>Interactive</string>\n\t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n</dict>\n</plist>\n"
+    )
+}
+
+/// macOS : les arguments d'un LaunchAgent ecrit par `launch_agent_plist` (pour le garder a la reinstallation).
+pub fn launch_agent_background(plist: &str) -> bool {
+    plist.contains("<string>--background</string>")
 }
 
 /// Un raccourci : la cible, ses arguments, reduit ou non.
@@ -141,22 +185,36 @@ pub fn install(dirs: &Dirs, src: &Path) -> Result<Vec<String>, String> {
             }
         }
         std::fs::copy(src, &dst).map_err(|e| format!("cannot copy to {} ({e})", dst.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("cannot make {} executable ({e})", dst.display()))?;
+        }
         did.push(format!("Copied {} to {}", src.display(), dst.display()));
     }
     let swept = sweep_asides(&app);
     if swept > 0 {
         did.push(format!("Removed {swept} old cop{} set aside by a previous install.", if swept == 1 { "y" } else { "ies" }));
     }
-    let sm = dirs.start_menu_link();
-    shortcut::write(&sm, &Shortcut { target: dst.clone(), args: String::new(), minimized: false })?;
-    did.push(format!("Start Menu shortcut \"Uppwind Link Companion\": {}", sm.display()));
-    // le demarrage automatique, s'il est la, suit le nouvel exe (ses arguments gardes)
-    let su = dirs.startup_link();
-    if su.exists() {
-        let old = shortcut::read(&su).ok();
-        let args = old.as_ref().map(|s| s.args.clone()).unwrap_or_default();
-        shortcut::write(&su, &Shortcut { target: dst.clone(), args, minimized: true })?;
-        did.push(format!("Startup shortcut updated: {}", su.display()));
+    if cfg!(windows) {
+        let sm = dirs.start_menu_link();
+        shortcut::write(&sm, &Shortcut { target: dst.clone(), args: String::new(), minimized: false })?;
+        did.push(format!("Start Menu shortcut \"Uppwind Link Companion\": {}", sm.display()));
+        // le demarrage automatique, s'il est la, suit le nouvel exe (ses arguments gardes)
+        let su = dirs.startup_link();
+        if su.exists() {
+            let old = shortcut::read(&su).ok();
+            let args = old.as_ref().map(|s| s.args.clone()).unwrap_or_default();
+            shortcut::write(&su, &Shortcut { target: dst.clone(), args, minimized: true })?;
+            did.push(format!("Startup shortcut updated: {}", su.display()));
+        }
+    } else {
+        // macOS : pas de menu Demarrer ; le LaunchAgent, s'il est la, est reecrit (--background garde)
+        let la = dirs.launch_agent();
+        if let Ok(old) = std::fs::read_to_string(&la) {
+            std::fs::write(&la, launch_agent_plist(&dst, launch_agent_background(&old), &dirs.log())).map_err(|e| format!("cannot write {} ({e})", la.display()))?;
+            did.push(format!("Login item (LaunchAgent) updated: {}", la.display()));
+        }
     }
     Ok(did)
 }
@@ -165,7 +223,13 @@ pub fn install(dirs: &Dirs, src: &Path) -> Result<Vec<String>, String> {
 /// d'appairage (%USERPROFILE%\.uppwind-companion.json) n'est pas touche.
 pub fn uninstall(dirs: &Dirs) -> Result<Vec<String>, String> {
     let mut did = Vec::new();
-    for (what, p) in [("Start Menu shortcut", dirs.start_menu_link()), ("Startup shortcut", dirs.startup_link())] {
+    let links = if cfg!(windows) {
+        vec![("Start Menu shortcut", dirs.start_menu_link()), ("Startup shortcut", dirs.startup_link())]
+    } else {
+        // macOS : le LaunchAgent (s'il est charge, il le reste jusqu'a la fin de la session : launchctl bootout le retire)
+        vec![("login item (LaunchAgent)", dirs.launch_agent())]
+    };
+    for (what, p) in links {
         if p.exists() {
             std::fs::remove_file(&p).map_err(|e| format!("cannot remove {} ({e})", p.display()))?;
             did.push(format!("Removed the {what}: {}", p.display()));
@@ -196,6 +260,9 @@ pub fn uninstall(dirs: &Dirs) -> Result<Vec<String>, String> {
 /// --autostart on|off : le raccourci du dossier Demarrage (reduit ; `background` : sans fenetre). Il lance la copie
 /// installee : --install d'abord.
 pub fn autostart(dirs: &Dirs, on: bool, background: bool) -> Result<Vec<String>, String> {
+    if !cfg!(windows) {
+        return autostart_agent(dirs, on, background);
+    }
     let su = dirs.startup_link();
     if !on {
         if su.exists() {
@@ -215,6 +282,27 @@ pub fn autostart(dirs: &Dirs, on: bool, background: bool) -> Result<Vec<String>,
         su.display(),
         if background { "no window; the log is in companion.log" } else { "starts minimized in the taskbar" }
     )])
+}
+
+/// macOS : --autostart avec un LaunchAgent. Ecrit ou retire le fichier, ne le charge jamais (pas de launchctl ici).
+fn autostart_agent(dirs: &Dirs, on: bool, background: bool) -> Result<Vec<String>, String> {
+    let la = dirs.launch_agent();
+    if !on {
+        if la.exists() {
+            std::fs::remove_file(&la).map_err(|e| format!("cannot remove {} ({e})", la.display()))?;
+            return Ok(vec![format!("Autostart off: removed {} (a companion already running keeps running).", la.display())]);
+        }
+        return Ok(vec!["Autostart was already off.".into()]);
+    }
+    let exe = dirs.exe();
+    if !exe.exists() {
+        return Err(format!("Not installed yet ({} is missing): run uppwind-companion --install first.", exe.display()));
+    }
+    if let Some(d) = la.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("cannot create {} ({e})", d.display()))?;
+    }
+    std::fs::write(&la, launch_agent_plist(&exe, background, &dirs.log())).map_err(|e| format!("cannot write {} ({e})", la.display()))?;
+    Ok(vec![format!("Autostart on: {} (starts at your next login; the output goes to {}).", la.display(), dirs.log().display())])
 }
 
 /// Le journal de --background : ouvert en ajout, remis a zero au-dela de LOG_MAX.
@@ -261,9 +349,25 @@ pub fn go_background(log: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-#[cfg(not(windows))]
+/// macOS / Unix : stdout et stderr vers le journal (dup2). Pas de console a lacher ; stdin vers /dev/null.
+#[cfg(unix)]
+pub fn go_background(log: &Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn dup2(from: i32, to: i32) -> i32;
+    }
+    let f = open_log(log).map_err(|e| format!("cannot open the log {} ({e})", log.display()))?;
+    let null = std::fs::File::open("/dev/null").map_err(|e| format!("cannot open /dev/null ({e})"))?;
+    unsafe {
+        if dup2(f.as_raw_fd(), 1) < 0 || dup2(f.as_raw_fd(), 2) < 0 || dup2(null.as_raw_fd(), 0) < 0 {
+            return Err(format!("cannot send the output to {}", log.display()));
+        }
+    }
+    Ok(())
+}
+#[cfg(not(any(windows, unix)))]
 pub fn go_background(_log: &Path) -> Result<(), String> {
-    Err("--background is for Windows".into())
+    Err("--background is not supported here".into())
 }
 
 /// Le pid du fichier d'etat (ecrit par le compagnon au demarrage).
@@ -273,10 +377,18 @@ pub fn state_pid(state: &Path) -> Option<u32> {
     v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p != 0)
 }
 
-/// Un nom d'exe a nous : uppwind-companion.exe, ou une copie (uppwind-companion.part4.exe…).
+/// Un nom d'exe a nous : uppwind-companion.exe, ou une copie (uppwind-companion.part4.exe…) ; macOS : sans extension
+/// (uppwind-companion, uppwind-companion-universal…).
 pub fn is_companion_image(path: &str) -> bool {
     let name = path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
-    name.starts_with("uppwind-companion") && name.ends_with(".exe")
+    if !name.starts_with("uppwind-companion") {
+        return false;
+    }
+    if cfg!(windows) {
+        name.ends_with(".exe")
+    } else {
+        !name.contains('.')
+    }
 }
 
 /// --stop : le compagnon du fichier d'etat, s'il tourne et si c'est bien un uppwind-companion*.exe.
@@ -304,9 +416,35 @@ pub fn stop(state: &Path) -> Result<String, String> {
         r
     }
 }
-#[cfg(not(windows))]
+/// macOS : le chemin du programme d'un pid (proc_pidpath, libproc), puis SIGTERM s'il est bien a nous.
+#[cfg(target_os = "macos")]
+pub fn stop(state: &Path) -> Result<String, String> {
+    extern "C" {
+        fn proc_pidpath(pid: i32, buf: *mut u8, size: u32) -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGTERM: i32 = 15;
+    let pid = state_pid(state).ok_or(format!("No companion recorded in {}.", state.display()))?;
+    if pid == std::process::id() {
+        return Err("That is this very process.".into());
+    }
+    let mut buf = [0u8; 4096];
+    let n = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return Err(format!("No companion running (pid {pid} is gone)."));
+    }
+    let image = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+    if !is_companion_image(&image) {
+        return Err(format!("pid {pid} is not a companion ({image}): left alone."));
+    }
+    if unsafe { kill(pid as i32, SIGTERM) } != 0 {
+        return Err(format!("cannot stop pid {pid}: {}", std::io::Error::last_os_error()));
+    }
+    Ok(format!("Stopped the companion (pid {pid}, {image})."))
+}
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn stop(_state: &Path) -> Result<String, String> {
-    Err("--stop is for Windows".into())
+    Err("--stop is not supported here".into())
 }
 
 /// Les raccourcis .lnk (IShellLinkW, dans le profil de l'utilisateur).
@@ -378,6 +516,97 @@ pub mod shortcut {
     #[cfg(not(windows))]
     pub fn read(_lnk: &Path) -> Result<Shortcut, String> {
         Err("shortcuts are for Windows".into())
+    }
+}
+
+/// Le LaunchAgent : du XML valide pour launchd, les chemins echappes (sur tous les systemes : c'est une chaine).
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_agent_runs_the_installed_copy_at_login_and_is_never_kept_alive() {
+        let p = launch_agent_plist(Path::new("/Users/x/Library/Application Support/Uppwind Link/uppwind-companion"), true, Path::new("/tmp/a&b.log"));
+        assert!(p.contains(&format!("<string>{AGENT_LABEL}</string>")));
+        assert!(p.contains("<string>/Users/x/Library/Application Support/Uppwind Link/uppwind-companion</string>"));
+        assert!(p.contains("<key>RunAtLoad</key>\n\t<true/>") && p.contains("<key>KeepAlive</key>\n\t<false/>"));
+        assert!(p.contains("<string>/tmp/a&amp;b.log</string>"), "escaped");
+        assert!(launch_agent_background(&p));
+        assert!(!launch_agent_background(&launch_agent_plist(Path::new("/x"), false, Path::new("/l"))));
+    }
+}
+
+/// macOS (26 oct.) : les memes gestes que sous Windows, dans un dossier temporaire (UWC_INSTALL_ROOT) : jamais le vrai
+/// ~/Library ; le LaunchAgent est ecrit, jamais charge.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("uwc-install-mac-{tag}-{}-{t}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn dirs_in(root: &Path) -> Dirs {
+        let env: HashMap<&str, OsString> = HashMap::from([(ROOT_ENV, root.as_os_str().to_owned())]);
+        Dirs::from_lookup(|k| env.get(k).cloned()).unwrap()
+    }
+
+    #[test]
+    fn mac_dirs_come_from_home() {
+        let env: HashMap<&str, OsString> = HashMap::from([("HOME", OsString::from("/Users/x"))]);
+        let d = Dirs::from_lookup(|k| env.get(k).cloned()).unwrap();
+        assert_eq!(d.exe(), PathBuf::from("/Users/x/Library/Application Support/Uppwind Link/uppwind-companion"));
+        assert_eq!(d.launch_agent(), PathBuf::from("/Users/x/Library/LaunchAgents/com.uppwind.link.companion.plist"));
+        assert!(Dirs::from_lookup(|_| None).is_err());
+    }
+
+    #[test]
+    fn install_autostart_and_uninstall_on_macos() {
+        let root = temp_root("all");
+        let d = dirs_in(&root);
+        let src = root.join("build").join("uppwind-companion");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"v1").unwrap();
+        let did = install(&d, &src).unwrap();
+        assert!(did.iter().any(|l| l.starts_with("Copied")), "{did:?}");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(d.exe()).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!d.launch_agent().exists(), "install alone does not autostart");
+        assert!(autostart(&d, true, true).unwrap()[0].starts_with("Autostart on"));
+        let plist = std::fs::read_to_string(d.launch_agent()).unwrap();
+        assert!(plist.contains(&d.exe().display().to_string()) && launch_agent_background(&plist));
+        // une reinstallation garde --background
+        std::fs::write(&src, b"v2").unwrap();
+        let did = install(&d, &src).unwrap();
+        assert!(did.iter().any(|l| l.contains("LaunchAgent")), "{did:?}");
+        assert!(launch_agent_background(&std::fs::read_to_string(d.launch_agent()).unwrap()));
+        assert_eq!(std::fs::read(d.exe()).unwrap(), b"v2");
+        assert!(autostart(&d, false, false).unwrap()[0].starts_with("Autostart off"));
+        assert_eq!(autostart(&d, false, false).unwrap()[0], "Autostart was already off.");
+        autostart(&d, true, false).unwrap();
+        let un = uninstall(&d).unwrap();
+        assert!(!d.exe().exists() && !d.launch_agent().exists() && !d.app_dir().exists(), "{un:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stop_only_touches_a_companion_on_macos() {
+        let root = temp_root("stop");
+        let st = root.join("state.json");
+        assert!(is_companion_image("/Users/x/Library/Application Support/Uppwind Link/uppwind-companion"));
+        assert!(!is_companion_image("/bin/sleep"));
+        assert!(!is_companion_image("/x/uppwind-companion.bak"));
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        std::fs::write(&st, format!("{{\"pid\": {}}}", child.id())).unwrap();
+        let e = stop(&st).unwrap_err();
+        assert!(e.contains("is not a companion"), "{e}");
+        assert!(child.try_wait().unwrap().is_none(), "sleep still runs");
+        child.kill().unwrap();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
