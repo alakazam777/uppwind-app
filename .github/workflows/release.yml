@@ -2,7 +2,9 @@
 # Copyright (C) 2026 Uppwind
 # Uppwind Link -- a release, on a tag v*: builds uppwind-companion.exe exactly as RELEASING.md step 4 says, checks it
 # (step 5), attests its provenance and publishes ONLY the exe and SHA256SUMS (never the .pdb or target/).
-# macOS is not released yet (not notarized, not yet tried in a real DAW).
+# macOS (uppwind-companion-macos.dmg: signed with the Developer ID, notarized, stapled, macos-build.yml) joins the
+# release only when the repository variable MACOS_RELEASE is 1 (off by default: the Mac build has to pass a test in a
+# real DAW first; macos-preview.yml makes the same .dmg as a workflow artifact, without a release).
 name: release
 
 on:
@@ -18,23 +20,26 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
-  release:
-    name: Windows release
+  windows:
+    name: Windows build
     runs-on: windows-2025
     timeout-minutes: 45
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
+    outputs:
+      rustc: ${{ steps.toolchain.outputs.rustc }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Rust toolchain
+        id: toolchain
         run: |
           rustup toolchain install $env:RUST_VERSION --profile minimal
           rustup default $env:RUST_VERSION
-          rustc -V
+          $rustc = (rustc -V)
+          $rustc
+          "rustc=$rustc" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
       - name: The tag matches the companion's version
         run: |
           $line = Select-String -Path companion/Cargo.toml -Pattern '^version = "(.+)"$' | Select-Object -First 1
@@ -51,6 +56,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I tests/test_ableton.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # the notices list the macOS crates too: fetch the crates of every target first
+          cargo fetch --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I dev/third_party_notices.py --check
           if ($LASTEXITCODE -ne 0) { exit 1 }
       # RELEASING.md step 4: from the repository folder (.cargo/config.toml applies), the path remapping added with
@@ -66,23 +74,80 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Check the program (RELEASING.md step 5)
         run: python -I dev/release_check.py companion/target/release/uppwind-companion.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: uppwind-companion-windows
+          path: companion/target/release/uppwind-companion.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS build (only with MACOS_RELEASE=1)
+    if: ${{ vars.MACOS_RELEASE == '1' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/macos-build.yml
+    secrets:
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+
+  release:
+    name: Publish the release
+    needs: [windows, macos]
+    # the Mac job is skipped unless MACOS_RELEASE=1; when it runs, it must succeed
+    if: ${{ !cancelled() && needs.windows.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'skipped') }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: uppwind-companion-windows
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ needs.macos.result == 'success' }}
+        with:
+          name: uppwind-companion-macos
+          path: dist-macos
       - name: The files of the release
+        env:
+          WITH_MACOS: ${{ needs.macos.result == 'success' }}
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item companion/target/release/uppwind-companion.exe dist/uppwind-companion.exe
-          $hash = (Get-FileHash -Algorithm SHA256 dist/uppwind-companion.exe).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'dist/SHA256SUMS'), "$hash  uppwind-companion.exe`n")
+          $files = @('uppwind-companion.exe')
+          if ($env:WITH_MACOS -eq 'true') {
+            # the SHA-256 the Mac job wrote must be the one of the file downloaded here
+            $want = (Get-Content dist-macos/uppwind-companion-macos.dmg.sha256).Split(' ')[0]
+            $got = (Get-FileHash -Algorithm SHA256 dist-macos/uppwind-companion-macos.dmg).Hash.ToLowerInvariant()
+            if ($want -ne $got) { throw "uppwind-companion-macos.dmg: SHA-256 $got, the macOS job wrote $want" }
+            Copy-Item dist-macos/uppwind-companion-macos.dmg dist/uppwind-companion-macos.dmg
+            $files += 'uppwind-companion-macos.dmg'
+          }
+          $sums = ''
+          foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 (Join-Path dist $f)).Hash.ToLowerInvariant()
+            $sums += "$hash  $f`n"
+          }
+          [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'dist/SHA256SUMS'), $sums)
           Get-Content dist/SHA256SUMS
           Get-ChildItem dist
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            dist/uppwind-companion.exe
-            dist/SHA256SUMS
+          # the exe, the .dmg when there is one, SHA256SUMS
+          subject-path: dist/*
       - name: Release notes
+        env:
+          RUSTC_VERSION: ${{ needs.windows.outputs.rustc }}
+          WITH_MACOS: ${{ needs.macos.result == 'success' }}
         run: |
-          $rustc = (rustc -V)
-          $hash = (Get-Content dist/SHA256SUMS).Split(' ')[0]
+          $rustc = $env:RUSTC_VERSION
+          $sums = Get-Content dist/SHA256SUMS
+          $hash = ($sums | Where-Object { $_ -like '*uppwind-companion.exe' }).Split(' ')[0]
           $repo = $env:GITHUB_REPOSITORY
           $notes = @(
             "Uppwind Link companion $env:GITHUB_REF_NAME for Windows 10 (version 2004 or later) and Windows 11, 64-bit."
@@ -97,15 +162,33 @@ jobs:
             ""
             "**Rebuild it byte for byte** (RELEASING.md, steps 4 and 5): $rustc, Visual Studio build tools of the ``windows-2025`` runner, build folder ``$env:GITHUB_WORKSPACE``, ``cargo build --release --locked`` with the ``--remap-path-prefix`` flags of RELEASING.md."
             ""
-            "Assets: ``uppwind-companion.exe`` and ``SHA256SUMS`` only. The DAW scripts are in the repository (and inside the exe)."
-            ""
-            "**macOS coming:** the companion builds and passes its tests on macOS, but it is not notarized nor tried in a real DAW yet, so there is no Mac download in this release."
           )
+          if ($env:WITH_MACOS -eq 'true') {
+            $mhash = ($sums | Where-Object { $_ -like '*uppwind-companion-macos.dmg' }).Split(' ')[0]
+            $notes += @(
+              "**macOS** (11 or later, Apple silicon and Intel): ``uppwind-companion-macos.dmg`` holds ``uppwind-companion``, signed with a Developer ID, notarized by Apple and stapled. Open the .dmg, copy ``uppwind-companion`` where you like and start it from Terminal."
+              ""
+              "- SHA-256 (also in ``SHA256SUMS``): ``$mhash`` (``shasum -a 256 uppwind-companion-macos.dmg``)"
+              "- ``gh attestation verify uppwind-companion-macos.dmg --repo $repo``"
+              ""
+              "Assets: ``uppwind-companion.exe``, ``uppwind-companion-macos.dmg`` and ``SHA256SUMS`` only. The DAW scripts are in the repository (and inside the programs)."
+            )
+          } else {
+            $notes += @(
+              "Assets: ``uppwind-companion.exe`` and ``SHA256SUMS`` only. The DAW scripts are in the repository (and inside the exe)."
+              ""
+              "**macOS coming:** the companion builds, is signed and notarized on macOS, but it has not been tried in a real DAW yet, so there is no Mac download in this release."
+            )
+          }
           [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'notes.md'), ($notes -join "`n") + "`n")
           Get-Content (Join-Path $env:RUNNER_TEMP 'notes.md')
-      - name: Publish the GitHub release (the exe and SHA256SUMS, nothing else)
+      - name: Publish the GitHub release (the programs and SHA256SUMS, nothing else)
         env:
           GH_TOKEN: ${{ github.token }}
+          WITH_MACOS: ${{ needs.macos.result == 'success' }}
         run: |
-          gh release create $env:GITHUB_REF_NAME dist/uppwind-companion.exe dist/SHA256SUMS --repo $env:GITHUB_REPOSITORY --title "Uppwind Link companion $env:GITHUB_REF_NAME" --notes-file (Join-Path $env:RUNNER_TEMP 'notes.md') --verify-tag
+          $assets = @('dist/uppwind-companion.exe')
+          if ($env:WITH_MACOS -eq 'true') { $assets += 'dist/uppwind-companion-macos.dmg' }
+          $assets += 'dist/SHA256SUMS'
+          gh release create $env:GITHUB_REF_NAME @assets --repo $env:GITHUB_REPOSITORY --title "Uppwind Link companion $env:GITHUB_REF_NAME" --notes-file (Join-Path $env:RUNNER_TEMP 'notes.md') --verify-tag
           if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -29,7 +29,7 @@ allow = [
 ]
 confidence-threshold = 0.9
 # macOS only (wry -> dirs -> dirs-sys -> option-ext), not in the Windows exe: MPL-2.0 allows the combination with the
-# GPL (its section 3.3). Its notice must join the Mac build's notices before the first Mac release.
+# GPL (its section 3.3). Its licence text is in THIRD-PARTY-NOTICES.txt (the list of the macOS-only crates).
 exceptions = [
     { name = "option-ext", allow = ["MPL-2.0"] },
 ]

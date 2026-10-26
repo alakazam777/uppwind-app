@@ -43,9 +43,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I tests/test_ableton.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
-      # offline: reads the crates the tests above downloaded into the cargo registry
+      # reads the crates from the cargo registry (offline): cargo fetch first, for the macOS crates the notices list too
       - name: Third-party notices up to date
-        run: python -I dev/third_party_notices.py --check
+        run: |
+          cargo fetch --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I dev/third_party_notices.py --check
 
   macos:
     name: macOS arm64 (companion, build and tests only)

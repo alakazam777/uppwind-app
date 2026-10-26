@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+# Uppwind Link -- the macOS companion, signed and notarized (called by macos-preview.yml and release.yml):
+# a universal binary (arm64 + x86_64, lipo) built with the release flags, signed with the Developer ID Application
+# certificate (hardened runtime, Apple's timestamp, no entitlements), put in a .dmg with the README and the licences,
+# the .dmg signed, notarized by Apple (notarytool) and stapled. The result is a workflow artifact
+# "uppwind-companion-macos" (the .dmg and its SHA-256); this workflow never publishes a release itself.
+#
+# Secrets (repository secrets, passed by the caller): MACOS_CERT_P12_BASE64 (the .p12 export of the certificate and
+# its key, base64), MACOS_CERT_PASSWORD, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (an app-specific password).
+# They reach only the steps that use them, never a command line that is printed; the certificate lives in a
+# keychain made for this job (random password) and deleted at the end, whatever happens.
+name: macos-build
+
+on:
+  workflow_call:
+    secrets:
+      MACOS_CERT_P12_BASE64:
+        required: true
+      MACOS_CERT_PASSWORD:
+        required: true
+      APPLE_ID:
+        required: true
+      APPLE_TEAM_ID:
+        required: true
+      APPLE_APP_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.99.1"
+  CARGO_TERM_COLOR: never
+  BUNDLE_ID: com.uppwind.link.companion
+
+jobs:
+  macos:
+    name: macOS companion (universal, Developer ID, notarized)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (both Mac targets)
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-apple-darwin --target x86_64-apple-darwin
+          rustup default "$RUST_VERSION"
+          rustc -V
+          uname -m
+          sw_vers
+          xcodebuild -version
+      - name: Tests
+        run: cargo test --release --locked --manifest-path companion/Cargo.toml
+      # the notices embedded in the program (--license) must list the Mac crates too (option-ext, MPL-2.0…)
+      - name: Third-party notices up to date
+        run: |
+          cargo fetch --locked --manifest-path companion/Cargo.toml
+          python3 -I dev/third_party_notices.py --check
+      # as RELEASING.md step 4 for Windows: a fresh target folder, --locked, the paths of the runner remapped with
+      # --config (never RUSTFLAGS); the companion left unsigned here (signed below with the Developer ID)
+      - name: Build (universal, release flags)
+        run: |
+          rm -rf companion/target
+          UWL_RELEASE=1 UWL_NO_ADHOC=1 sh dev/build-macos.sh "$RUNNER_TEMP/build"
+          lipo -archs "$RUNNER_TEMP/build/uppwind-companion"
+      - name: Check the program (no path of the runner)
+        run: python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion"
+      - name: Temporary keychain with the Developer ID certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/uwl-signing.keychain-db"
+          KC_PASS=$(openssl rand -hex 32)
+          echo "::add-mask::$KC_PASS"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          umask 077
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/uwl-cert.p12"
+          security import "$RUNNER_TEMP/uwl-cert.p12" -k "$KEYCHAIN" -f pkcs12 -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign > /dev/null
+          rm -f "$RUNNER_TEMP/uwl-cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN" > /dev/null
+          # the job's keychain first in the search list, the runner's own ones kept after it
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # match the identity by its hash (several "Developer ID Application" names could exist one day)
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk '/"Developer ID Application: / { print $2; exit }')
+          if [ -z "$IDENTITY" ]; then
+            echo "no valid Developer ID Application identity in the certificate"
+            security find-identity -v -p codesigning "$KEYCHAIN" | sed -E 's/"[^"]*"/"…"/'
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "signing identity: $IDENTITY"
+      # hardened runtime, Apple's timestamp, a stable identifier (the one of the LaunchAgent), no entitlements: the
+      # companion needs neither JIT (WKWebView runs its JavaScript in WebKit's own processes) nor get-task-allow, and
+      # it loads only Apple's frameworks
+      - name: Sign the companion
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/uwl-signing.keychain-db"
+          BIN="$RUNNER_TEMP/build/uppwind-companion"
+          codesign --force --options runtime --timestamp --identifier "$BUNDLE_ID" --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign -dv --verbose=4 "$BIN" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier|Runtime Version)'
+          echo "entitlements (none expected):"
+          codesign -d --entitlements - "$BIN" 2>&1 || true
+          "$BIN" --license > "$RUNNER_TEMP/license.txt"
+          head -n 3 "$RUNNER_TEMP/license.txt"
+      - name: The .dmg (the companion, README, licences, notices)
+        run: |
+          STAGE="$RUNNER_TEMP/dmg"
+          rm -rf "$STAGE" dist
+          mkdir -p "$STAGE" dist
+          ditto "$RUNNER_TEMP/build/uppwind-companion" "$STAGE/uppwind-companion"
+          cp README.md LICENSE LICENSE-EXCEPTION.txt LICENSE-MIT THIRD-PARTY-NOTICES.txt "$STAGE/"
+          ok=0
+          for i in 1 2 3; do
+            if hdiutil create -volname "Uppwind Link" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov dist/uppwind-companion-macos.dmg; then ok=1; break; fi
+            echo "hdiutil create failed (try $i), again in 10 s"
+            sleep 10
+          done
+          [ "$ok" = "1" ]
+          codesign --force --timestamp --identifier "$BUNDLE_ID.dmg" --keychain "$RUNNER_TEMP/uwl-signing.keychain-db" --sign "$SIGN_IDENTITY" dist/uppwind-companion-macos.dmg
+          codesign --verify --strict --verbose=2 dist/uppwind-companion-macos.dmg
+      - name: Notarize (notarytool, waits for Apple)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set +e
+          xcrun notarytool submit dist/uppwind-companion-macos.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait --timeout 45m --output-format json > "$RUNNER_TEMP/notary.json"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/notary.json"
+          echo
+          SUB_ID=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$RUNNER_TEMP/notary.json" || true)
+          STATUS=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' "$RUNNER_TEMP/notary.json" || true)
+          echo "notarization: id=$SUB_ID status=$STATUS (exit $rc)"
+          if [ -n "$SUB_ID" ]; then
+            xcrun notarytool log "$SUB_ID" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" || true
+          fi
+          [ "$STATUS" = "Accepted" ]
+      - name: Staple and check like a user (Gatekeeper)
+        run: |
+          DMG=dist/uppwind-companion-macos.dmg
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl -a -vvv -t open --context context:primary-signature "$DMG"
+          spctl -a -vvv -t install "$DMG" || echo "(spctl -t install: see above)"
+          MNT="$RUNNER_TEMP/mnt"
+          mkdir -p "$MNT"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MNT" "$DMG"
+          ls -la "$MNT"
+          codesign --verify --strict --verbose=2 "$MNT/uppwind-companion"
+          spctl -a -vvv -t exec "$MNT/uppwind-companion" || echo "(spctl -t exec on a bare executable: see above)"
+          "$MNT/uppwind-companion" --license > "$RUNNER_TEMP/license-dmg.txt"
+          head -n 3 "$RUNNER_TEMP/license-dmg.txt"
+          grep -q "option-ext" "$RUNNER_TEMP/license-dmg.txt"
+          hdiutil detach "$MNT"
+      - name: SHA-256
+        run: |
+          cd dist
+          shasum -a 256 uppwind-companion-macos.dmg > uppwind-companion-macos.dmg.sha256
+          cat uppwind-companion-macos.dmg.sha256
+          ls -la
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: uppwind-companion-macos
+          path: |
+            dist/uppwind-companion-macos.dmg
+            dist/uppwind-companion-macos.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Delete the keychain and the certificate
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/uwl-cert.p12"
+          if [ -f "$RUNNER_TEMP/uwl-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/uwl-signing.keychain-db"
+            echo "keychain deleted"
+          fi
+          security list-keychains -d user

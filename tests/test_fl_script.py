@@ -81,9 +81,17 @@ class World(object):
         self.rec = []            # (id, valeur, drapeaux) de general.processRECEvent
         self.docs = False
 
-    def add(self, name, plugin=None, ctype=2, color=0x5F7581, vst=False, vol=0.78125, pan=0.0, muted=False):
+    def add(self, name, plugin=None, ctype=2, color=0x5F7581, vst=False, vol=0.78125, pan=0.0, muted=False, port=-2,
+            pnames=None):
+        # (26 oct.) port : le port d'entree MIDI du wrapper (-2 : aucun, comme FL) ; pnames : les noms des parametres
         self.chans.append({"name": name, "plugin": plugin, "type": ctype, "color": color, "vst": vst,
-                           "vol": vol, "pan": pan, "muted": muted})
+                           "vol": vol, "pan": pan, "muted": muted, "port": port, "pnames": pnames or {}, "pv": {}})
+
+    def add_notes(self, name="Uppwind Link Notes", port=10, tagged=True):
+        """(26 oct.) Un canal Uppwind Link Notes : ses ports d'entree et de sortie sur `port` (FL ne montre au script
+        que l'entree) ; tagged=False : un plugin d'avant le 25 oct., sans « Link tag »."""
+        self.add(name, "Uppwind Link Notes", vst=True, port=port,
+                 pnames={0: "Link tag", 1: "Bypass"} if tagged else {0: "Bypass"})
 
     def tick(self):
         # FL applique les bascules de mute du tick (plusieurs bascules d'un meme tick = une seule)
@@ -157,8 +165,13 @@ def make_modules(w):
     def getChannelIndex(i):
         return i
 
+    def getChannelMidiInPort(i, g=False):
+        w.g(g, "getChannelMidiInPort")
+        return w.chans[i]["port"]
+
     for f in (channelCount, getChannelName, getChannelColor, getChannelType, getChannelVolume, setChannelVolume,
-              getChannelPan, setChannelPan, isChannelMuted, muteChannel, setChannelPitch, midiNoteOn, getChannelIndex):
+              getChannelPan, setChannelPan, isChannelMuted, muteChannel, setChannelPitch, midiNoteOn, getChannelIndex,
+              getChannelMidiInPort):
         setattr(ch, f.__name__, f)
 
     pl = types.ModuleType("plugins")
@@ -168,15 +181,26 @@ def make_modules(w):
         return 0 <= i < len(w.chans) and w.chans[i]["type"] == 2 and w.chans[i]["plugin"] is not None
 
     def getPluginName(i, slot=-1, user=False, g=False):
+        w.g(g, "getPluginName") if w.api >= 26 else None
         return w.chans[i]["plugin"]
 
     def getParamCount(i, slot=-1, g=False):
         return 4240 if w.chans[i]["vst"] else 40
 
-    def setParamValue(v, p, i, slot=-1, pick=0, g=False):
-        w.params.append((i, p, v))
+    def getParamName(p, i, slot=-1, g=False):
+        w.g(g, "getParamName") if w.api >= 26 else None
+        return w.chans[i]["pnames"].get(p, "")
 
-    for f in (isValid, getPluginName, getParamCount, setParamValue):
+    def getParamValue(p, i, slot=-1, g=False):
+        w.g(g, "getParamValue") if w.api >= 26 else None
+        return w.chans[i]["pv"].get(p, 0.0)
+
+    def setParamValue(v, p, i, slot=-1, pick=0, g=False):
+        assert 0.0 <= v <= 1.0, "a VST parameter is 0..1"
+        w.params.append((i, p, v))
+        w.chans[i]["pv"][p] = v
+
+    for f in (isValid, getPluginName, getParamCount, getParamName, getParamValue, setParamValue):
         setattr(pl, f.__name__, f)
 
     dev = types.ModuleType("device")
@@ -305,7 +329,7 @@ def hello_ack_describes_fl_honestly():
     d = r.hello()
     assert d["daw"] == "FL Studio"
     assert d["project"] == "Night drive", d
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo"], d["caps"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes"], d["caps"]
     assert d["bpm"] == 140, d
     for cap in ("plugins", "add", "remove"):
         assert cap not in d["caps"]
@@ -670,7 +694,7 @@ def no_output_port_means_a_clear_hint_not_a_crash():
 def older_api_without_global_indexes_still_works():
     r = Rig(api=30)
     d = r.hello()
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes"]
     r.bind(1, 1)
     r.midi(0x90, 60, 100)
     assert r.w.notes == [(1, 60, 100)]
@@ -773,6 +797,117 @@ def get_current_tempo_read_either_way_and_a_new_project_is_a_tempo_change():
     r.s.OnProjectLoad(MIDI.PL_LoadOk)
     r.advance(0.1)
     assert (P.TEMPO_CHANGED, {"bpm": 95}) in pushed(r)
+
+
+# -- 26 oct. : les notes par Uppwind Link Notes (cap 'notes', BIND.via 'plugin') ---------------------------
+def notes_rig(**kw):
+    def setup(w):
+        w.add("Kick", None, ctype=0)
+        w.add("Serum Bass", "Serum", vst=True, port=10)               # le port d'entree 10
+        w.add("Pad", "Pigments", vst=True)                             # sans port
+        w.add_notes("Uppwind Link Notes", port=10, **kw)               # entree et sortie sur 10
+        w.add("Keys", "Diva", vst=True, port=12)                       # un port, mais pas de Notes dessus
+    r = Rig(setup=setup)
+    printed = []
+    r.s._log = lambda m: printed.append(m)
+    r.printed = printed
+    return r
+
+
+def tag_of(r, i):
+    return int(round(r.w.chans[i]["pv"].get(0, 0.0) * 255))
+
+
+@test
+def a_notes_channel_is_hidden_and_takes_its_midi_port_as_link_tag():
+    r = notes_rig()
+    r.hello()
+    assert tag_of(r, 3) == 10, r.w.params                              # HELLO : le numero = le port
+    _c, _r, d = r.ask(P.LIST)
+    assert [i["name"] for i in d["items"]] == ["Kick", "Serum Bass", "Pad", "Keys"], d   # pas le Notes
+    cmd, _q, e = r.bind(1, 3)                                           # le Notes n'est pas un instrument
+    assert cmd == P.ERROR and e["code"] == "not_found", e
+    assert not r.w.non_global, r.w.non_global
+    # un port change a la main : le numero suit (le filet de securite, toutes les 2 s)
+    r.w.chans[3]["port"] = 20
+    r.advance(2.5)
+    assert tag_of(r, 3) == 20
+    assert any("Link tag 20" in m for m in r.printed), r.printed
+
+
+@test
+def bind_via_plugin_names_the_notes_on_the_instruments_input_port():
+    r = notes_rig()
+    r.hello()
+    cmd, _q, d = r.ask(P.BIND, {"slot": 1, "id": 1, "via": "plugin"})
+    assert (cmd, d) == (P.BIND_ACK, {"slot": 1, "id": 1, "via": "plugin", "notes": 10}), d
+    # le mix passe toujours par le script (volume, pan, mute du canal)
+    r.send(P.SET, {"id": 1, "vol": 1.0, "pan": 0.25})
+    assert abs(r.w.chans[1]["vol"] - 1.0) < 1e-9 and r.w.chans[1]["pan"] == 0.25
+    _c, _r, d = r.ask(P.LIST)
+    assert [i.get("slots") for i in d["items"]] == [None, [1], None, None]
+    assert any("plays from the Uppwind Link Notes on MIDI port 10" in m for m in r.printed), r.printed
+    # un BIND sans via (un studio d'avant) : comme avant, sans via ni notes
+    assert r.bind(2, 1)[2] == {"slot": 2, "id": 1}
+
+
+@test
+def bind_via_plugin_falls_back_to_loopmidi_and_says_why():
+    r = notes_rig()
+    r.hello()
+    _c, _q, d = r.ask(P.BIND, {"slot": 1, "id": 2, "via": "plugin"})   # Pad : sans port
+    assert d == {"slot": 1, "id": 2, "via": "port"}, d
+    assert any("has no MIDI input port" in m for m in r.printed), r.printed
+    _c, _q, d = r.ask(P.BIND, {"slot": 2, "id": 4, "via": "plugin"})   # Keys : port 12, aucun Notes dessus
+    assert d == {"slot": 2, "id": 4, "via": "port"}, d
+    assert any("no Uppwind Link Notes on MIDI port 12" in m for m in r.printed), r.printed
+    # par ici : le script joue les notes recues, comme avant
+    r.midi(0x91, 60, 100)
+    assert r.w.notes == [(4, 60, 100)], r.w.notes
+    # un Notes d'avant le 25 oct. (sans « Link tag ») : jamais choisi
+    o = notes_rig(tagged=False)
+    o.hello()
+    _c, _q, d = o.ask(P.BIND, {"slot": 1, "id": 1, "via": "plugin"})
+    assert d["via"] == "port", d
+    assert any("older Uppwind Link Notes" in m for m in o.printed), o.printed
+
+
+@test
+def a_route_that_changes_drops_the_link_and_pushes_changed():
+    r = notes_rig()
+    r.hello()
+    r.ask(P.BIND, {"slot": 1, "id": 1, "via": "plugin"})
+    r.replies()
+    r.w.chans[1]["port"] = 30                                          # l'instrument change de port
+    r.advance(2.5)
+    assert [c for c, _q, _d in r.replies()] == [P.CHANGED]
+    _c, _r, d = r.ask(P.LIST)
+    assert all("slots" not in i for i in d["items"]), d
+    # le studio relie a nouveau : plus de Notes sur 30, par ici
+    _c, _q, d = r.ask(P.BIND, {"slot": 1, "id": 1, "via": "plugin"})
+    assert d["via"] == "port"
+    # le Notes passe sur 30 aussi : la route revient au prochain BIND
+    r.w.chans[3]["port"] = 30
+    r.advance(2.5)
+    assert tag_of(r, 3) == 30
+    _c, _q, d = r.ask(P.BIND, {"slot": 1, "id": 1, "via": "plugin"})
+    assert d == {"slot": 1, "id": 1, "via": "plugin", "notes": 30}, d
+
+
+@test
+def two_notes_on_one_port_are_reported_once():
+    def setup(w):
+        w.add("Serum", "Serum", vst=True, port=10)
+        w.add_notes("Notes A", port=10)
+        w.add_notes("Notes B", port=10)
+    r = Rig(setup=setup)
+    printed = []
+    r.s._log = lambda m: printed.append(m)
+    r.hello()
+    r.advance(5.0)
+    assert len([m for m in printed if "share MIDI port 10" in m]) == 1, printed
+    _c, _q, d = r.ask(P.BIND, {"slot": 1, "id": 0, "via": "plugin"})
+    assert d["notes"] == 10
 
 
 @test

@@ -1,11 +1,14 @@
 # Releasing the companion
 
-A release is `uppwind-companion.exe` and its SHA-256, nothing else. Never publish the `.pdb`, the `.d` files or the `target/` folder: they hold the build machine's paths.
+A release is `uppwind-companion.exe` (and, once switched on, `uppwind-companion-macos.dmg`) and their SHA-256, nothing else. Never publish the `.pdb`, the `.d` files or the `target/` folder: they hold the build machine's paths.
 
 ## The workflows (GitHub Actions)
 
 - `.github/workflows/ci.yml`, on every push and pull request: the companion's tests on Windows (`cargo test --release --locked`, the registry test included: it writes `HKCU\Software\UppwindLinkTest` on the runner and deletes it), the Python tests, `third_party_notices.py --check`; the companion's tests on macOS (arm64, build and tests only, no signing); `cargo audit` and `cargo deny` (rules in `deny.toml`); `gitleaks` on the files and on the git history.
-- `.github/workflows/release.yml`, on a tag `v*` (it must match `version` in `companion/Cargo.toml`): steps 3 to 5 and 7 below on a `windows-2025` runner, then a GitHub release with `uppwind-companion.exe` and `SHA256SUMS` only, and an artifact attestation. To release: bump the version in `companion/Cargo.toml` (and `Cargo.lock`), wait for `ci` to be green on `main`, then `git tag v<version>` and `git push origin v<version>`. macOS is not released yet (no notarization).
+- `.github/workflows/release.yml`, on a tag `v*` (it must match `version` in `companion/Cargo.toml`): steps 3 to 5 and 7 below on a `windows-2025` runner, then a GitHub release with `uppwind-companion.exe` and `SHA256SUMS` only, and an artifact attestation. To release: bump the version in `companion/Cargo.toml` (and `Cargo.lock`), wait for `ci` to be green on `main`, then `git tag v<version>` and `git push origin v<version>`.
+- `.github/workflows/macos-build.yml` (called by the two below): the macOS companion on a `macos-latest` runner: tests, `third_party_notices.py --check`, a universal binary (arm64 + x86_64, `dev/build-macos.sh` with `UWL_RELEASE=1`: `--locked`, the runner's paths remapped), `release_check.py`, then signed with the *Developer ID Application* certificate (hardened runtime, Apple's timestamp, identifier `com.uppwind.link.companion`, no entitlements) from a keychain made for the job and deleted at its end, put in `uppwind-companion-macos.dmg` with the README and the licences, the .dmg signed, notarized (`notarytool`, its log printed) and stapled, then checked (`stapler validate`, `spctl`). Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`.
+- `.github/workflows/macos-preview.yml`, started by hand (`gh workflow run macos-preview.yml`): that .dmg as a workflow artifact only, no release.
+- macOS in a release: only when the repository variable `MACOS_RELEASE` is `1` (`gh variable set MACOS_RELEASE --body 1`); then `release.yml` adds `uppwind-companion-macos.dmg` to the release and to `SHA256SUMS`. Off by default: a tag ships Windows only.
 
 Both pin every action by its commit SHA and every tool by its version (gitleaks by its SHA-256 too) and use the same Rust version (`RUST_VERSION`); update them together.
 
@@ -29,5 +32,5 @@ Both pin every action by its commit SHA and every tool by its version (gitleaks 
 
 - Commit with the GitHub *noreply* address only, set in this repository (`git config user.email <id>+<login>@users.noreply.github.com`), never globally. Before a push, `git log --format="%an <%ae> | %cn <%ce>"` must show only that address.
 - On GitHub: *Keep my email addresses private* and *Block command line pushes that expose my email*, two-factor authentication, secret scanning with push protection, Dependabot alerts, private vulnerability reporting (SECURITY.md relies on it).
-- CI workflows (`.github/workflows/`, see above): actions pinned by commit SHA, `permissions: contents: read` by default, `contents: write`, `id-token: write` and `attestations: write` only in the release job.
+- CI workflows (`.github/workflows/`, see above): actions pinned by commit SHA, `permissions: contents: read` by default, `contents: write`, `id-token: write` and `attestations: write` only in the job that publishes the release.
 - Outside contributions: decide before the first pull request how they are licensed (a DCO, "inbound = outbound", is the simplest), or relicensing later needs every contributor's consent.

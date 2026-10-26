@@ -29,8 +29,21 @@ Ce que fait le script (le protocole : uwlink_protocol.py, a cote) :
   TEMPO_CHANGED pousse quand le tempo change dans FL (relu toutes les 50 ms dans OnIdle : FL n'a pas
           de rappel pour le tempo), seulement a un studio qui a dit 'tempo' dans son HELLO
 Ce que l'API de script de FL ne permet PAS : charger un nouveau plugin, lister les plugins installes,
-supprimer un canal. caps ne contient donc ni 'plugins', ni 'add', ni 'remove' : le studio dit
-« Add the plugin in FL's channel rack; it appears here instantly ».
+supprimer un canal, choisir les ports MIDI d'un canal (getChannelMidiInPort se lit, rien ne l'ecrit).
+caps ne contient donc ni 'plugins', ni 'add', ni 'remove' : le studio dit « Add the plugin in FL's
+channel rack; it appears here instantly ».
+
+(26 oct., 1.2.0) Les notes par le plugin « Uppwind Link Notes » (cap 'notes'), le son par « Uppwind Link
+Return », les commandes toujours ici (FL refuse les sockets aux scripts, et un script ne vit que sur une
+entree MIDI : loopMIDI reste pour ces commandes). Le chemin d'une note :
+    studio -> compagnon -> Uppwind Link Notes (un canal du rack) --(son port de SORTIE MIDI, numero P)-->
+    l'instrument dont le port d'ENTREE MIDI est P
+Le script ne peut ni poser le plugin ni regler ces ports ; il les LIT. La regle, faite une fois a la main :
+le canal Uppwind Link Notes a ses ports d'entree ET de sortie sur P (le script ne lit que l'entree),
+l'instrument vise son port d'entree sur P. Le script donne alors au Notes le numero « Link tag » P (comme
+le script de Live) ; BIND.via 'plugin' -> BIND_ACK.notes = P : le studio envoie a ce Notes. Sans Notes sur
+le port de l'instrument (ou sans port) : BIND_ACK.via 'port', le script joue les notes recues comme avant.
+Les canaux Uppwind Link Notes ne sont pas listes (ce ne sont pas des instruments).
 
 Notes : channels.midiNoteOn(index global, note, velocite) -- 0 = note off (comme les scripts
 Novation d'Image-Line). Pedale (CC64) : emulee ici (les note off attendent le relachement), pour
@@ -54,11 +67,16 @@ import ui
 
 import uwlink_protocol as P
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 TAG = "[Uppwind Link]"
 DAW_NAME = "FL Studio"
-CAPS = ["list", "bind", "set", "audition", "tempo"]
+CAPS = ["list", "bind", "set", "audition", "tempo", "notes"]
 ADD_HINT = "Add the plugin in FL's channel rack; it appears here instantly."
+# (26 oct.) le plugin des notes, son parametre « Link tag » (0..255, 0 : aucun), les ports MIDI de FL
+NOTES_NAME = "Uppwind Link Notes"
+TAG_PARAM = "Link tag"
+TAG_MAX = 255
+PARAM_SCAN = 64             # le « Link tag » est parmi les premiers parametres (les noms vides au-dela)
 
 LIST_BUDGET = 20000         # octets de JSON par page de LIST_REPLY (100 morceaux, sous 25 600)
 CHANGE_SETTLE = 0.25        # s de calme avant de pousser CHANGED
@@ -137,6 +155,11 @@ class _State(object):
         self.tempo_hold_until = 0.0
         self.tempo_sent_at = -1e9
         self.last_tempo_check = 0.0
+        # (26 oct.) les notes par Uppwind Link Notes : index d'un Notes -> index de son « Link tag » (-1 : aucun) ;
+        # les numeros annonces (index -> tag) ; ce qui a ete dit au journal (pas deux fois la meme ligne)
+        self.tag_param = {}
+        self.tags = {}
+        self.said = {}
 
 
 S = _State()
@@ -222,6 +245,8 @@ def _item(i):
     t = _type(i)
     if t in (CT_AUDIOCLIP, CT_AUTOCLIP):
         return None
+    if _is_notes(i):
+        return None                 # (26 oct.) un Uppwind Link Notes n'est pas un instrument
     it = {"id": i, "name": _name(i)[:64], "plugin": _plugin_name(i, t)[:64], "kind": KIND.get(t, "plugin")}
     c = _color(i)
     if c:
@@ -230,6 +255,120 @@ def _item(i):
     if slots:
         it["slots"] = slots
     return it
+
+
+# -- (26 oct.) Les notes par Uppwind Link Notes ---------------------------------------------
+def _midi_port(i):
+    """Le port d'entree MIDI du canal (son wrapper : Settings > MIDI > Input port), ou -1 (aucun, clavier...)."""
+    try:
+        p = int(channels.getChannelMidiInPort(*_g(i)))
+    except Exception:
+        return -1
+    return p if p >= 0 else -1
+
+
+def _is_notes(i):
+    """Un canal qui porte Uppwind Link Notes (le nom du plugin, pas celui du canal : renomme, il le reste)."""
+    if not _plugin_valid(i):
+        return False
+    try:
+        n = str(plugins.getPluginName(*_pg(i, -1, False)) or "")
+    except Exception:
+        return False
+    return NOTES_NAME.lower() in n.lower()
+
+
+def _notes_channels():
+    return [j for j in range(_count_all()) if _type(j) == CT_GENPLUG and _is_notes(j)]
+
+
+def _tag_param(j):
+    """L'index du parametre « Link tag » du Notes j, ou -1 (un plugin d'avant le 25 oct.)."""
+    if j not in S.tag_param:
+        k = -1
+        try:
+            n = min(int(plugins.getParamCount(*_pg(j, -1))), PARAM_SCAN)
+            for p in range(n):
+                if str(plugins.getParamName(*((p,) + _pg(j, -1)))).strip().lower() == TAG_PARAM.lower():
+                    k = p
+                    break
+        except Exception:
+            k = -1
+        S.tag_param[j] = k
+    return S.tag_param[j]
+
+
+def _read_tag(j):
+    p = _tag_param(j)
+    if p < 0:
+        return None
+    try:
+        v = float(plugins.getParamValue(*((p,) + _pg(j, -1))))
+    except Exception:
+        return None
+    return max(0, min(TAG_MAX, int(round(v * TAG_MAX))))
+
+
+def _write_tag(j, n):
+    """Le numero n dans « Link tag » (la valeur normalisee d'un VST, 0..1) -> True si on le relit."""
+    p = _tag_param(j)
+    if p < 0:
+        return False
+    try:
+        plugins.setParamValue(*((float(n) / TAG_MAX, p) + _pg(j, -1, PIM_NONE)))
+    except Exception as e:
+        _log("cannot set the Link tag of '%s': %s" % (_name(j), e))
+        return False
+    return _read_tag(j) == n
+
+
+def _say(key, msg):
+    """Une ligne au journal (Script output), pas deux fois de suite la meme."""
+    if S.said.get(key) != msg:
+        S.said[key] = msg
+        _log(msg)
+
+
+def _sync_tags():
+    """Chaque Uppwind Link Notes prend pour « Link tag » son port MIDI (1..255 ; 0 sans port) : le studio le vise par
+    ce numero. -> {port: [index des Notes]}"""
+    by_port = {}
+    for j in _notes_channels():
+        port = _midi_port(j)
+        want = port if 1 <= port <= TAG_MAX else 0
+        have = _read_tag(j)
+        if have is None:
+            _say(("old", j), "'%s' is an older Uppwind Link Notes (no Link tag): install the new Uppwind Link plugins."
+                 % _name(j))
+            continue
+        if have != want:
+            if _write_tag(j, want):
+                _say(("tag", j), "'%s': Link tag %d (MIDI port %s)." % (_name(j), want, port if port >= 0 else "none"))
+            else:
+                continue
+        S.tags[j] = want
+        if want:
+            by_port.setdefault(want, []).append(j)
+    for port, js in by_port.items():
+        if len(js) > 1:
+            _say(("twins", port), "%d Uppwind Link Notes share MIDI port %d (%s): one per port, or the studio picks "
+                 "the first." % (len(js), port, ", ".join("'%s'" % _name(j) for j in js)))
+    return by_port
+
+
+def _notes_route(i, by_port=None):
+    """(tag, pourquoi) : le Notes qui joue le canal i (son port de sortie = le port d'entree de i), ou (0, la raison).
+    by_port : ce que _sync_tags vient de rendre (sinon il est refait)."""
+    port = _midi_port(i)
+    if not 1 <= port <= TAG_MAX:
+        return 0, ("'%s' has no MIDI input port: in its wrapper, Settings > MIDI > Input port, pick a free number "
+                   "(1 to 255), and give an Uppwind Link Notes the same Input and Output port." % _name(i))
+    if by_port is None:
+        by_port = _sync_tags()
+    if port not in by_port:
+        return 0, ("no Uppwind Link Notes on MIDI port %d (the Input port of '%s'): give one the same Input and "
+                   "Output port %d." % (port, _name(i), port))
+    return port, ""
 
 
 # -- Volume : la loi des canaux de FL -----------------------------------------------------
@@ -569,10 +708,11 @@ def _set(d):
 
 
 # -- Liens slot -> canal ------------------------------------------------------------------
-def _bind(slot, i):
+def _bind(slot, i, notes=0):
+    """notes (26 oct.) : le « Link tag » du Uppwind Link Notes qui joue ce canal (0 : les notes passent par ici)."""
     old = S.binds.get(slot)
     _release_slot(slot)
-    S.binds[slot] = {"index": i, "sig": _sig(i)}
+    S.binds[slot] = {"index": i, "sig": _sig(i), "notes": notes}
     if old is not None and old["index"] != i and old["index"] not in _bound_indexes():
         _restore(old["index"])
     _apply_mutes()
@@ -606,6 +746,8 @@ def _reset_session(restore=True):
         S.orig.clear()
         S.mute_want.clear()
     S.cc_params.clear()
+    S.tag_param.clear()
+    S.tags.clear()
 
 
 # -- La structure du rack a change ----------------------------------------------------------
@@ -632,6 +774,7 @@ def _remap(mapping):
         d.clear()
         d.update(moved)
     S.cc_params.clear()
+    S.tag_param.clear()
 
 
 def _rack(n):
@@ -676,6 +819,10 @@ def _reconcile_structure():
     _remap(mapping)
     S.count = n
     S.cc_params.clear()
+    S.tag_param.clear()
+    S.tags.clear()
+    if S.session:
+        _sync_tags()                # (26 oct.) un Notes ajoute, deplace : son numero suit son port
     sig = tuple(rack)
     first = S.list_sig is None
     if sig != S.list_sig or mapping:
@@ -683,6 +830,25 @@ def _reconcile_structure():
         if S.session and not first:
             _send(P.CHANGED, 0, {})
     _apply_mutes()
+
+
+def _check_routes():
+    """(26 oct.) Toutes les STRUCT_CHECK s : les numeros des Notes suivent leurs ports ; un lien par un Notes dont la
+    route a change (un port bouge, le Notes retire) tombe, et CHANGED le dit : le studio relie a nouveau (le Notes
+    du nouveau port, ou les notes par ici)."""
+    if not S.session:
+        return
+    by_port = _sync_tags()
+    lost = []
+    for slot, b in list(S.binds.items()):
+        if b.get("notes") and _notes_route(b["index"], by_port)[0] != b["notes"]:
+            lost.append(slot)
+    for slot in lost:
+        _log("the Uppwind Link Notes route of '%s' changed: the studio links it again." % _name(S.binds[slot]["index"]))
+        del S.binds[slot]
+        _release_slot(slot, send_off=False)
+    if lost:
+        _send(P.CHANGED, 0, {})
 
 
 def _mark_dirty():
@@ -818,14 +984,27 @@ def _dispatch(cmd, req, data):
             ack["bpm"] = bpm
         _send(P.HELLO_ACK, req, ack)
         _log("Uppwind Studio connected.")
+        _sync_tags()                # (26 oct.) les numeros des Uppwind Link Notes, des maintenant
     elif cmd == P.LIST:
         _send(P.LIST_REPLY, req, _list_page(d.get("start", 0)))
     elif cmd == P.BIND:
-        if not _playable(d["id"]):
+        if not _playable(d["id"]) or _is_notes(d["id"]):
             _error(req, P.ERR_NOT_FOUND, "No instrument at position %d of the channel rack." % (d["id"] + 1))
             return
-        _bind(d["slot"], d["id"])
-        _send(P.BIND_ACK, req, {"slot": d["slot"], "id": d["id"]})
+        # (26 oct.) via 'plugin' : le Uppwind Link Notes du port d'entree du canal, s'il y en a un ; sinon par ici
+        tag, why = (0, "")
+        if d.get("via") == "plugin":
+            tag, why = _notes_route(d["id"])
+        _bind(d["slot"], d["id"], tag)
+        ack = {"slot": d["slot"], "id": d["id"]}
+        if d.get("via") == "plugin":
+            ack["via"] = "plugin" if tag else "port"
+            if tag:
+                ack["notes"] = tag
+                _say(("route", d["slot"]), "'%s' plays from the Uppwind Link Notes on MIDI port %d." % (_name(d["id"]), tag))
+            else:
+                _say(("route", d["slot"]), "notes for '%s' come through loopMIDI: %s" % (_name(d["id"]), why))
+        _send(P.BIND_ACK, req, ack)
     elif cmd == P.UNBIND:
         _unbind(d["slot"])
     elif cmd == P.SET:
@@ -956,6 +1135,8 @@ def OnIdle():
             S.last_struct_check = now
             if _count_all() != S.count:
                 _mark_dirty()
+            else:
+                _check_routes()     # (26 oct.) les ports MIDI ne previennent pas quand ils changent
         if S.mute_want and now - S.last_mute_check >= MUTE_CHECK:
             S.last_mute_check = now
             _reconcile_mutes(now)

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+# Uppwind Link -- a macOS preview, started by hand (Actions > macos-preview > Run workflow, or
+# `gh workflow run macos-preview.yml`): the same signed, notarized and stapled .dmg as a release would carry
+# (macos-build.yml), kept as a workflow artifact only. No GitHub release, no tag: the Mac build has to pass a test in
+# a real DAW before release.yml ships it (repository variable MACOS_RELEASE=1).
+name: macos-preview
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    uses: ./.github/workflows/macos-build.yml
+    secrets:
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}

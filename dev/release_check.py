@@ -5,8 +5,8 @@
 
     python -I dev/release_check.py companion/target/release/uppwind-companion.exe [more files…]
 
-For every file: no absolute path of the machine that built it (C:\\Users\\…, a cargo registry or rustup folder,
-another drive's folder), in ASCII or UTF-16; for a Windows program, also: DLLs loaded from System32 only
+For every file: no absolute path of the machine that built it (C:\\Users\\…, /Users/…, a cargo registry or rustup
+folder, another drive's folder), in ASCII or UTF-16; for a Windows program, also: DLLs loaded from System32 only
 (DependentLoadFlags 0x800), no VCRUNTIME140 / api-ms-win-crt import (the C runtime is inside), a REPRO debug entry
 (reproducible build). Prints the SHA-256 of each file. Exit code 1 if anything is wrong. A .pdb is always refused:
 it is never published.
@@ -21,6 +21,8 @@ PATTERNS = [
     (re.compile(rb"\\\.cargo\\\\?registry|/\.cargo/registry", re.I), "the cargo registry"),
     (re.compile(rb"\\\.rustup\\\\?toolchains|/\.rustup/toolchains", re.I), "a rustup toolchain"),
     (re.compile(rb"\b[D-Z]:\\\\?[A-Za-z0-9_.-]+\\\\?", re.I), "a folder on another drive"),
+    # a macOS (or Linux) home folder: /Users/<name>/…, /home/<name>/… (/Users/Shared is not anyone's)
+    (re.compile(rb"/(?:Users/(?!Shared/)|home/)[A-Za-z0-9_.-]+/"), "a user folder"),
 ]
 
 

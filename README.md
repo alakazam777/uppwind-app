@@ -77,7 +77,7 @@ The companion is a program on your computer that a web page can talk to. It is b
 | DAW | Status |
 |---|---|
 | **Ableton Live** 11 / 12 | Instruments listed, added (on a new MIDI track) and removed, notes, volume / pan / mute / solo, shared tempo. Plugin windows open and close from the studio with **Live 12.4.3 or later**. |
-| **FL Studio** 21.2 or newer | Channel-rack instruments listed, notes, volume / pan / mute / solo, shared tempo. FL's scripting API cannot load a plugin or delete a channel: add plugins in FL's channel rack. Plugin windows in the studio: not yet (the companion follows Live's windows). |
+| **FL Studio** 21.2 or newer | Channel-rack instruments listed, notes, volume / pan / mute / solo, shared tempo. With the Uppwind Link plugins, notes go through *Uppwind Link Notes* (sample-accurate) and the sound through *Uppwind Link Return*; the script's commands still use loopMIDI (FL runs scripts only on a MIDI input and refuses them network sockets). Without loopMIDI at all, "plugins only": each Uppwind Link Notes is an instrument, the tempo follows FL, no remote channel volume / pan / mute ([details](fl-studio/README.md)). FL's scripting API cannot load a plugin, delete a channel or set its MIDI ports: add plugins in FL's channel rack. Plugin windows in the studio: not yet (the companion follows Live's windows). |
 | Bitwig Studio, REAPER | Not yet; both have APIs that would allow it. |
 | Logic Pro | Not possible: Logic has no comparable scripting API. |
 

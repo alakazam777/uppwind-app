@@ -8,9 +8,11 @@
 Two files: THIRD-PARTY-NOTICES.txt (the companion, uppwind-companion.exe) and, when plugin/plugins/ is there,
 plugin/THIRD-PARTY-NOTICES.txt (the Uppwind Link plugins, the .vst3 bundle). Asks cargo which crates end up in each Windows binary (`cargo tree --target
 x86_64-pc-windows-msvc -e normal`, proc macros and their build-only dependencies left out, our own path crates
-left out), then reads each crate's licence files from the local cargo registry (CARGO_HOME, %USERPROFILE%\\.cargo
-by default). Run it after any dependency change; --check only says whether the files are up to date (for CI).
-Nothing is downloaded: build the companion and the plugins once first.
+left out), and for the companion also in the macOS one (aarch64-apple-darwin and x86_64-apple-darwin: the crates
+only the Mac program links get a list of their own), then reads each crate's licence files from the local cargo
+registry (CARGO_HOME, %USERPROFILE%\\.cargo by default). Run it after any dependency change; --check only says
+whether the files are up to date (for CI). Nothing is downloaded: `cargo fetch --locked --manifest-path
+companion/Cargo.toml` once first (it fetches the crates of every target, the macOS ones included).
 """
 import os
 import re
@@ -22,14 +24,15 @@ LINK = os.path.dirname(HERE)
 OUT = os.path.join(LINK, "THIRD-PARTY-NOTICES.txt")
 PLUGIN_OUT = os.path.join(LINK, "plugin", "THIRD-PARTY-NOTICES.txt")
 TARGET = "x86_64-pc-windows-msvc"
+MAC_TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 
 
-def linked_and_build_only(manifest, package=None):
+def linked_and_build_only(manifest, package=None, target=TARGET):
     """(linked, build_only) : [(name, version)] from cargo tree. Path crates (ours: uwl-proto…) are left out."""
     cmd = ["cargo", "tree", "--offline", "--locked", "--manifest-path", manifest]
     if package:
         cmd += ["-p", package]
-    cmd += ["--target", TARGET, "-e", "normal", "--prefix", "depth", "--format", "{p}"]
+    cmd += ["--target", target, "-e", "normal", "--prefix", "depth", "--format", "{p}"]
     out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
     linked, build, macro_depth = {}, set(), None
     for line in out.splitlines():
@@ -104,7 +107,8 @@ def copyright_lines(d):
     out = []
     for f in licence_files(d):
         t = open(os.path.join(d, f), encoding="utf-8").read()
-        out += [l.strip() for l in t.splitlines() if l.strip().lower().startswith("copyright ") and "[yyyy]" not in l]
+        out += [l.strip() for l in t.splitlines() if l.strip().lower().startswith("copyright ") and "[yyyy]" not in l
+                and not l.strip().lower().startswith("copyright holders")]
     return out
 
 
@@ -173,6 +177,11 @@ def chosen(name, ver, d, lic):
         if not t:
             raise SystemExit("no CC0 text for %s %s" % (name, ver))
         return [("CC0-1.0", t)]
+    if lic == "MPL-2.0":  # option-ext, macOS only: file-level copyleft, compatible with the GPL (MPL-2.0 section 3.3)
+        t = read_text(d, ("LICENSE", "LICENSE.txt", "LICENSE.md", "LICENSE-MPL"), "Mozilla Public License Version 2.0")
+        if not t:
+            raise SystemExit("no MPL-2.0 text for %s %s" % (name, ver))
+        return [("MPL-2.0", t)]
     if lic == "Apache-2.0":
         t = read_text(d, ("LICENSE-APACHE", "LICENSE"), "Apache License")
         if not t:
@@ -197,15 +206,19 @@ WEBVIEW2_LOADER = [
 
 COMPANION_HEAD = [
     "Uppwind Link companion -- third-party notices", "=" * 46, "",
-    "The Uppwind Link companion (uppwind-companion.exe) is free software under the GNU General Public License,",
-    "version 3 or (at your option) any later version: see LICENSE. It is built with the Rust crates listed",
-    "below, downloaded from crates.io when you build it (none of their source is in this repository).", "",
+    "The Uppwind Link companion (uppwind-companion.exe on Windows, uppwind-companion on macOS) is free software under",
+    "the GNU General Public License, version 3 or (at your option) any later version: see LICENSE. It is built with",
+    "the Rust crates listed below, downloaded from crates.io when you build it (none of their source is in this",
+    "repository): a first list for Windows, then the crates that only the macOS program links.", "",
     "Crates offered under \"MIT OR Apache-2.0\", \"Apache-2.0 OR MIT\", \"MIT OR Apache-2.0 OR Zlib\" or",
     "\"Unlicense OR MIT\" are used under the MIT option; the others under the licence given in the list (Apache-2.0,",
-    "Unicode-3.0, CC0-1.0), all compatible with the GPL version 3. jpeg-encoder also contains code derived from the",
-    "Independent JPEG Group's software (its fdct.rs and quantization tables), under the IJG licence below:", "",
+    "Unicode-3.0, CC0-1.0, MPL-2.0), all compatible with the GPL version 3. jpeg-encoder also contains code derived",
+    "from the Independent JPEG Group's software (its fdct.rs and quantization tables), under the IJG licence below:", "",
     "    This software is based in part on the work of the Independent JPEG Group.", "",
-    "zmij is a Rust port of Victor Zverovich's Zmij (C++, MIT licence).", ""] + WEBVIEW2_LOADER + ["",
+    "zmij is a Rust port of Victor Zverovich's Zmij (C++, MIT licence).", "",
+    "option-ext (macOS program only) is under the Mozilla Public License 2.0 (text below), used unmodified: its source",
+    "code is available from crates.io (https://crates.io/crates/option-ext) and from its repository given in the list.",
+    "The MPL-2.0 allows its combination with the GPL (its section 3.3).", ""] + WEBVIEW2_LOADER + ["",
     "The scripts for Ableton Live and FL Studio (ableton/UppwindLink/, fl-studio/, shared/) are under the MIT",
     "licence (LICENSE-MIT), also the copies that the companion embeds and installs (--setup). They, the dev tool",
     "and the tests use only the Python standard library.", ""]
@@ -225,32 +238,50 @@ PLUGIN_HEAD = [
     "bundle.", ""]
 
 
-def render(head, title, manifest, package=None):
+def render(head, title, manifest, package=None, mac_title=None):
+    """The notices of one program: its Windows crates, then (mac_title given) the crates only its macOS build links."""
     linked, build_only = linked_and_build_only(manifest, package)
-    rows, groups, ijg = [], {}, None
-    for name, ver in linked:
-        d = crate_dir(name, ver)
-        cargo = open(os.path.join(d, "Cargo.toml"), encoding="utf-8").read()
-        lic = toml_field(cargo, "license") or "?"
-        texts = chosen(name, ver, d, lic)
-        holders = []
-        for kind, t in texts:
-            holders += [l.strip() for l in t.splitlines() if l.strip().lower().startswith("copyright") and "notice" not in l.lower() and "[yyyy]" not in l]
-            groups.setdefault((kind, t), []).append("%s %s" % (name, ver))
-        if texts[0][0] == "Unicode-3.0" or texts[0][0] == "CC0-1.0":
-            holders = [h for h in holders if h.lower().startswith("copyright ©") or h.lower().startswith("copyright (c)")][:1]
-        rows.append((name, ver, lic, holders, toml_field(cargo, "authors") or "", toml_field(cargo, "repository") or ""))
-        if "IJG" in lic:
-            ijg = open(os.path.join(d, "LICENSE-IJG"), encoding="utf-8").read().replace("\r\n", "\n").strip("\n")
+    lists = [(title, linked)]
+    if mac_title:
+        mac, mac_build = set(), set(build_only)
+        for t in MAC_TARGETS:
+            l, b = linked_and_build_only(manifest, package, t)
+            mac.update(l)
+            mac_build.update(b)
+        lists.append((mac_title, sorted(mac - set(linked))))
+        everything = {n for _, crates in lists for n, _ in crates}
+        build_only = sorted(mac_build - everything)
+    groups, ijg, sections = {}, None, []
+    for list_title, crates in lists:
+        rows = []
+        for name, ver in crates:
+            d = crate_dir(name, ver)
+            cargo = open(os.path.join(d, "Cargo.toml"), encoding="utf-8").read()
+            lic = toml_field(cargo, "license") or "?"
+            texts = chosen(name, ver, d, lic)
+            holders = []
+            for kind, t in texts:
+                # (a wrapped MIT text has a line starting « COPYRIGHT HOLDERS BE LIABLE »: not a holder)
+                holders += [l.strip() for l in t.splitlines() if l.strip().lower().startswith("copyright") and "notice" not in l.lower()
+                            and "[yyyy]" not in l and not l.strip().lower().startswith("copyright holders")]
+                groups.setdefault((kind, t), []).append("%s %s" % (name, ver))
+            if texts[0][0] in ("Unicode-3.0", "CC0-1.0", "MPL-2.0"):
+                holders = [h for h in holders if h.lower().startswith("copyright ©") or h.lower().startswith("copyright (c)")][:1]
+            rows.append((name, ver, lic, holders, toml_field(cargo, "authors") or "", toml_field(cargo, "repository") or ""))
+            if "IJG" in lic:
+                ijg = open(os.path.join(d, "LICENSE-IJG"), encoding="utf-8").read().replace("\r\n", "\n").strip("\n")
+        sections.append((list_title, rows))
     no_mail = lambda s: re.sub(r"\s*<[^>]*@[^>]*>", "", s)  # noqa: E731 (the licence texts below keep them verbatim)
-    w = list(head) + [title, "-" * 74]
-    for name, ver, lic, holders, authors, repo in rows:
-        who = no_mail("; ".join(dict.fromkeys(holders)) if holders else ("authors: " + authors if authors else ""))
-        w.append("  %-20s %-9s %s" % (name, ver, lic))
-        if who:
-            w.append("      %s" % who)
-        if repo:
-            w.append("      %s" % repo)
+    w = list(head)
+    for i, (list_title, rows) in enumerate(sections):
+        w += ([""] if i else []) + [list_title, "-" * 74]
+        for name, ver, lic, holders, authors, repo in rows:
+            who = no_mail("; ".join(dict.fromkeys(holders)) if holders else ("authors: " + authors if authors else ""))
+            w.append("  %-20s %-9s %s" % (name, ver, lic))
+            if who:
+                w.append("      %s" % who)
+            if repo:
+                w.append("      %s" % repo)
     w += ["", "Used only while building (not part of the program): " + ", ".join(build_only) + ".", "",
           "Licence texts", "-" * 13]
     for (kind, text), crates in sorted(groups.items(), key=lambda kv: (kv[1][0], kv[0][0])):
@@ -264,7 +295,8 @@ def render(head, title, manifest, package=None):
 def main():
     files = [
         (OUT, render(COMPANION_HEAD, "Crates linked into uppwind-companion.exe (Windows, %s)" % TARGET,
-                     os.path.join(LINK, "companion", "Cargo.toml"))),
+                     os.path.join(LINK, "companion", "Cargo.toml"),
+                     mac_title="Crates linked only into the macOS uppwind-companion (%s)" % ", ".join(MAC_TARGETS))),
     ]
     # the plugins are not in every copy of this folder (not published yet: only plugin/proto is, for the companion)
     if os.path.isfile(os.path.join(LINK, "plugin", "plugins", "Cargo.toml")):
