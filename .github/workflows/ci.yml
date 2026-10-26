@@ -83,10 +83,14 @@ jobs:
         run: |
           cargo install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
           cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      # cargo audit reads the whole Cargo.lock, Linux crates included. The two ignored advisories are in crates that only
+      # Linux builds would link (the GTK stack of tao/muda: glib, proc-macro-error), never the Windows or macOS
+      # companion: `cargo tree --target <each target> -i glib` prints nothing. cargo deny below, which looks at the
+      # Windows and macOS targets only (deny.toml), checks every advisory with no exception.
       - name: cargo audit
-        run: cargo audit --deny warnings --file companion/Cargo.lock
+        run: cargo audit --deny warnings --file companion/Cargo.lock --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2024-0370
       - name: cargo deny
-        run: cargo deny --manifest-path companion/Cargo.toml check --config deny.toml advisories bans licenses sources
+        run: cargo deny --manifest-path companion/Cargo.toml --config deny.toml check advisories bans licenses sources
 
   secrets:
     name: Secrets (gitleaks, tree and history)

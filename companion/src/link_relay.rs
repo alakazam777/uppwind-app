@@ -502,7 +502,8 @@ mod tests {
         let got = collect(&r, |a| a.iter().any(|o| matches!(o, LinkOut::Chunks(_))));
         let ms = t0.elapsed().as_millis();
         assert_eq!(got[0], LinkOut::Chunks(vec![pong]));
-        assert!(ms < 40, "the command waited {ms} ms");
+        // far below WAIT_MS (400 ms): a busy machine (a CI runner) can take some tens of ms
+        assert!(ms < 150, "the command waited {ms} ms");
         let mut got = got;
         if got.len() < 2 {
             got.extend(collect(&r, |a| a.iter().any(|o| matches!(o, LinkOut::Chunks(_)))));

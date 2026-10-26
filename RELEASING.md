@@ -11,7 +11,7 @@ Both pin every action by its commit SHA and every tool by its version (gitleaks 
 
 ## Before every release
 
-1. **Dependencies** (online): `cargo audit --file companion/Cargo.lock` and `cargo deny --manifest-path companion/Cargo.toml check --config deny.toml advisories bans licenses sources` must pass (the `ci` workflow runs both). Then `python -I dev/third_party_notices.py --check`: after any dependency change, rerun it without `--check` and commit `THIRD-PARTY-NOTICES.txt`.
+1. **Dependencies** (online): `cargo audit --deny warnings --file companion/Cargo.lock` (two advisories of Linux-only crates ignored, see `ci.yml`) and `cargo deny --manifest-path companion/Cargo.toml --config deny.toml check advisories bans licenses sources` must pass (the `ci` workflow runs both). Then `python -I dev/third_party_notices.py --check`: after any dependency change, rerun it without `--check` and commit `THIRD-PARTY-NOTICES.txt`.
 2. **Secrets and personal data** in the sources (and in the git history of this repository): `gitleaks detect` must find nothing. Look at every new file before the commit that adds it.
 3. **Tests**: the commands of *Build from source* in the README, all green.
 4. **Build from a clean checkout of the release tag**, ideally in CI (a GitHub Actions Windows runner), never from a working copy with stray files:

@@ -846,7 +846,25 @@ pub(crate) mod tests {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let d = std::env::temp_dir().join(format!("uwc-setup-test-{tag}-{}-{t}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        long_path(d)
+    }
+
+    /// Windows: TEMP can be a short 8.3 path (C:\Users\RUNNER~1\… on a CI runner) while a shortcut stores the long
+    /// one: the tests work with the long form. Elsewhere: unchanged.
+    pub fn long_path(d: PathBuf) -> PathBuf {
+        if !cfg!(windows) {
+            return d;
+        }
+        match std::fs::canonicalize(&d) {
+            Ok(p) => {
+                let s = p.to_string_lossy().into_owned();
+                match s.strip_prefix(r"\\?\") {
+                    Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+                    _ => d,
+                }
+            }
+            Err(_) => d,
+        }
     }
 
     /// Une fausse machine typique : Live 12.4.3 et 12.4.6 (la meme User Library, deplacee sur un autre disque), FL

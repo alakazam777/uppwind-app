@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Uppwind
 # Uppwind Link -- cargo deny's rules for the companion (CI and RELEASING.md step 1):
-#   cargo deny --manifest-path companion/Cargo.toml check --config deny.toml advisories bans licenses sources
+#   cargo deny --manifest-path companion/Cargo.toml --config deny.toml check advisories bans licenses sources
 
 [graph]
 # the systems the companion is built for

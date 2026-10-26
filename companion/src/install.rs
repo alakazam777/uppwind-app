@@ -620,7 +620,7 @@ mod tests {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let d = std::env::temp_dir().join(format!("uwc-install-test-{tag}-{}-{t}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::setup::tests::long_path(d)
     }
     fn dirs_in(root: &Path) -> Dirs {
         let env: HashMap<&str, OsString> = HashMap::from([(ROOT_ENV, root.as_os_str().to_owned())]);
