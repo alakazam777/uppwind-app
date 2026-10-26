@@ -130,14 +130,28 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
+          # a value pasted with a newline or spaces around it is refused by Apple (HTTP 401): trim them
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
+          APPLE_ID=$(trim "$APPLE_ID")
+          APPLE_TEAM_ID=$(trim "$APPLE_TEAM_ID")
+          APPLE_APP_PASSWORD=$(trim "$APPLE_APP_PASSWORD")
+          # the shape of the secrets (yes/no only, never a value)
+          yn() { if printf '%s' "$2" | grep -Eq "$1"; then echo yes; else echo no; fi; }
+          echo "APPLE_ID looks like an e-mail address: $(yn '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' "$APPLE_ID")"
+          echo "APPLE_TEAM_ID is 10 capitals/digits: $(yn '^[A-Z0-9]{10}$' "$APPLE_TEAM_ID")"
+          echo "APPLE_APP_PASSWORD is xxxx-xxxx-xxxx-xxxx: $(yn '^[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}$' "$APPLE_APP_PASSWORD")"
           set +e
           xcrun notarytool submit dist/uppwind-companion-macos.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait --timeout 45m --output-format json > "$RUNNER_TEMP/notary.json"
           rc=$?
           set -e
           cat "$RUNNER_TEMP/notary.json"
           echo
-          SUB_ID=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$RUNNER_TEMP/notary.json" || true)
-          STATUS=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' "$RUNNER_TEMP/notary.json" || true)
+          SUB_ID=""
+          STATUS=""
+          if [ -s "$RUNNER_TEMP/notary.json" ]; then
+            SUB_ID=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$RUNNER_TEMP/notary.json" || true)
+            STATUS=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", ""))' "$RUNNER_TEMP/notary.json" || true)
+          fi
           echo "notarization: id=$SUB_ID status=$STATUS (exit $rc)"
           if [ -n "$SUB_ID" ]; then
             xcrun notarytool log "$SUB_ID" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" || true
