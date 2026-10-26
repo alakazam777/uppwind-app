@@ -1,0 +1,643 @@
+{
+ "about": "Uppwind Link golden fixtures, generated from the protocol's reference JavaScript implementation (link-protocol.js, in Uppwind Studio); uwlink_protocol.py must agree byte for byte.",
+ "cases": [
+  {
+   "name": "hello",
+   "cmd": 1,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "app": "Uppwind Studio"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 01 01 00 01 7B 22 76 22 3A 31 2C 22 61 70 70 22 3A 22 55 70 70 77 69 6E 64 20 53 74 75 64 69 6F 22 7D F7"
+   ]
+  },
+  {
+   "name": "hello-ack-fl",
+   "cmd": 2,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "daw": "FL Studio",
+    "dawVersion": "2026.1.0.5000",
+    "project": "Night drive",
+    "caps": [
+     "list",
+     "bind",
+     "set",
+     "audition"
+    ]
+   },
+   "chunks": [
+    "F0 7D 55 57 01 02 01 00 01 7B 22 76 22 3A 31 2C 22 64 61 77 22 3A 22 46 4C 20 53 74 75 64 69 6F 22 2C 22 64 61 77 56 65 72 73 69 6F 6E 22 3A 22 32 30 32 36 2E 31 2E 30 2E 35 30 30 30 22 2C 22 70 72 6F 6A 65 63 74 22 3A 22 4E 69 67 68 74 20 64 72 69 76 65 22 2C 22 63 61 70 73 22 3A 5B 22 6C 69 73 74 22 2C 22 62 69 6E 64 22 2C 22 73 65 74 22 2C 22 61 75 64 69 74 69 6F 6E 22 5D 7D F7"
+   ]
+  },
+  {
+   "name": "hello-ack-live",
+   "cmd": 2,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "daw": "Ableton Live",
+    "dawVersion": "12.1",
+    "project": "",
+    "caps": [
+     "list",
+     "bind",
+     "set",
+     "plugins",
+     "add",
+     "remove",
+     "audition"
+    ]
+   },
+   "chunks": [
+    "F0 7D 55 57 01 02 01 00 01 7B 22 76 22 3A 31 2C 22 64 61 77 22 3A 22 41 62 6C 65 74 6F 6E 20 4C 69 76 65 22 2C 22 64 61 77 56 65 72 73 69 6F 6E 22 3A 22 31 32 2E 31 22 2C 22 70 72 6F 6A 65 63 74 22 3A 22 22 2C 22 63 61 70 73 22 3A 5B 22 6C 69 73 74 22 2C 22 62 69 6E 64 22 2C 22 73 65 74 22 2C 22 70 6C 75 67 69 6E 73 22 2C 22 61 64 64 22 2C 22 72 65 6D 6F 76 65 22 2C 22 61 75 64 69 74 69 6F 6E 22 5D 7D F7"
+   ]
+  },
+  {
+   "name": "list",
+   "cmd": 16,
+   "req": 2,
+   "data": {},
+   "chunks": [
+    "F0 7D 55 57 01 10 02 00 01 7B 7D F7"
+   ]
+  },
+  {
+   "name": "list-page-2",
+   "cmd": 16,
+   "req": 3,
+   "data": {
+    "start": 40
+   },
+   "chunks": [
+    "F0 7D 55 57 01 10 03 00 01 7B 22 73 74 61 72 74 22 3A 34 30 7D F7"
+   ]
+  },
+  {
+   "name": "list-reply",
+   "cmd": 17,
+   "req": 2,
+   "data": {
+    "items": [
+     {
+      "id": 0,
+      "name": "Sampler",
+      "plugin": "Sampler",
+      "kind": "sampler",
+      "color": "#5f7581"
+     },
+     {
+      "id": 1,
+      "name": "Café ☕ Keys 🎹",
+      "plugin": "Keyscape",
+      "kind": "plugin",
+      "color": "#a1b2c3",
+      "slots": [
+       1
+      ]
+     },
+     {
+      "id": 7,
+      "name": "Bass \"Sub\"\\Low",
+      "plugin": "Serum",
+      "kind": "plugin",
+      "color": "#ff8800",
+      "slots": [
+       2,
+       5
+      ]
+     }
+    ]
+   },
+   "chunks": [
+    "F0 7D 55 57 01 11 02 00 00 7B 22 69 74 65 6D 73 22 3A 5B 7B 22 69 64 22 3A 30 2C 22 6E 61 6D 65 22 3A 22 53 61 6D 70 6C 65 72 22 2C 22 70 6C 75 67 69 6E 22 3A 22 53 61 6D 70 6C 65 72 22 2C 22 6B 69 6E 64 22 3A 22 73 61 6D 70 6C 65 72 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 35 66 37 35 38 31 22 7D 2C 7B 22 69 64 22 3A 31 2C 22 6E 61 6D 65 22 3A 22 43 61 66 5C 75 30 30 65 39 20 5C 75 32 36 31 35 20 4B 65 79 73 20 5C 75 64 38 33 63 5C 75 64 66 62 39 22 2C 22 70 6C 75 67 69 6E 22 3A 22 4B 65 79 73 63 61 70 65 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 61 31 62 32 63 33 22 2C 22 73 6C 6F F7",
+    "F0 7D 55 57 01 11 02 01 01 74 73 22 3A 5B 31 5D 7D 2C 7B 22 69 64 22 3A 37 2C 22 6E 61 6D 65 22 3A 22 42 61 73 73 20 5C 22 53 75 62 5C 22 5C 5C 4C 6F 77 22 2C 22 70 6C 75 67 69 6E 22 3A 22 53 65 72 75 6D 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 66 66 38 38 30 30 22 2C 22 73 6C 6F 74 73 22 3A 5B 32 2C 35 5D 7D 5D 7D F7"
+   ]
+  },
+  {
+   "name": "list-reply-long",
+   "cmd": 17,
+   "req": 4,
+   "data": {
+    "items": [
+     {
+      "id": 0,
+      "name": "Instrument 0 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 1,
+      "name": "Instrument 1 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 2,
+      "name": "Instrument 2 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 3,
+      "name": "Instrument 3 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 4,
+      "name": "Instrument 4 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 5,
+      "name": "Instrument 5 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 6,
+      "name": "Instrument 6 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 7,
+      "name": "Instrument 7 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     },
+     {
+      "id": 8,
+      "name": "Instrument 8 — très long nom",
+      "plugin": "Vital",
+      "kind": "plugin",
+      "color": "#102030"
+     }
+    ],
+    "next": 9
+   },
+   "chunks": [
+    "F0 7D 55 57 01 11 04 00 00 7B 22 69 74 65 6D 73 22 3A 5B 7B 22 69 64 22 3A 30 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 30 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 31 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 31 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 F7",
+    "F0 7D 55 57 01 11 04 01 00 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 32 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 32 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 33 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 33 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 F7",
+    "F0 7D 55 57 01 11 04 02 00 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 34 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 34 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 35 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 35 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 F7",
+    "F0 7D 55 57 01 11 04 03 00 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 36 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 36 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 37 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 37 20 5C 75 32 30 31 F7",
+    "F0 7D 55 57 01 11 04 04 01 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 2C 7B 22 69 64 22 3A 38 2C 22 6E 61 6D 65 22 3A 22 49 6E 73 74 72 75 6D 65 6E 74 20 38 20 5C 75 32 30 31 34 20 74 72 5C 75 30 30 65 38 73 20 6C 6F 6E 67 20 6E 6F 6D 22 2C 22 70 6C 75 67 69 6E 22 3A 22 56 69 74 61 6C 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 31 30 32 30 33 30 22 7D 5D 2C 22 6E 65 78 74 22 3A 39 7D F7"
+   ]
+  },
+  {
+   "name": "list-reply-last-page",
+   "cmd": 17,
+   "req": 5,
+   "data": {
+    "items": [],
+    "next": null
+   },
+   "chunks": [
+    "F0 7D 55 57 01 11 05 00 01 7B 22 69 74 65 6D 73 22 3A 5B 5D 2C 22 6E 65 78 74 22 3A 6E 75 6C 6C 7D F7"
+   ]
+  },
+  {
+   "name": "changed",
+   "cmd": 18,
+   "req": 0,
+   "data": {},
+   "chunks": [
+    "F0 7D 55 57 01 12 00 00 01 7B 7D F7"
+   ]
+  },
+  {
+   "name": "bind",
+   "cmd": 32,
+   "req": 6,
+   "data": {
+    "slot": 1,
+    "id": 7
+   },
+   "chunks": [
+    "F0 7D 55 57 01 20 06 00 01 7B 22 73 6C 6F 74 22 3A 31 2C 22 69 64 22 3A 37 7D F7"
+   ]
+  },
+  {
+   "name": "bind-ack",
+   "cmd": 33,
+   "req": 6,
+   "data": {
+    "slot": 1,
+    "id": 7
+   },
+   "chunks": [
+    "F0 7D 55 57 01 21 06 00 01 7B 22 73 6C 6F 74 22 3A 31 2C 22 69 64 22 3A 37 7D F7"
+   ]
+  },
+  {
+   "name": "unbind",
+   "cmd": 34,
+   "req": 8,
+   "data": {
+    "slot": 16
+   },
+   "chunks": [
+    "F0 7D 55 57 01 22 08 00 01 7B 22 73 6C 6F 74 22 3A 31 36 7D F7"
+   ]
+  },
+  {
+   "name": "set-all",
+   "cmd": 48,
+   "req": 9,
+   "data": {
+    "id": 7,
+    "vol": 0.64,
+    "pan": -0.25,
+    "mute": false,
+    "solo": true
+   },
+   "chunks": [
+    "F0 7D 55 57 01 30 09 00 01 7B 22 69 64 22 3A 37 2C 22 76 6F 6C 22 3A 30 2E 36 34 2C 22 70 61 6E 22 3A 2D 30 2E 32 35 2C 22 6D 75 74 65 22 3A 66 61 6C 73 65 2C 22 73 6F 6C 6F 22 3A 74 72 75 65 7D F7"
+   ]
+  },
+  {
+   "name": "set-vol-rounded",
+   "cmd": 48,
+   "req": 10,
+   "data": {
+    "id": 7,
+    "vol": 0.1235
+   },
+   "chunks": [
+    "F0 7D 55 57 01 30 0A 00 01 7B 22 69 64 22 3A 37 2C 22 76 6F 6C 22 3A 30 2E 31 32 33 35 7D F7"
+   ]
+  },
+  {
+   "name": "plugins",
+   "cmd": 64,
+   "req": 11,
+   "data": {},
+   "chunks": [
+    "F0 7D 55 57 01 40 0B 00 01 7B 7D F7"
+   ]
+  },
+  {
+   "name": "plugins-reply",
+   "cmd": 65,
+   "req": 11,
+   "data": {
+    "items": [
+     {
+      "id": "query:Synths#Wavetable",
+      "name": "Wavetable",
+      "vendor": "Ableton",
+      "kind": "instrument"
+     },
+     {
+      "id": "query:Plugins#VST3:Xfer%20Records:Serum",
+      "name": "Serum",
+      "vendor": "Xfer Records",
+      "kind": "plugin"
+     }
+    ]
+   },
+   "chunks": [
+    "F0 7D 55 57 01 41 0B 00 00 7B 22 69 74 65 6D 73 22 3A 5B 7B 22 69 64 22 3A 22 71 75 65 72 79 3A 53 79 6E 74 68 73 23 57 61 76 65 74 61 62 6C 65 22 2C 22 6E 61 6D 65 22 3A 22 57 61 76 65 74 61 62 6C 65 22 2C 22 76 65 6E 64 6F 72 22 3A 22 41 62 6C 65 74 6F 6E 22 2C 22 6B 69 6E 64 22 3A 22 69 6E 73 74 72 75 6D 65 6E 74 22 7D 2C 7B 22 69 64 22 3A 22 71 75 65 72 79 3A 50 6C 75 67 69 6E 73 23 56 53 54 33 3A 58 66 65 72 25 32 30 52 65 63 6F 72 64 73 3A 53 65 72 75 6D 22 2C 22 6E 61 6D 65 22 3A 22 53 65 72 75 6D 22 2C 22 76 65 6E 64 6F 72 22 3A 22 58 66 65 72 20 52 65 63 6F 72 64 73 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 F7",
+    "F0 7D 55 57 01 41 0B 01 01 6E 22 7D 5D 7D F7"
+   ]
+  },
+  {
+   "name": "add",
+   "cmd": 66,
+   "req": 12,
+   "data": {
+    "plugin": "query:Plugins#VST3:Xfer%20Records:Serum",
+    "name": "Lead"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 42 0C 00 01 7B 22 70 6C 75 67 69 6E 22 3A 22 71 75 65 72 79 3A 50 6C 75 67 69 6E 73 23 56 53 54 33 3A 58 66 65 72 25 32 30 52 65 63 6F 72 64 73 3A 53 65 72 75 6D 22 2C 22 6E 61 6D 65 22 3A 22 4C 65 61 64 22 7D F7"
+   ]
+  },
+  {
+   "name": "added",
+   "cmd": 67,
+   "req": 12,
+   "data": {
+    "item": {
+     "id": 4,
+     "name": "Lead",
+     "plugin": "Serum",
+     "kind": "plugin",
+     "color": "#ff0000"
+    }
+   },
+   "chunks": [
+    "F0 7D 55 57 01 43 0C 00 01 7B 22 69 74 65 6D 22 3A 7B 22 69 64 22 3A 34 2C 22 6E 61 6D 65 22 3A 22 4C 65 61 64 22 2C 22 70 6C 75 67 69 6E 22 3A 22 53 65 72 75 6D 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 66 66 30 30 30 30 22 7D 7D F7"
+   ]
+  },
+  {
+   "name": "remove",
+   "cmd": 68,
+   "req": 13,
+   "data": {
+    "id": 4
+   },
+   "chunks": [
+    "F0 7D 55 57 01 44 0D 00 01 7B 22 69 64 22 3A 34 7D F7"
+   ]
+  },
+  {
+   "name": "hello-with-caps",
+   "cmd": 1,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "app": "Uppwind Studio",
+    "caps": [
+     "tempo"
+    ]
+   },
+   "chunks": [
+    "F0 7D 55 57 01 01 01 00 01 7B 22 76 22 3A 31 2C 22 61 70 70 22 3A 22 55 70 70 77 69 6E 64 20 53 74 75 64 69 6F 22 2C 22 63 61 70 73 22 3A 5B 22 74 65 6D 70 6F 22 5D 7D F7"
+   ]
+  },
+  {
+   "name": "hello-ack-fl-tempo",
+   "cmd": 2,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "daw": "FL Studio",
+    "dawVersion": "2026.1.0 build 5123, API 40",
+    "project": "Night drive",
+    "caps": [
+     "list",
+     "bind",
+     "set",
+     "audition",
+     "tempo"
+    ],
+    "bpm": 140
+   },
+   "chunks": [
+    "F0 7D 55 57 01 02 01 00 01 7B 22 76 22 3A 31 2C 22 64 61 77 22 3A 22 46 4C 20 53 74 75 64 69 6F 22 2C 22 64 61 77 56 65 72 73 69 6F 6E 22 3A 22 32 30 32 36 2E 31 2E 30 20 62 75 69 6C 64 20 35 31 32 33 2C 20 41 50 49 20 34 30 22 2C 22 70 72 6F 6A 65 63 74 22 3A 22 4E 69 67 68 74 20 64 72 69 76 65 22 2C 22 63 61 70 73 22 3A 5B 22 6C 69 73 74 22 2C 22 62 69 6E 64 22 2C 22 73 65 74 22 2C 22 61 75 64 69 74 69 6F 6E 22 2C 22 74 65 6D 70 6F 22 5D 2C 22 62 70 6D 22 3A 31 34 30 7D F7"
+   ]
+  },
+  {
+   "name": "hello-ack-live-tempo",
+   "cmd": 2,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "daw": "Ableton Live",
+    "dawVersion": "12.4.6",
+    "project": "",
+    "caps": [
+     "list",
+     "bind",
+     "set",
+     "plugins",
+     "add",
+     "remove",
+     "audition",
+     "tempo"
+    ],
+    "bpm": 120.25
+   },
+   "chunks": [
+    "F0 7D 55 57 01 02 01 00 01 7B 22 76 22 3A 31 2C 22 64 61 77 22 3A 22 41 62 6C 65 74 6F 6E 20 4C 69 76 65 22 2C 22 64 61 77 56 65 72 73 69 6F 6E 22 3A 22 31 32 2E 34 2E 36 22 2C 22 70 72 6F 6A 65 63 74 22 3A 22 22 2C 22 63 61 70 73 22 3A 5B 22 6C 69 73 74 22 2C 22 62 69 6E 64 22 2C 22 73 65 74 22 2C 22 70 6C 75 67 69 6E 73 22 2C 22 61 64 64 22 2C 22 72 65 6D 6F 76 65 22 2C 22 61 75 64 69 74 69 6F 6E 22 2C 22 74 65 6D 70 6F 22 5D 2C 22 62 70 6D 22 3A 31 32 30 2E 32 35 7D F7"
+   ]
+  },
+  {
+   "name": "tempo",
+   "cmd": 80,
+   "req": 0,
+   "data": {
+    "bpm": 128.5
+   },
+   "chunks": [
+    "F0 7D 55 57 01 50 00 00 01 7B 22 62 70 6D 22 3A 31 32 38 2E 35 7D F7"
+   ]
+  },
+  {
+   "name": "tempo-3-decimals",
+   "cmd": 80,
+   "req": 0,
+   "data": {
+    "bpm": 97.333
+   },
+   "chunks": [
+    "F0 7D 55 57 01 50 00 00 01 7B 22 62 70 6D 22 3A 39 37 2E 33 33 33 7D F7"
+   ]
+  },
+  {
+   "name": "tempo-changed",
+   "cmd": 81,
+   "req": 0,
+   "data": {
+    "bpm": 174
+   },
+   "chunks": [
+    "F0 7D 55 57 01 51 00 00 01 7B 22 62 70 6D 22 3A 31 37 34 7D F7"
+   ]
+  },
+  {
+   "name": "tempo-changed-fraction",
+   "cmd": 81,
+   "req": 0,
+   "data": {
+    "bpm": 89.125
+   },
+   "chunks": [
+    "F0 7D 55 57 01 51 00 00 01 7B 22 62 70 6D 22 3A 38 39 2E 31 32 35 7D F7"
+   ]
+  },
+  {
+   "name": "bind-via-plugin",
+   "cmd": 32,
+   "req": 6,
+   "data": {
+    "slot": 2,
+    "id": 7,
+    "via": "plugin"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 20 06 00 01 7B 22 73 6C 6F 74 22 3A 32 2C 22 69 64 22 3A 37 2C 22 76 69 61 22 3A 22 70 6C 75 67 69 6E 22 7D F7"
+   ]
+  },
+  {
+   "name": "bind-ack-via-plugin",
+   "cmd": 33,
+   "req": 6,
+   "data": {
+    "slot": 2,
+    "id": 7,
+    "via": "plugin",
+    "notes": 3
+   },
+   "chunks": [
+    "F0 7D 55 57 01 21 06 00 01 7B 22 73 6C 6F 74 22 3A 32 2C 22 69 64 22 3A 37 2C 22 76 69 61 22 3A 22 70 6C 75 67 69 6E 22 2C 22 6E 6F 74 65 73 22 3A 33 7D F7"
+   ]
+  },
+  {
+   "name": "bind-ack-via-port",
+   "cmd": 33,
+   "req": 6,
+   "data": {
+    "slot": 2,
+    "id": 7,
+    "via": "port"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 21 06 00 01 7B 22 73 6C 6F 74 22 3A 32 2C 22 69 64 22 3A 37 2C 22 76 69 61 22 3A 22 70 6F 72 74 22 7D F7"
+   ]
+  },
+  {
+   "name": "hello-ack-live-notes",
+   "cmd": 2,
+   "req": 1,
+   "data": {
+    "v": 1,
+    "daw": "Ableton Live",
+    "dawVersion": "12.4.3",
+    "project": "",
+    "caps": [
+     "list",
+     "bind",
+     "set",
+     "plugins",
+     "add",
+     "remove",
+     "audition",
+     "tempo",
+     "notes"
+    ],
+    "bpm": 120
+   },
+   "chunks": [
+    "F0 7D 55 57 01 02 01 00 01 7B 22 76 22 3A 31 2C 22 64 61 77 22 3A 22 41 62 6C 65 74 6F 6E 20 4C 69 76 65 22 2C 22 64 61 77 56 65 72 73 69 6F 6E 22 3A 22 31 32 2E 34 2E 33 22 2C 22 70 72 6F 6A 65 63 74 22 3A 22 22 2C 22 63 61 70 73 22 3A 5B 22 6C 69 73 74 22 2C 22 62 69 6E 64 22 2C 22 73 65 74 22 2C 22 70 6C 75 67 69 6E 73 22 2C 22 61 64 64 22 2C 22 72 65 6D 6F 76 65 22 2C 22 61 75 64 69 74 69 6F 6E 22 2C 22 74 65 6D 70 6F 22 2C 22 6E 6F 74 65 73 22 5D 2C 22 62 70 6D 22 3A 31 32 30 7D F7"
+   ]
+  },
+  {
+   "name": "ping",
+   "cmd": 112,
+   "req": 14,
+   "data": {
+    "t": 123456.7891
+   },
+   "chunks": [
+    "F0 7D 55 57 01 70 0E 00 01 7B 22 74 22 3A 31 32 33 34 35 36 2E 37 38 39 31 7D F7"
+   ]
+  },
+  {
+   "name": "pong",
+   "cmd": 113,
+   "req": 14,
+   "data": {
+    "t": 123456.7891
+   },
+   "chunks": [
+    "F0 7D 55 57 01 71 0E 00 01 7B 22 74 22 3A 31 32 33 34 35 36 2E 37 38 39 31 7D F7"
+   ]
+  },
+  {
+   "name": "error",
+   "cmd": 127,
+   "req": 15,
+   "data": {
+    "code": "unsupported",
+    "msg": "Add the plugin in FL's channel rack; it appears here instantly."
+   },
+   "chunks": [
+    "F0 7D 55 57 01 7F 0F 00 01 7B 22 63 6F 64 65 22 3A 22 75 6E 73 75 70 70 6F 72 74 65 64 22 2C 22 6D 73 67 22 3A 22 41 64 64 20 74 68 65 20 70 6C 75 67 69 6E 20 69 6E 20 46 4C 27 73 20 63 68 61 6E 6E 65 6C 20 72 61 63 6B 3B 20 69 74 20 61 70 70 65 61 72 73 20 68 65 72 65 20 69 6E 73 74 61 6E 74 6C 79 2E 22 7D F7"
+   ]
+  },
+  {
+   "name": "error-push-raw-escapes",
+   "cmd": 127,
+   "req": 0,
+   "data": {
+    "code": "internal",
+    "msg": "Ünïcödé\ttab\u0001</>"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 7F 00 00 01 7B 22 63 6F 64 65 22 3A 22 69 6E 74 65 72 6E 61 6C 22 2C 22 6D 73 67 22 3A 22 5C 75 30 30 64 63 6E 5C 75 30 30 65 66 63 5C 75 30 30 66 36 64 5C 75 30 30 65 39 5C 75 30 30 37 66 5C 74 74 61 62 5C 75 30 30 30 31 3C 2F 3E 22 7D F7"
+   ]
+  },
+  {
+   "name": "list-reply-umlaut-flat-emoji",
+   "cmd": 17,
+   "req": 16,
+   "data": {
+    "items": [
+     {
+      "id": 2,
+      "name": "Bässe in E♭ 🎛️",
+      "plugin": "Ümlaut Synth",
+      "kind": "plugin",
+      "color": "#00ff00"
+     },
+     {
+      "id": 3,
+      "name": "Pad ♭♯ 😀 日本",
+      "plugin": "Pigments",
+      "kind": "plugin",
+      "slots": [
+       16
+      ]
+     }
+    ]
+   },
+   "chunks": [
+    "F0 7D 55 57 01 11 10 00 00 7B 22 69 74 65 6D 73 22 3A 5B 7B 22 69 64 22 3A 32 2C 22 6E 61 6D 65 22 3A 22 42 5C 75 30 30 65 34 73 73 65 20 69 6E 20 45 5C 75 32 36 36 64 20 5C 75 64 38 33 63 5C 75 64 66 39 62 5C 75 66 65 30 66 22 2C 22 70 6C 75 67 69 6E 22 3A 22 5C 75 30 30 64 63 6D 6C 61 75 74 20 53 79 6E 74 68 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 63 6F 6C 6F 72 22 3A 22 23 30 30 66 66 30 30 22 7D 2C 7B 22 69 64 22 3A 33 2C 22 6E 61 6D 65 22 3A 22 50 61 64 20 5C 75 32 36 36 64 5C 75 32 36 36 66 20 5C 75 64 38 33 64 5C 75 64 65 30 30 20 5C 75 36 35 65 35 5C 75 36 37 32 63 22 2C 22 70 6C 75 67 69 6E 22 F7",
+    "F0 7D 55 57 01 11 10 01 01 3A 22 50 69 67 6D 65 6E 74 73 22 2C 22 6B 69 6E 64 22 3A 22 70 6C 75 67 69 6E 22 2C 22 73 6C 6F 74 73 22 3A 5B 31 36 5D 7D 5D 7D F7"
+   ]
+  },
+  {
+   "name": "json-exactly-200-bytes",
+   "cmd": 127,
+   "req": 17,
+   "data": {
+    "code": "x",
+    "msg": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 7F 11 00 01 7B 22 63 6F 64 65 22 3A 22 78 22 2C 22 6D 73 67 22 3A 22 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 22 7D F7"
+   ]
+  },
+  {
+   "name": "json-201-bytes",
+   "cmd": 127,
+   "req": 17,
+   "data": {
+    "code": "x",
+    "msg": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 7F 11 00 00 7B 22 63 6F 64 65 22 3A 22 78 22 2C 22 6D 73 67 22 3A 22 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 22 F7",
+    "F0 7D 55 57 01 7F 11 01 01 7D F7"
+   ]
+  },
+  {
+   "name": "escape-straddles-the-200-boundary",
+   "cmd": 127,
+   "req": 18,
+   "data": {
+    "code": "x",
+    "msg": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa♭ü🎹"
+   },
+   "chunks": [
+    "F0 7D 55 57 01 7F 12 00 00 7B 22 63 6F 64 65 22 3A 22 78 22 2C 22 6D 73 67 22 3A 22 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 5C 75 32 F7",
+    "F0 7D 55 57 01 7F 12 01 01 36 36 64 5C 75 30 30 66 63 5C 75 64 38 33 63 5C 75 64 66 62 39 22 7D F7"
+   ]
+  }
+ ]
+}

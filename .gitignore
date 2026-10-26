@@ -1,0 +1,25 @@
+# build output: it holds the build machine's paths (the .pdb, the .d files), never commit it
+companion/target/
+target/
+*.pdb
+# Python
+__pycache__/
+*.pyc
+# local state, logs and backups the companion or the scripts may write while you test
+.uppwind-*.json
+*.log
+*.reg
+backups/
+# editors and systems
+.vscode/
+.idea/
+*.swp
+*~
+*.orig
+*.rej
+Thumbs.db
+desktop.ini
+.DS_Store
+# secrets never belong here
+.env
+.env.*

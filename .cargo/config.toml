@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+# Uppwind Link -- build settings for the companion (read by cargo when it runs from this folder or below).
+#
+# Every extra rustc flag lives here, in ONE place: if RUSTFLAGS (or CARGO_ENCODED_RUSTFLAGS) is set, cargo ignores
+# this list entirely, so don't set them. To add a flag for one build, use `cargo --config`, whose arrays are added
+# to this one (RELEASING.md does that for the path remapping of a release).
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    # the C runtime inside the exe: no VCRUNTIME140.dll for Windows to look for next to it
+    "-C", "target-feature=+crt-static",
+    # the DLLs the exe imports come from System32 only, never from the folder the exe was started from
+    # (a downloaded copy usually runs from Downloads, where anything could sit next to it)
+    "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
+    # a reproducible build: no build time stamped into the exe
+    "-C", "link-arg=/Brepro",
+]

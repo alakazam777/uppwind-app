@@ -1,0 +1,8 @@
+# Uppwind Link: LF everywhere, on every system (the companion embeds the DAW scripts and their README byte for byte,
+# and the website's download zips must match them)
+* text=auto eol=lf
+*.exe binary
+*.zip binary
+*.png binary
+*.ico binary
+*.jpg binary

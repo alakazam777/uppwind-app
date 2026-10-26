@@ -1,0 +1,21 @@
+Uppwind Link companion -- additional permission under GNU GPL version 3 section 7
+
+This permission applies to the Uppwind Link companion: the folder companion/ and the program
+uppwind-companion.exe built from it, which are under the GNU General Public License version 3 or later (LICENSE).
+
+The companion draws its windows with Microsoft Edge WebView2. To find and start the WebView2 Runtime that Windows
+provides, it is linked statically with the Microsoft Edge WebView2 Loader (WebView2LoaderStatic.lib), from
+Microsoft's WebView2 SDK, which Microsoft distributes in object form only, under the WebView2 SDK's own licence.
+
+As an additional permission under GNU GPL version 3 section 7, you may link this program with the Microsoft Edge
+WebView2 Loader (WebView2LoaderStatic.lib, or a later version of it from the WebView2 SDK), and distribute the
+resulting work, including the WebView2 Loader's object code linked into it. You must follow the GNU GPL in all
+respects for all of the code used other than the WebView2 Loader. Corresponding Source for a non-source form of
+such a combination need not include the source code of the WebView2 Loader.
+
+You may extend this additional permission to your version of the companion, but you are not obliged to do so. If
+you do not wish to, delete this permission from your version; the GNU General Public License version 3 or later
+then applies to it alone.
+
+Microsoft, Microsoft Edge and WebView2 are trademarks of the Microsoft group of companies. This project is not
+affiliated with or endorsed by Microsoft.

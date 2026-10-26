@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+[package]
+name = "uppwind-companion"
+version = "0.1.0"
+edition = "2021"
+description = "Uppwind Link companion: shows the windows of the plugins hosted in Ableton Live inside Uppwind Studio, plays them, and brings the DAW's sound back."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/alakazam777/uppwind-app"
+publish = false
+
+# Peu de dependances, sous licences MIT, Apache-2.0, Unlicense et IJG (jpeg-encoder) : la liste complete, avec leurs
+# textes, est dans ../THIRD-PARTY-NOTICES.txt (--license l'affiche) :
+#   windows (Microsoft) : EnumWindows, Windows.Graphics.Capture, PrintWindow, Direct3D 11 ;
+#   tungstenite : le serveur WebSocket (synchrone, un fil par connexion) ;
+#   jpeg-encoder : les images (Rust pur) ;
+#   serde / serde_json : les messages ; getrandom : le jeton d'appairage (la meme version que tungstenite, 0.4).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+jpeg-encoder = "0.7"
+getrandom = "0.4"
+# (25 oct.) le protocole des plugins Uppwind Link (plugin_link), partage avec eux : sans dependance
+uwl-proto = { path = "../plugin/proto" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    # --setup (setup/winsys.rs) : lecture du registre, des ports MIDI, des peripheriques audio, des processus ;
+    # ecriture des seuls reglages de FL sous HKCU (--fl-settings : RegCreateKeyExW demande Win32_Security)
+    "Win32_Security",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    # le retour audio sans cable (audio/wasapi.rs) : les instants de capture (QPC), les evenements (CreateEventW)
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# (24 oct.) le retour audio sans cable : #[implement] (le rappel de fin d'activation de WASAPI) cite windows_core
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.62"
+
+# (24 oct.) la fenetre d'installation, la fenetre d'etat et l'icone de la zone de notification (src/wizard, src/ui,
+# src/tray) : WebView2 (wry), la fenetre et sa boucle (tao), l'icone et son menu (tray-icon, muda). MIT OR Apache-2.0
+# (tao : Apache-2.0), compatibles GPL-3.0. Aucune page distante : les pages sont des chaines de l'exe. Et de `windows` :
+# le presse-papiers (le bouton Copy du code d'appairage).
+[target.'cfg(windows)'.dependencies.wry]
+version = "0.57"
+default-features = false
+# (sous Windows, « os-webview » ne tire rien de plus : ses dependances sont celles de Linux ; il donne webview_version)
+features = ["os-webview"]
+
+[target.'cfg(windows)'.dependencies.tao]
+version = "0.37"
+default-features = false
+features = ["rwh_06"]
+
+[target.'cfg(windows)'.dependencies.tray-icon]
+version = "0.25"
+default-features = false
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.62"
+features = ["Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole"]
+
+[profile.release]
+opt-level = 3
+codegen-units = 4
+strip = true

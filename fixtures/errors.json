@@ -1,0 +1,360 @@
+{
+ "about": "Uppwind Link golden fixtures, generated from the protocol's reference JavaScript implementation (link-protocol.js, in Uppwind Studio); uwlink_protocol.py must agree byte for byte.",
+ "cases": [
+  {
+   "name": "foreign-sysex",
+   "chunks": [
+    "F0 7E 7F 06 01 F7"
+   ],
+   "outs": [
+    {
+     "type": "ignored"
+    }
+   ]
+  },
+  {
+   "name": "note-on-is-not-sysex",
+   "chunks": [
+    "90 3C 64"
+   ],
+   "outs": [
+    {
+     "type": "ignored"
+    }
+   ]
+  },
+  {
+   "name": "not-7bit",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 01 7B FF 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "not_7bit"
+    }
+   ]
+  },
+  {
+   "name": "short-header",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "bad_frame"
+    }
+   ]
+  },
+  {
+   "name": "version-2",
+   "chunks": [
+    "F0 7D 55 57 02 70 03 00 01 7B 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "version",
+     "cmd": 112,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "last-is-2",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 02 7B 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "bad_frame",
+     "cmd": 112,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "unknown-cmd",
+   "chunks": [
+    "F0 7D 55 57 01 55 03 00 01 7B 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "unknown_cmd",
+     "cmd": 85,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "too-long",
+   "chunks": [
+    "F0 7D 55 57 01 11 03 00 01 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "too_long",
+     "cmd": 17,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "orphan-chunk",
+   "chunks": [
+    "F0 7D 55 57 01 11 03 01 01 7B 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 17,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "gap",
+   "chunks": [
+    "F0 7D 55 57 01 11 03 00 00 7B",
+    "F0 7D 55 57 01 11 03 02 01 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "partial"
+    },
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 17,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "bad-json",
+   "chunks": [
+    "F0 7D 55 57 01 11 03 00 01 7B 78 F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "bad_json",
+     "cmd": 17,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "json-array",
+   "chunks": [
+    "F0 7D 55 57 01 11 03 00 01 5B 5D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "bad_json",
+     "cmd": 17,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "json-nan",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 01 7B 22 74 22 3A 4E 61 4E 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "bad_json",
+     "cmd": 112,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "empty-data-is-empty-object",
+   "chunks": [
+    "F0 7D 55 57 01 12 00 00 01 F7"
+   ],
+   "outs": [
+    {
+     "type": "message",
+     "cmd": 18,
+     "req": 0,
+     "data": {}
+    }
+   ]
+  },
+  {
+   "name": "unframed",
+   "chunks": [
+    "7D 55 57 01 70 03 00 01 7B 22 74 22 3A 31 7D"
+   ],
+   "outs": [
+    {
+     "type": "message",
+     "cmd": 112,
+     "req": 3,
+     "data": {
+      "t": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "two-chunks",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 3A F7",
+    "F0 7D 55 57 01 70 03 01 01 31 32 2E 35 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "partial"
+    },
+    {
+     "type": "message",
+     "cmd": 112,
+     "req": 3,
+     "data": {
+      "t": 12.5
+     }
+    }
+   ]
+  },
+  {
+   "name": "expired",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 3A F7",
+    "F0 7D 55 57 01 70 03 01 01 31 32 2E 35 7D F7"
+   ],
+   "nows": [
+    0,
+    3001
+   ],
+   "outs": [
+    {
+     "type": "partial"
+    },
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 112,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "out-of-order",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 01 01 31 32 2E 35 7D F7",
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 3A F7",
+    "F0 7D 55 57 01 70 03 01 01 31 32 2E 35 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 112,
+     "req": 3
+    },
+    {
+     "type": "partial"
+    },
+    {
+     "type": "message",
+     "cmd": 112,
+     "req": 3,
+     "data": {
+      "t": 12.5
+     }
+    }
+   ]
+  },
+  {
+   "name": "repeated-middle-chunk",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 F7",
+    "F0 7D 55 57 01 70 03 01 00 3A 31 F7",
+    "F0 7D 55 57 01 70 03 01 00 3A 31 F7",
+    "F0 7D 55 57 01 70 03 02 01 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "partial"
+    },
+    {
+     "type": "partial"
+    },
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 112,
+     "req": 3
+    },
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 112,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "repeat-after-complete",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 3A F7",
+    "F0 7D 55 57 01 70 03 01 01 32 7D F7",
+    "F0 7D 55 57 01 70 03 01 01 32 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "partial"
+    },
+    {
+     "type": "message",
+     "cmd": 112,
+     "req": 3,
+     "data": {
+      "t": 2
+     }
+    },
+    {
+     "type": "error",
+     "code": "seq",
+     "cmd": 112,
+     "req": 3
+    }
+   ]
+  },
+  {
+   "name": "restart-replaces",
+   "chunks": [
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 3A F7",
+    "F0 7D 55 57 01 70 03 00 00 7B 22 74 22 3A F7",
+    "F0 7D 55 57 01 70 03 01 01 32 7D F7"
+   ],
+   "outs": [
+    {
+     "type": "partial"
+    },
+    {
+     "type": "partial"
+    },
+    {
+     "type": "message",
+     "cmd": 112,
+     "req": 3,
+     "data": {
+      "t": 2
+     }
+    }
+   ]
+  }
+ ]
+}

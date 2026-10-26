@@ -1,0 +1,975 @@
+{
+ "about": "Uppwind Link golden fixtures, generated from the protocol's reference JavaScript implementation (link-protocol.js, in Uppwind Studio); uwlink_protocol.py must agree byte for byte.",
+ "cases": [
+  {
+   "name": "bind-ok",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 3,
+    "id": 12
+   },
+   "ok": true,
+   "out": {
+    "slot": 3,
+    "id": 12
+   }
+  },
+  {
+   "name": "bind-int-as-float",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 3,
+    "id": 12
+   },
+   "ok": true,
+   "out": {
+    "slot": 3,
+    "id": 12
+   }
+  },
+  {
+   "name": "bind-slot-0",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 0,
+    "id": 12
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-slot-17",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 17,
+    "id": 12
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-fraction",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1.5,
+    "id": 12
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-string-id",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1,
+    "id": "12"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-bool-id",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1,
+    "id": true
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-missing-id",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-null-id",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1,
+    "id": null
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-from-daw",
+   "cmd": 32,
+   "from": "daw",
+   "data": {
+    "slot": 1,
+    "id": 2
+   },
+   "ok": false,
+   "code": "wrong_direction"
+  },
+  {
+   "name": "bind-via-plugin",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1,
+    "id": 2,
+    "via": "plugin"
+   },
+   "ok": true,
+   "out": {
+    "slot": 1,
+    "id": 2,
+    "via": "plugin"
+   }
+  },
+  {
+   "name": "bind-via-unknown",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1,
+    "id": 2,
+    "via": "bluetooth"
+   },
+   "ok": true,
+   "out": {
+    "slot": 1,
+    "id": 2
+   }
+  },
+  {
+   "name": "bind-via-number",
+   "cmd": 32,
+   "from": "studio",
+   "data": {
+    "slot": 1,
+    "id": 2,
+    "via": 1
+   },
+   "ok": true,
+   "out": {
+    "slot": 1,
+    "id": 2
+   }
+  },
+  {
+   "name": "bind-ack-notes",
+   "cmd": 33,
+   "from": "daw",
+   "data": {
+    "slot": 1,
+    "id": 2,
+    "via": "plugin",
+    "notes": 255
+   },
+   "ok": true,
+   "out": {
+    "slot": 1,
+    "id": 2,
+    "via": "plugin",
+    "notes": 255
+   }
+  },
+  {
+   "name": "bind-ack-notes-too-big",
+   "cmd": 33,
+   "from": "daw",
+   "data": {
+    "slot": 1,
+    "id": 2,
+    "via": "plugin",
+    "notes": 256
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "bind-ack-notes-string",
+   "cmd": 33,
+   "from": "daw",
+   "data": {
+    "slot": 1,
+    "id": 2,
+    "via": "plugin",
+    "notes": "3"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "hello-ack-notes-cap",
+   "cmd": 2,
+   "from": "daw",
+   "data": {
+    "v": 1,
+    "daw": "Ableton Live",
+    "caps": [
+     "notes",
+     "bind",
+     "midi"
+    ]
+   },
+   "ok": true,
+   "out": {
+    "v": 1,
+    "daw": "Ableton Live",
+    "caps": [
+     "notes",
+     "bind"
+    ]
+   }
+  },
+  {
+   "name": "unbind-extra-fields",
+   "cmd": 34,
+   "from": "studio",
+   "data": {
+    "slot": 2,
+    "id": 9,
+    "why": "x"
+   },
+   "ok": true,
+   "out": {
+    "slot": 2
+   }
+  },
+  {
+   "name": "set-clamped",
+   "cmd": 48,
+   "from": "studio",
+   "data": {
+    "id": 1,
+    "vol": 1.25,
+    "pan": -1.5
+   },
+   "ok": true,
+   "out": {
+    "id": 1,
+    "vol": 1,
+    "pan": -1
+   }
+  },
+  {
+   "name": "set-partial",
+   "cmd": 48,
+   "from": "studio",
+   "data": {
+    "id": 1,
+    "mute": true
+   },
+   "ok": true,
+   "out": {
+    "id": 1,
+    "mute": true
+   }
+  },
+  {
+   "name": "set-bad-mute",
+   "cmd": 48,
+   "from": "studio",
+   "data": {
+    "id": 1,
+    "mute": 1
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "set-bad-vol",
+   "cmd": 48,
+   "from": "studio",
+   "data": {
+    "id": 1,
+    "vol": "0.5"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "hello-ok",
+   "cmd": 1,
+   "from": "studio",
+   "data": {
+    "v": 1,
+    "app": "Uppwind Studio"
+   },
+   "ok": true,
+   "out": {
+    "v": 1,
+    "app": "Uppwind Studio"
+   }
+  },
+  {
+   "name": "hello-long-app",
+   "cmd": 1,
+   "from": "studio",
+   "data": {
+    "v": 1,
+    "app": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "ok": true,
+   "out": {
+    "v": 1,
+    "app": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   }
+  },
+  {
+   "name": "hello-ack-caps",
+   "cmd": 2,
+   "from": "daw",
+   "data": {
+    "v": 1,
+    "daw": "FL Studio",
+    "caps": [
+     "list",
+     "list",
+     "fly",
+     7,
+     "bind",
+     "remove"
+    ]
+   },
+   "ok": true,
+   "out": {
+    "v": 1,
+    "daw": "FL Studio",
+    "caps": [
+     "list",
+     "bind",
+     "remove"
+    ]
+   }
+  },
+  {
+   "name": "hello-ack-no-caps",
+   "cmd": 2,
+   "from": "daw",
+   "data": {
+    "v": 1,
+    "daw": "FL Studio"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "list-reply-dirty",
+   "cmd": 17,
+   "from": "daw",
+   "data": {
+    "items": [
+     {
+      "id": 1,
+      "name": "A\u0000B\u001fCDE",
+      "plugin": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+      "kind": "plugin",
+      "color": "#ABCDEF",
+      "slots": [
+       1,
+       0,
+       3,
+       "x",
+       16
+      ]
+     },
+     {
+      "id": 2,
+      "name": "no color",
+      "color": "#12345"
+     },
+     {
+      "id": 3
+     },
+     {
+      "id": 70000,
+      "name": "too big"
+     },
+     {
+      "id": 4,
+      "name": "🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹"
+     },
+     "not an object"
+    ],
+    "next": 12
+   },
+   "ok": true,
+   "out": {
+    "items": [
+     {
+      "id": 1,
+      "name": "ABCDE",
+      "plugin": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+      "kind": "plugin",
+      "color": "#abcdef",
+      "slots": [
+       1,
+       3,
+       16
+      ]
+     },
+     {
+      "id": 2,
+      "name": "no color"
+     },
+     {
+      "id": 4,
+      "name": "🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹🎹"
+     }
+    ],
+    "next": 12
+   }
+  },
+  {
+   "name": "list-reply-null-next",
+   "cmd": 17,
+   "from": "daw",
+   "data": {
+    "items": [],
+    "next": null
+   },
+   "ok": true,
+   "out": {
+    "items": [],
+    "next": null
+   }
+  },
+  {
+   "name": "list-reply-bad-next",
+   "cmd": 17,
+   "from": "daw",
+   "data": {
+    "items": [],
+    "next": "more"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "list-reply-not-a-list",
+   "cmd": 17,
+   "from": "daw",
+   "data": {
+    "items": {
+     "id": 1
+    }
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "plugins-reply-empty-id",
+   "cmd": 65,
+   "from": "daw",
+   "data": {
+    "items": [
+     {
+      "id": "",
+      "name": "x"
+     },
+     {
+      "id": "a",
+      "name": "A",
+      "vendor": "V",
+      "kind": "instrument"
+     }
+    ]
+   },
+   "ok": true,
+   "out": {
+    "items": [
+     {
+      "id": "a",
+      "name": "A",
+      "vendor": "V",
+      "kind": "instrument"
+     }
+    ]
+   }
+  },
+  {
+   "name": "added-bad-item",
+   "cmd": 67,
+   "from": "daw",
+   "data": {
+    "item": {
+     "id": "x",
+     "name": "y"
+    }
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "ping-ok",
+   "cmd": 112,
+   "from": "studio",
+   "data": {
+    "t": 1234.5678
+   },
+   "ok": true,
+   "out": {
+    "t": 1234.5678
+   }
+  },
+  {
+   "name": "ping-huge",
+   "cmd": 112,
+   "from": "studio",
+   "data": {
+    "t": 100000000000000000000
+   },
+   "ok": true,
+   "out": {
+    "t": 100000000000000
+   }
+  },
+  {
+   "name": "error-any-direction",
+   "cmd": 127,
+   "from": "studio",
+   "data": {
+    "code": "oops",
+    "msg": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+   },
+   "ok": true,
+   "out": {
+    "code": "oops",
+    "msg": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+   }
+  },
+  {
+   "name": "error-empty-code",
+   "cmd": 127,
+   "from": "daw",
+   "data": {
+    "code": ""
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "unknown-cmd",
+   "cmd": 85,
+   "from": "studio",
+   "data": {},
+   "ok": false,
+   "code": "unknown_cmd"
+  },
+  {
+   "name": "changed-anything",
+   "cmd": 18,
+   "from": "daw",
+   "data": {
+    "a": 1
+   },
+   "ok": true,
+   "out": {}
+  },
+  {
+   "name": "tempo-ok",
+   "cmd": 80,
+   "from": "studio",
+   "data": {
+    "bpm": 120
+   },
+   "ok": true,
+   "out": {
+    "bpm": 120
+   }
+  },
+  {
+   "name": "tempo-rounded",
+   "cmd": 80,
+   "from": "studio",
+   "data": {
+    "bpm": 128.123456
+   },
+   "ok": true,
+   "out": {
+    "bpm": 128.123
+   }
+  },
+  {
+   "name": "tempo-clamped-low",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 5
+   },
+   "ok": true,
+   "out": {
+    "bpm": 20
+   }
+  },
+  {
+   "name": "tempo-clamped-high",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 1500.25
+   },
+   "ok": true,
+   "out": {
+    "bpm": 999
+   }
+  },
+  {
+   "name": "tempo-round-then-clamp",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 999.9996
+   },
+   "ok": true,
+   "out": {
+    "bpm": 999
+   }
+  },
+  {
+   "name": "tempo-string",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": "120"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "tempo-bool",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": false
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "tempo-null",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": null
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "tempo-missing",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "tempo": 120
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "tempo-list",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": [
+     120
+    ]
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "tempo-from-daw",
+   "cmd": 80,
+   "from": "daw",
+   "data": {
+    "bpm": 120
+   },
+   "ok": false,
+   "code": "wrong_direction"
+  },
+  {
+   "name": "tempo-changed-from-studio",
+   "cmd": 81,
+   "from": "studio",
+   "data": {
+    "bpm": 120
+   },
+   "ok": false,
+   "code": "wrong_direction"
+  },
+  {
+   "name": "hello-studio-caps",
+   "cmd": 1,
+   "from": "studio",
+   "data": {
+    "v": 1,
+    "app": "Uppwind Studio",
+    "caps": [
+     "tempo",
+     "tempo",
+     "warp",
+     3
+    ]
+   },
+   "ok": true,
+   "out": {
+    "v": 1,
+    "app": "Uppwind Studio",
+    "caps": [
+     "tempo"
+    ]
+   }
+  },
+  {
+   "name": "hello-studio-bad-caps",
+   "cmd": 1,
+   "from": "studio",
+   "data": {
+    "v": 1,
+    "caps": "tempo"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "hello-ack-bpm",
+   "cmd": 2,
+   "from": "daw",
+   "data": {
+    "v": 1,
+    "daw": "FL Studio",
+    "caps": [
+     "list",
+     "tempo"
+    ],
+    "bpm": 139.99951
+   },
+   "ok": true,
+   "out": {
+    "v": 1,
+    "daw": "FL Studio",
+    "caps": [
+     "list",
+     "tempo"
+    ],
+    "bpm": 140
+   }
+  },
+  {
+   "name": "hello-ack-bad-bpm",
+   "cmd": 2,
+   "from": "daw",
+   "data": {
+    "v": 1,
+    "daw": "FL Studio",
+    "caps": [
+     "tempo"
+    ],
+    "bpm": "140"
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "tempo-rounding-0",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 60.0005
+   },
+   "ok": true,
+   "out": {
+    "bpm": 60.001
+   }
+  },
+  {
+   "name": "tempo-rounding-1",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 60.0015
+   },
+   "ok": true,
+   "out": {
+    "bpm": 60.002
+   }
+  },
+  {
+   "name": "tempo-rounding-2",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 128.0005
+   },
+   "ok": true,
+   "out": {
+    "bpm": 128
+   }
+  },
+  {
+   "name": "tempo-rounding-3",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 128.1235
+   },
+   "ok": true,
+   "out": {
+    "bpm": 128.124
+   }
+  },
+  {
+   "name": "tempo-rounding-4",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 174.9995
+   },
+   "ok": true,
+   "out": {
+    "bpm": 175
+   }
+  },
+  {
+   "name": "tempo-rounding-5",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 99.9995
+   },
+   "ok": true,
+   "out": {
+    "bpm": 100
+   }
+  },
+  {
+   "name": "tempo-rounding-6",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 333.3335
+   },
+   "ok": true,
+   "out": {
+    "bpm": 333.334
+   }
+  },
+  {
+   "name": "tempo-rounding-7",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 120.00049999
+   },
+   "ok": true,
+   "out": {
+    "bpm": 120
+   }
+  },
+  {
+   "name": "tempo-rounding-8",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 89.12549
+   },
+   "ok": true,
+   "out": {
+    "bpm": 89.125
+   }
+  },
+  {
+   "name": "tempo-rounding-9",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 140.0625
+   },
+   "ok": true,
+   "out": {
+    "bpm": 140.063
+   }
+  },
+  {
+   "name": "tempo-rounding-10",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 97.33333333333333
+   },
+   "ok": true,
+   "out": {
+    "bpm": 97.333
+   }
+  },
+  {
+   "name": "tempo-rounding-11",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 20.0004
+   },
+   "ok": true,
+   "out": {
+    "bpm": 20
+   }
+  },
+  {
+   "name": "tempo-rounding-12",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 998.9994999
+   },
+   "ok": true,
+   "out": {
+    "bpm": 998.999
+   }
+  },
+  {
+   "name": "tempo-rounding-13",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 123.4565
+   },
+   "ok": true,
+   "out": {
+    "bpm": 123.457
+   }
+  },
+  {
+   "name": "tempo-rounding-14",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 0.5
+   },
+   "ok": true,
+   "out": {
+    "bpm": 20
+   }
+  },
+  {
+   "name": "tempo-rounding-15",
+   "cmd": 81,
+   "from": "daw",
+   "data": {
+    "bpm": 2000
+   },
+   "ok": true,
+   "out": {
+    "bpm": 999
+   }
+  }
+ ]
+}

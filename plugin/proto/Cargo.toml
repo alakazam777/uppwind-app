@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+[package]
+name = "uwl-proto"
+description = "Uppwind Link: the tiny versioned protocol between the Uppwind Link plugins and the companion (localhost TCP)."
+# written out, not inherited from ../Cargo.toml: the companion builds with this crate in a copy of the repository
+# that has no plugin workspace (the plugins are not published yet)
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
