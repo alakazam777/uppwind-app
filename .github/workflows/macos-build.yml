@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Uppwind
-# Uppwind Link -- the macOS companion, signed and notarized (called by macos-preview.yml and release.yml):
-# a universal binary (arm64 + x86_64, lipo) built with the release flags, signed with the Developer ID Application
-# certificate (hardened runtime, Apple's timestamp, no entitlements), put in a .dmg with the README and the licences,
-# the .dmg signed, notarized by Apple (notarytool) and stapled. The result is a workflow artifact
+# Uppwind Link -- the macOS companion and its plugins, signed and notarized (called by macos-preview.yml and
+# release.yml): the Uppwind Link plugins first (Uppwind Link.vst3, universal), signed with the Developer ID
+# Application certificate (hardened runtime, Apple's timestamp), then the companion (universal, arm64 + x86_64, lipo),
+# built with the release flags and that signed bundle inside (it installs it itself, byte for byte), signed the same
+# way (no entitlements); both put in a .dmg with the README, the licences and the notices, the .dmg signed, notarized
+# by Apple (notarytool, which covers the bundle too) and stapled. The result is a workflow artifact
 # "uppwind-companion-macos" (the .dmg and its SHA-256); this workflow never publishes a release itself.
 #
 # Secrets (repository secrets, passed by the caller): MACOS_CERT_P12_BASE64 (the .p12 export of the certificate and
@@ -38,7 +40,7 @@ jobs:
   macos:
     name: macOS companion (universal, Developer ID, notarized)
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,21 +54,16 @@ jobs:
           sw_vers
           xcodebuild -version
       - name: Tests
-        run: cargo test --release --locked --manifest-path companion/Cargo.toml
-      # the notices embedded in the program (--license) must list the Mac crates too (option-ext, MPL-2.0…)
+        run: |
+          cargo test --release --locked --manifest-path plugin/Cargo.toml
+          cargo test --release --locked --manifest-path companion/Cargo.toml
+      # the notices embedded in the program (--license) must list the Mac crates too (option-ext, MPL-2.0…), the
+      # companion's and the plugins'
       - name: Third-party notices up to date
         run: |
           cargo fetch --locked --manifest-path companion/Cargo.toml
+          cargo fetch --locked --manifest-path plugin/Cargo.toml
           python3 -I dev/third_party_notices.py --check
-      # as RELEASING.md step 4 for Windows: a fresh target folder, --locked, the paths of the runner remapped with
-      # --config (never RUSTFLAGS); the companion left unsigned here (signed below with the Developer ID)
-      - name: Build (universal, release flags)
-        run: |
-          rm -rf companion/target
-          UWL_RELEASE=1 UWL_NO_ADHOC=1 sh dev/build-macos.sh "$RUNNER_TEMP/build"
-          lipo -archs "$RUNNER_TEMP/build/uppwind-companion"
-      - name: Check the program (no path of the runner)
-        run: python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion"
       - name: Temporary keychain with the Developer ID certificate
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
@@ -94,6 +91,29 @@ jobs:
           fi
           echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
           echo "signing identity: $IDENTITY"
+      # as RELEASING.md step 4 for Windows: fresh target folders, --locked, the paths of the runner remapped with
+      # --config (never RUSTFLAGS). dev/build-macos.sh builds the plugins first and signs their bundles with the
+      # Developer ID (hardened runtime, Apple's timestamp), THEN the companion, which embeds that signed bundle; the
+      # companion itself is left unsigned here (signed below)
+      - name: Build (universal, release flags; the plugins signed before the companion embeds them)
+        run: |
+          rm -rf companion/target plugin/target
+          UWL_RELEASE=1 UWL_NO_ADHOC=1 UWL_PLUGIN_SIGN_IDENTITY="$SIGN_IDENTITY" UWL_SIGN_KEYCHAIN="$RUNNER_TEMP/uwl-signing.keychain-db" \
+            sh dev/build-macos.sh "$RUNNER_TEMP/build"
+          lipo -archs "$RUNNER_TEMP/build/uppwind-companion"
+          lipo -archs "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link"
+      - name: Check the programs (no path of the runner) and the plugins' signature
+        run: |
+          python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion" "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link"
+          VST3="$RUNNER_TEMP/build/Uppwind Link.vst3"
+          codesign --verify --deep --strict --verbose=2 "$VST3"
+          INFO=$(codesign -dv --verbose=4 "$VST3" 2>&1)
+          printf '%s\n' "$INFO" | grep -E '^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier|Runtime Version)'
+          # a Developer ID signature, timestamped, with the hardened runtime (not ad hoc); here-strings, not pipes
+          # into grep -q (pipefail)
+          grep -q '^Authority=Developer ID Application: ' <<< "$INFO"
+          grep -q '^Timestamp=' <<< "$INFO"
+          grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]*\(runtime\)' <<< "$INFO"
       # hardened runtime, Apple's timestamp, a stable identifier (the one of the LaunchAgent), no entitlements: the
       # companion needs neither JIT (WKWebView runs its JavaScript in WebKit's own processes) nor get-task-allow, and
       # it loads only Apple's frameworks
@@ -108,13 +128,23 @@ jobs:
           codesign -d --entitlements - "$BIN" 2>&1 || true
           "$BIN" --license > "$RUNNER_TEMP/license.txt"
           head -n 3 "$RUNNER_TEMP/license.txt"
-      - name: The .dmg (the companion, README, licences, notices)
+          grep -q "Uppwind Link plugins -- third-party notices" "$RUNNER_TEMP/license.txt"
+          # the companion carries exactly the signed bundle: installed into a folder of the runner, same bytes, valid
+          "$BIN" --install-plugins --plugins-dir "$RUNNER_TEMP/vst3-check"
+          diff -r "$RUNNER_TEMP/build/Uppwind Link.vst3" "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          rm -rf "$RUNNER_TEMP/vst3-check"
+      # the signed Uppwind Link.vst3 too: notarization covers it, and a user can drag it into ~/Library/Audio/Plug-Ins/VST3
+      - name: The .dmg (the companion, the plugins, README, licences, notices)
         run: |
           STAGE="$RUNNER_TEMP/dmg"
           rm -rf "$STAGE" dist
           mkdir -p "$STAGE" dist
           ditto "$RUNNER_TEMP/build/uppwind-companion" "$STAGE/uppwind-companion"
-          cp README.md LICENSE LICENSE-EXCEPTION.txt LICENSE-MIT THIRD-PARTY-NOTICES.txt "$STAGE/"
+          ditto "$RUNNER_TEMP/build/Uppwind Link.vst3" "$STAGE/Uppwind Link.vst3"
+          codesign --verify --deep --strict "$STAGE/Uppwind Link.vst3"
+          cp README.md LICENSE LICENSE-EXCEPTION.txt LICENSE-EXCEPTION-PLUGINS.txt LICENSE-MIT THIRD-PARTY-NOTICES.txt "$STAGE/"
+          cp plugin/THIRD-PARTY-NOTICES.txt "$STAGE/THIRD-PARTY-NOTICES-PLUGINS.txt"
           ok=0
           for i in 1 2 3; do
             if hdiutil create -volname "Uppwind Link" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov dist/uppwind-companion-macos.dmg; then ok=1; break; fi
@@ -173,6 +203,14 @@ jobs:
           "$MNT/uppwind-companion" --license > "$RUNNER_TEMP/license-dmg.txt"
           head -n 3 "$RUNNER_TEMP/license-dmg.txt"
           grep -q "option-ext" "$RUNNER_TEMP/license-dmg.txt"
+          # the plugins in the .dmg: the Developer ID signature, valid; Gatekeeper's view of a plugin bundle
+          codesign --verify --deep --strict --verbose=2 "$MNT/Uppwind Link.vst3"
+          codesign -dv --verbose=4 "$MNT/Uppwind Link.vst3" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)'
+          spctl -a -vvv -t install "$MNT/Uppwind Link.vst3" || echo "(spctl -t install on a plugin bundle: see above)"
+          # and the companion of the .dmg installs that very bundle (into a folder of the runner)
+          "$MNT/uppwind-companion" --install-plugins --plugins-dir "$RUNNER_TEMP/vst3-dmg"
+          diff -r "$MNT/Uppwind Link.vst3" "$RUNNER_TEMP/vst3-dmg/Uppwind Link.vst3"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-dmg/Uppwind Link.vst3"
           hdiutil detach "$MNT"
       - name: SHA-256
         run: |

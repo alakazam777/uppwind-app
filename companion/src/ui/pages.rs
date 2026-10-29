@@ -445,8 +445,8 @@ mod tests {
         let r = crate::tray::status::report(&probe);
         let m = crate::tray::status::model(&r, 47410, "abc", Default::default(), Ok(1.0), true, None);
         let out = s.on_done(Done::Status(Ok(Box::new(m.clone()))));
-        assert_eq!(sends(&out)[0]["status"]["code"], "UWC-47410-abc");
-        assert!(matches!(&s.on_request(Request::CopyCode)[0], Out::Copy(c) if c == "UWC-47410-abc"));
+        assert_eq!(sends(&out)[0]["status"]["code"], "UWC2-47410-abc");
+        assert!(matches!(&s.on_request(Request::CopyCode)[0], Out::Copy(c) if c == "UWC2-47410-abc"));
         assert!(matches!(s.on_request(Request::Open(Link::VbCable))[0], Out::Send(ref v) if v["type"] == "error"), "no failure: no VB-CABLE");
         let mut bad = m;
         bad.audio.trouble = Some("cannot capture".into());

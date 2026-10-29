@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+# Uppwind Link — les plugins (VST3, CLAP) qui remplacent loopMIDI (les notes) et VB-CABLE (le retour du son).
+# Depuis la v0.2.0 du compagnon, le bundle VST3 est dans son exe et il l'installe lui-meme (companion/src/plugin_install/).
+# Voir README.md.
+#
+#   proto/     le protocole plugin <-> compagnon (sans dependance ; le compagnon s'en sert aussi)
+#   plugins/   « Uppwind Link Return » et « Uppwind Link Notes » (nice-plug), une seule DLL
+#   testhost/  un petit hote VST3 d'essai (charge le .vst3, joue des blocs en temps reel, mesure) et le bundler
+#
+# Construire (depuis la racine du depot, pour .cargo/config.toml) : cargo build --release --locked --manifest-path
+# plugin/Cargo.toml ; une version publiee : RELEASING.md (le remappage des chemins, comme le compagnon).
+[workspace]
+resolver = "2"
+members = ["proto", "plugins", "testhost"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"

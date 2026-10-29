@@ -13,18 +13,59 @@ struct Fake {
     rd: p::FrameReader,
 }
 
+/// (29 oct.) Ce que le faux plugin repond au CHALLENGE.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// sa preuve, faite avec le secret qu'on lui donne (juste ou non)
+    Proof,
+    /// ces 32 octets (une preuve rejouee, fausse…)
+    Raw([u8; 32]),
+    /// une autre trame a la place (FORMAT : un plugin qui sauterait AUTH)
+    Skip,
+    /// rien du tout
+    Silent,
+}
+
 impl Fake {
+    fn hello(kind: p::Kind, id: u64, nonce: [u8; 32], rate: u32) -> p::Hello {
+        p::Hello { version: p::VERSION, kind, flags: 0, nonce, instance: id, rate, max_block: 512, channels: 2, pid: 1234, name: format!("Fake {}", kind.name()), host: "Ableton Live 12 Suite.exe".into() }
+    }
+
     fn connect(hub: &Hub, kind: p::Kind, id: u64, secret: [u8; 32], rate: u32) -> (Fake, p::Welcome) {
+        let (f, w, _) = Fake::handshake(hub, Fake::hello(kind, id, crate::security::new_nonce(), rate), secret, Answer::Proof);
+        (f, w.expect("welcome"))
+    }
+
+    /// Un faux plugin v2 : HELLO, puis le CHALLENGE du compagnon (sa preuve verifiee avec `secret`), puis `answer`, puis
+    /// le verdict. → (le faux, le WELCOME s'il vient, le CHALLENGE recu)
+    fn handshake(hub: &Hub, hello: p::Hello, secret: [u8; 32], answer: Answer) -> (Fake, Option<p::Welcome>, Option<(p::Challenge, bool)>) {
         let s = TcpStream::connect(("127.0.0.1", hub.port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
         let mut f = Fake { s, rd: p::FrameReader::new(p::MAX_FRAME) };
         let mut out = Vec::new();
-        let hello = p::Hello { version: p::VERSION, kind, flags: 0, secret, instance: id, rate, max_block: 512, channels: 2, pid: 1234, name: format!("Fake {}", kind.name()), host: "Ableton Live 12 Suite.exe".into() };
         p::encode_hello(&hello, &mut out);
         f.s.write_all(&out).unwrap();
-        let (t, body) = f.frame().expect("welcome");
-        assert_eq!(t, p::ty::WELCOME);
-        (f, p::decode_welcome(&body).unwrap())
+        let Some((t, body)) = f.frame() else { return (f, None, None) };
+        if t == p::ty::WELCOME {
+            // un refus du HELLO, sans CHALLENGE
+            return (f, Some(p::decode_welcome(&body).unwrap()), None);
+        }
+        assert_eq!(t, p::ty::CHALLENGE);
+        let ch = p::decode_challenge(&body).unwrap();
+        let proved = p::auth::companion_proof_ok(&secret, hub.port, &hello.nonce, &ch.nonce, &ch.proof);
+        out.clear();
+        match answer {
+            Answer::Proof => p::encode_auth(&p::auth::plugin_proof(&secret, hub.port, &ch.nonce, &hello.nonce), &mut out),
+            Answer::Raw(b) => p::encode_auth(&b, &mut out),
+            Answer::Skip => p::encode_format(&p::Format { rate: 48000, max_block: 512, channels: 2 }, &mut out),
+            Answer::Silent => {}
+        }
+        f.s.write_all(&out).unwrap();
+        let w = f.frame().map(|(t, body)| {
+            assert_eq!(t, p::ty::WELCOME);
+            p::decode_welcome(&body).unwrap()
+        });
+        (f, w, Some((ch, proved)))
     }
 
     fn frame(&mut self) -> Option<(u8, Vec<u8>)> {
@@ -264,6 +305,90 @@ fn wrong_secrets_duplicates_and_strangers_are_refused() {
     s.write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
     let mut buf = [0u8; 16];
     assert!(matches!(s.read(&mut buf), Ok(0) | Err(_)), "closed, nothing said");
+}
+
+/// (29 oct., protocole v2, audit PL-1) Le compagnon prouve qu'il connait le secret (sur le nonce du plugin et son port),
+/// puis exige la preuve du plugin avant toute trame : une preuve fausse, rejouee (d'une autre connexion), absente, ou
+/// une trame a la place d'AUTH, et rien n'est enregistre — le studio ne voit pas ce plugin et ne lui donne rien.
+#[test]
+fn a_plugin_is_registered_only_after_its_proof() {
+    let hub = Hub::listen(0, SECRET).unwrap();
+    let np = [0x11; 32];
+    // la preuve du compagnon : juste pour le vrai secret, pour CE nonce, pour CE port
+    let (ok, w, ch) = Fake::handshake(&hub, Fake::hello(p::Kind::Return, 0x71, np, 48000), SECRET, Answer::Proof);
+    let (ch, proved) = ch.unwrap();
+    assert!(proved, "the companion proves it knows the secret");
+    assert_eq!(w.unwrap().status, p::status::OK);
+    assert!(!p::auth::companion_proof_ok(&SECRET, hub.port.wrapping_add(1), &np, &ch.nonce, &ch.proof), "bound to the port");
+    assert!(!p::auth::companion_proof_ok(&[1; 32], hub.port, &np, &ch.nonce, &ch.proof), "useless without the secret");
+    wait_for(|| hub.get(0x71).is_some());
+    // le meme HELLO (meme nonce) une seconde fois : un autre nonce du compagnon, une autre preuve
+    let (_f2, _, ch2) = Fake::handshake(&hub, Fake::hello(p::Kind::Return, 0x72, np, 48000), SECRET, Answer::Raw([0; 32]));
+    let (ch2, _) = ch2.unwrap();
+    assert_ne!(ch2.nonce, ch.nonce, "a fresh companion nonce for every connection");
+    drop(ok);
+    // une preuve rejouee : la bonne preuve d'une connexion d'avant ne vaut rien sur la suivante
+    let replay = p::auth::plugin_proof(&SECRET, hub.port, &ch.nonce, &np);
+    for (what, answer) in [("a replayed proof", Answer::Raw(replay)), ("a random proof", Answer::Raw([7; 32])), ("no proof", Answer::Silent), ("another frame instead of auth", Answer::Skip)] {
+        let (_f, w, _) = Fake::handshake(&hub, Fake::hello(p::Kind::Notes, 0x73, np, 48000), SECRET, answer);
+        if let Some(w) = w {
+            assert_eq!(w.status, p::status::BAD_SECRET, "{what}");
+        }
+        assert!(hub.get(0x73).is_none(), "{what}: never registered");
+        assert!(hub.instances_json()["list"].as_array().unwrap().iter().all(|i| i["id"] != "0000000000000073"), "{what}: the studio never sees it");
+        assert!(hub.send_midi("0000000000000073", &[crate::protocol::MidiIn { t: None, d: vec![0x90, 60, 100], n: None }]).is_err(), "{what}: no notes go to it");
+    }
+    // une preuve faite pour un autre port (un relais par un vieux port du fichier d'etat) : refusee
+    let s = TcpStream::connect(("127.0.0.1", hub.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut f = Fake { s, rd: p::FrameReader::new(p::MAX_FRAME) };
+    let mut out = Vec::new();
+    let h = Fake::hello(p::Kind::Notes, 0x75, [0x13; 32], 48000);
+    p::encode_hello(&h, &mut out);
+    f.send(&out);
+    let (t, body) = f.frame().unwrap();
+    assert_eq!(t, p::ty::CHALLENGE);
+    let c = p::decode_challenge(&body).unwrap();
+    out.clear();
+    p::encode_auth(&p::auth::plugin_proof(&SECRET, hub.port.wrapping_add(1), &c.nonce, &h.nonce), &mut out);
+    f.send(&out);
+    assert_eq!(p::decode_welcome(&f.frame().unwrap().1).unwrap().status, p::status::BAD_SECRET, "a proof for another port");
+    assert!(hub.get(0x75).is_none());
+}
+
+/// (29 oct.) Un plugin d'avant (protocole v1 : le secret en clair dans HELLO) est refuse avec ce qu'il faut faire, et le
+/// studio le voit (« refused » dans instances, un avis « notice ») — une fois par instance ; un faux secret v1 ne fait
+/// rien apparaitre.
+#[test]
+fn an_older_plugin_is_refused_with_a_reason_the_studio_shows() {
+    let hub = Hub::listen(0, SECRET).unwrap();
+    assert_eq!((hub.notices_generation(), hub.old_notice()), (0, None));
+    let v1 = |secret: [u8; 32], id: u64| p::Hello { version: p::V1, ..Fake::hello(p::Kind::Return, id, secret, 48000) };
+    // un faux secret v1 : refuse comme avant, rien pour le studio
+    let (_f, w, ch) = Fake::handshake(&hub, v1([9; 32], 0x91), SECRET, Answer::Silent);
+    assert!(ch.is_none(), "no challenge for a v1 hello");
+    assert_eq!(w.unwrap().status, p::status::BAD_SECRET);
+    assert_eq!(hub.notices_generation(), 0);
+    // le vrai secret, en v1 : refuse (version), avec la raison
+    for _ in 0..3 {
+        let (_f, w, ch) = Fake::handshake(&hub, v1(SECRET, 0x92), SECRET, Answer::Silent);
+        assert!(ch.is_none());
+        let w = w.unwrap();
+        assert_eq!(w.status, p::status::BAD_VERSION);
+        assert!(w.message.contains("older Uppwind Link plugin") && w.message.contains("reinstall the plugins"), "{}", w.message);
+    }
+    assert!(hub.get(0x92).is_none(), "never registered");
+    assert_eq!(hub.notices_generation(), 1, "once per instance, not at every retry");
+    let n = hub.old_notice().expect("a notice for the studio");
+    assert_eq!((n["type"].as_str(), n["code"].as_str()), (Some("notice"), Some("old-plugin")));
+    assert!(n["message"].as_str().unwrap().contains("reinstall the plugins and restart your DAW"), "{n}");
+    assert!(n["message"].as_str().unwrap().contains("Ableton Live"), "{n}");
+    let refused = &hub.instances_json()["refused"];
+    assert_eq!((refused[0]["kind"].as_str(), refused[0]["daw"].as_str(), refused[0]["pid"].as_u64()), (Some("return"), Some("live"), Some(1234)), "{refused}");
+    assert!(!refused.to_string().contains(&p::secret_hex(&SECRET)), "the secret is never kept nor shown");
+    // une autre instance d'avant : un avis de plus
+    let _ = Fake::handshake(&hub, v1(SECRET, 0x93), SECRET, Answer::Silent);
+    assert_eq!(hub.notices_generation(), 2);
 }
 
 #[test]

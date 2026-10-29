@@ -66,6 +66,50 @@ impl Ports {
     }
 }
 
+/// (29 oct.) Les plugins Uppwind Link (VST3) : l'element « Uppwind Link plugins (VST3) », coche par defaut ; dans les
+/// choix, l'identifiant `plugin_install::CHOICE_ID` parmi les DAW coches.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PluginItem {
+    /// cet exe les porte, et ce systeme les prend (Windows, macOS)
+    pub available: bool,
+    /// cet exe ne les porte pas (une construction de developpement) : « not in this build »
+    pub not_in_build: bool,
+    /// missing, up-to-date, outdated, different, newer
+    pub status: String,
+    /// install, update, none, skip
+    pub action: String,
+    pub reason: String,
+    /// le dossier du bundle
+    pub folder: String,
+    /// Windows : une invite d'administrateur pour les y mettre
+    pub admin: bool,
+    pub selectable: bool,
+    /// un DAW tient encore une ancienne copie
+    pub held: bool,
+}
+
+impl PluginItem {
+    pub fn from_report(p: &crate::plugin_install::Report) -> PluginItem {
+        let action = json_name(&p.action);
+        PluginItem {
+            available: p.supported && p.embedded,
+            not_in_build: p.supported && !p.embedded,
+            status: json_name(&p.status),
+            selectable: p.supported && p.embedded && action != "skip",
+            action,
+            reason: p.reason.clone(),
+            folder: p.folder.display().to_string(),
+            admin: p.admin,
+            held: !p.held.is_empty(),
+        }
+    }
+}
+
+/// Le nom JSON d'un enum (« up-to-date », « install »).
+fn json_name<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+}
+
 /// Ce que la fenetre montre.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Model {
@@ -79,6 +123,8 @@ pub struct Model {
     pub install_dir: String,
     pub daws: Vec<DawItem>,
     pub ports: Ports,
+    /// (29 oct.) les plugins Uppwind Link (VST3)
+    pub plugins: PluginItem,
 }
 
 /// Les noms de ports « presque justes » (comme le guide du studio, link-setup.js portReport) : on les montre pour qu'on
@@ -161,6 +207,7 @@ impl Model {
             install_dir,
             daws,
             ports: Ports { link, back, near, loopmidi_installed: r.midi.loopmidi.is_some(), loopmidi_running: r.midi.loopmidi_running },
+            plugins: PluginItem::from_report(&r.plugins),
         }
     }
 
@@ -172,7 +219,7 @@ impl Model {
 /// Ce que l'utilisateur choisit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Choices {
-    /// les DawItem.id coches
+    /// les DawItem.id coches ; (29 oct.) et `plugin_install::CHOICE_ID` (« plugins ») : les plugins Uppwind Link
     pub daws: Vec<String>,
     /// « Apply FL Studio's MIDI settings for me »
     pub fl_settings: bool,
@@ -183,20 +230,28 @@ pub struct Choices {
 }
 
 impl Choices {
-    /// Tout ce qui a un sens, coche.
+    /// Tout ce qui a un sens, coche (les plugins aussi, quand cet exe les porte).
     pub fn defaults(m: &Model) -> Choices {
-        Choices {
-            daws: m.daws.iter().filter(|d| d.selectable && d.action != "skip").map(|d| d.id.clone()).collect(),
-            fl_settings: true,
-            autostart: true,
-            open_studio: true,
+        let mut daws: Vec<String> = m.daws.iter().filter(|d| d.selectable && d.action != "skip").map(|d| d.id.clone()).collect();
+        if m.plugins.selectable {
+            daws.push(PLUGINS.into());
         }
+        Choices { daws, fl_settings: true, autostart: true, open_studio: true }
     }
 
-    /// Les choix que la page envoie : seulement des DAW connus et cochables, sans doublon.
+    /// Les choix que la page envoie : seulement des DAW connus et cochables (et les plugins s'ils le sont), sans doublon.
     pub fn validated(mut self, m: &Model) -> Result<Choices, String> {
         let mut seen: Vec<String> = Vec::new();
         for id in &self.daws {
+            if id == PLUGINS {
+                if !m.plugins.selectable {
+                    return Err("the Uppwind Link plugins cannot be installed by this program".into());
+                }
+                if !seen.contains(id) {
+                    seen.push(id.clone());
+                }
+                continue;
+            }
             match m.daw(id) {
                 Some(d) if d.selectable => {
                     if !seen.contains(id) {
@@ -214,7 +269,15 @@ impl Choices {
     pub fn wants(&self, id: &str) -> bool {
         self.daws.iter().any(|d| d == id)
     }
+
+    /// (29 oct.) Les plugins Uppwind Link sont coches.
+    pub fn wants_plugins(&self) -> bool {
+        self.wants(PLUGINS)
+    }
 }
+
+/// L'identifiant des plugins dans `Choices::daws`.
+pub const PLUGINS: &str = crate::plugin_install::CHOICE_ID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -241,6 +304,12 @@ pub struct Outcome {
     /// FL : written, unchanged, blocked, skipped, none
     pub fl: String,
     pub fl_lines: Vec<String>,
+    /// (29 oct.) les plugins : installed, updated, unchanged, refused (l'invite de Windows), failed, simulated, skipped ;
+    /// « » : pas coches
+    pub plugins: String,
+    pub plugin_lines: Vec<String>,
+    /// un DAW garde les anciens plugins charges : le relancer
+    pub plugins_restart: bool,
     /// le dossier des copies de sauvegarde, si des copies ont ete faites
     pub backups: Option<String>,
     pub autostart: bool,
@@ -254,7 +323,8 @@ pub struct Outcome {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Todo {
-    /// live, live-dev, live-audio, fl, fl-audio, ports, pair, restart-live, restart-fl
+    /// live, live-dev, live-audio, fl, fl-audio, ports, pair, restart-live, restart-fl ; (29 oct.) plugins (l'invite
+    /// refusee), plugins-scan (les retrouver dans le DAW), plugins-restart
     pub id: String,
     pub title: String,
     pub lines: Vec<String>,
@@ -402,6 +472,10 @@ impl Wizard {
                         daws.push(d.id.clone());
                     }
                 }
+                // les plugins : coches s'ils l'etaient (ou s'ils viennent de devenir possibles), et s'ils le restent
+                if m.plugins.selectable && (self.choices.wants_plugins() || !self.model.plugins.selectable) {
+                    daws.push(PLUGINS.into());
+                }
                 self.model = m;
                 self.choices.daws = daws;
                 Ok(vec![Effect::Render])
@@ -455,7 +529,61 @@ pub(crate) mod tests {
                 loopmidi_installed: ports_ok,
                 loopmidi_running: ports_ok,
             },
+            plugins: PluginItem::default(),
         }
+    }
+
+    /// Les plugins, tels qu'un exe qui les porte les montre (`action` : install, none, skip…).
+    pub fn plugins(action: &str) -> PluginItem {
+        PluginItem {
+            available: true,
+            not_in_build: false,
+            status: if action == "none" { "up-to-date".into() } else { "missing".into() },
+            action: action.into(),
+            reason: String::new(),
+            folder: r"C:\Program Files\Common Files\VST3\Uppwind Link.vst3".into(),
+            admin: true,
+            selectable: action != "skip",
+            held: false,
+        }
+    }
+
+    #[test]
+    fn the_plugins_are_ticked_by_default_checked_and_kept_across_a_recheck() {
+        let mut m = model(vec![item("fl", "fl", "install", None, 0)], true);
+        m.plugins = plugins("install");
+        let mut w = Wizard::new(m.clone());
+        assert_eq!(w.choices.daws, vec!["fl".to_string(), PLUGINS.to_string()], "ticked by default");
+        assert!(w.choices.wants_plugins());
+        // decoche, puis « Check again » : reste decoche
+        let mut c = w.choices.clone();
+        c.daws.retain(|d| d != PLUGINS);
+        w.on(Event::Choose(c)).unwrap();
+        w.on(Event::Recheck).unwrap();
+        w.on(Event::Detected(m.clone())).unwrap();
+        assert!(!w.choices.wants_plugins(), "unticked stays unticked");
+        // recoche, relu : reste coche
+        let mut c = w.choices.clone();
+        c.daws.push(PLUGINS.into());
+        w.on(Event::Choose(c)).unwrap();
+        w.on(Event::Detected(m.clone())).unwrap();
+        assert!(w.choices.wants_plugins());
+        // un exe sans plugins (ou une version plus recente installee) : ni coches, ni cochables
+        let mut none = model(vec![], true);
+        none.plugins = PluginItem { not_in_build: true, ..Default::default() };
+        let mut w2 = Wizard::new(none.clone());
+        assert!(!w2.choices.wants_plugins());
+        let bad = Choices { daws: vec![PLUGINS.into()], ..w2.choices.clone() };
+        assert!(w2.on(Event::Choose(bad)).is_err());
+        // devenus possibles a la relecture : coches
+        let mut later = none;
+        later.plugins = plugins("install");
+        w2.on(Event::Detected(later)).unwrap();
+        assert!(w2.choices.wants_plugins());
+        // pas de doublon
+        let dup = Choices { daws: vec![PLUGINS.into(), PLUGINS.into()], ..w2.choices.clone() };
+        w2.on(Event::Choose(dup)).unwrap();
+        assert_eq!(w2.choices.daws, vec![PLUGINS.to_string()]);
     }
 
     #[test]

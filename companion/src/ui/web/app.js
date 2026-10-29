@@ -104,6 +104,37 @@
         }
     }
 
+    // (29 oct.) les plugins Uppwind Link : une invite de Windows (l'administrateur) pour les mettre dans Program Files
+    const PLUGINS = 'plugins';
+    function adminNote(s) {
+        const p = s.model.plugins || {};
+        const asks = p.admin && !s.model.simulate_daws && s.choices.daws.includes(PLUGINS) && (p.action === 'install' || p.action === 'update');
+        return (asks ? 'One administrator prompt, for the plugins only.' : 'No administrator rights.') + ' Uninstall any time from Windows Settings › Apps.';
+    }
+    function pluginLine(p) {
+        if (p.not_in_build) return 'Not in this build of Uppwind Link (a development build).';
+        switch (p.action) {
+            case 'install': return 'Uppwind Link Return and Uppwind Link Notes will be installed.';
+            case 'update': return p.status === 'outdated' ? 'An older version is installed: it will be updated.' : 'Different files are installed: they will be replaced.';
+            case 'none': return 'Already up to date.';
+            default: return p.reason ? `${p.reason[0].toUpperCase()}${p.reason.slice(1)}.` : 'Nothing to do here.';
+        }
+    }
+    function pluginCard(s) {
+        const p = s.model.plugins;
+        if (!p || !(p.available || p.not_in_build)) return null;
+        const on = s.choices.daws.includes(PLUGINS) && p.selectable;
+        const body = [h('div', null, pluginLine(p)), p.folder ? h('div', { class: 'uw-path' }, p.folder) : null];
+        if (p.admin && on && (p.action === 'install' || p.action === 'update')) {
+            body.push(note('', 'Windows asks for administrator rights once, to put them where FL Studio looks for VST3 plugins. Nothing else runs as administrator.'));
+        }
+        if (p.held) body.push(note('', 'A DAW still has an older copy loaded: restart it after the install.'));
+        return h('div', { class: 'uw-card' + (p.selectable ? '' : ' is-off') },
+            check('Uppwind Link plugins (VST3)', on, (v) => choose((x) => { x.daws = x.daws.filter((i) => i !== PLUGINS); if (v) x.daws.push(PLUGINS); }),
+                { disabled: !p.selectable, sub: 'Needed for FL Studio. They also bring your DAW’s sound to the studio with any audio driver, ASIO included.' }),
+            h('div', { class: 'uw-card-body' }, body));
+    }
+
     function wizWelcome(s) {
         const m = s.model;
         const upd = m.update_from != null;
@@ -111,6 +142,7 @@
         const chips = m.daws.map((d) => h('span', { class: 'uw-chip' }, st('is-ok', ''), d.name));
         chips.push(h('span', { class: 'uw-chip' }, st(m.ports.link && m.ports.back ? 'is-ok' : 'is-warn', ''), m.ports.link && m.ports.back ? 'MIDI ports' : 'MIDI ports missing'));
         if (!m.daws.length) chips.unshift(h('span', { class: 'uw-chip' }, st('is-warn', ''), 'No DAW found'));
+        if (m.plugins && m.plugins.available) chips.push(h('span', { class: 'uw-chip' }, st('is-ok', ''), 'Uppwind Link plugins'));
         return [
             sandboxBanner(m),
             h('div', { class: 'uw-hero' },
@@ -156,6 +188,7 @@
                     { disabled: !d.selectable, sub: d.versions.length ? (d.daw === 'ableton' ? `Live ${d.versions.join(', ')}` : d.versions.join(', ')) : null }),
                 h('div', { class: 'uw-card-body' }, body)));
         }
+        kids.push(pluginCard(s));
         return kids;
     }
 
@@ -201,7 +234,7 @@
             h('div', { class: 'uw-card' }, check('Open the studio when done', c.open_studio, (v) => choose((x) => { x.open_studio = v; }), { sub: 'In your browser, to pair it.' })),
             h('div', { class: 'uw-k' }, 'Where'),
             h('div', { class: 'uw-path' }, s.model.install_dir),
-            h('p', { class: 'uw-small' }, 'No administrator rights. Uninstall any time from Windows Settings › Apps.')];
+            h('p', { class: 'uw-small' }, adminNote(s))];
     }
 
     function wizProgress() {
@@ -212,7 +245,7 @@
     // Le code d'appairage est cache par defaut (un partage d'ecran le montrerait) : « Show » le revele, « Copy » marche
     // sans le reveler. W.reveal survit aux rafraichissements de la fenetre.
     function masked(code) {
-        const m = /^(UWC-\d+-)/.exec(code);
+        const m = /^(UWC2?-\d+-)/.exec(code);
         return (m ? m[1] : '') + '••••••••••••••••';
     }
     function codeBox(code) {
@@ -236,7 +269,7 @@
             t.id === 'pair' && W.code ? [codeBox(W.code), h('div', { class: 'uw-row' }, btn('Open the studio', () => send('open', { link: 'studio' }), 'uw-btn-sm'))] : null,
             t.id === 'ports' ? h('div', { class: 'uw-row' }, btn('Get loopMIDI', () => send('open', { link: 'loopmidi' }), 'uw-btn-sm'), h('span', { class: 'uw-small' }, 'loopMIDI is free software by Tobias Erichsen for private, non-commercial use.')) : null));
         if (todo.length) kids.push(h('div', { class: 'uw-todo' }, todo));
-        const did = [...(o.scripts || []), ...(o.fl_lines || [])];
+        const did = [...(o.scripts || []), ...(o.fl_lines || []), ...(o.plugin_lines || [])];
         if (o.backups) did.push(`Copies of what was replaced: ${o.backups}`);
         if (o.autostart) did.push('Starts with Windows.');
         if (o.listed) did.push('Listed in Windows Settings › Apps (uninstall from there).');
@@ -271,7 +304,7 @@
         switch (s.step) {
             case 'welcome':
                 body = wizWelcome(s);
-                footer = [h('span', { class: 'uw-small' }, 'No administrator rights. Uninstall any time from Windows Settings › Apps.'), h('span', { class: 'uw-sp' }),
+                footer = [h('span', { class: 'uw-small' }, adminNote(s)), h('span', { class: 'uw-sp' }),
                     h('button', { type: 'button', class: 'uw-link', onclick: () => send('customize') }, 'Customize'),
                     btn(s.model.update_from === s.model.version ? 'Set up' : s.model.update_from != null ? 'Update' : 'Install', () => send('install'), 'uw-btn-primary uw-btn-big')];
                 break;

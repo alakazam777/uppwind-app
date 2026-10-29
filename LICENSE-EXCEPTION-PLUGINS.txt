@@ -1,0 +1,21 @@
+Uppwind Link plugins -- additional permission under GNU GPL version 3 section 7
+
+This permission applies to the Uppwind Link plugins: the folder plugin/ (the plugins "Uppwind Link Return" and
+"Uppwind Link Notes", the protocol they share with the companion in plugin/proto, and the tools that build and test
+them) and the plugin bundles built from it ("Uppwind Link.vst3", "Uppwind Link.clap"), which are under the GNU General
+Public License version 3 or later (LICENSE).
+
+A plugin runs inside the program that loads it, a digital audio workstation such as Ableton Live or FL Studio, and
+many of these programs are not free software.
+
+As an additional permission under GNU GPL version 3 section 7, you may combine the Uppwind Link plugins with any host
+program that loads them through the VST 3 or CLAP plugin interfaces, whatever that program's licence, and convey the
+plugins for that use. This combination does not bring the host program under the GNU GPL. You must follow the GNU GPL
+in all respects for the plugins themselves.
+
+You may extend this additional permission to your version of the plugins, but you are not obliged to do so. If you do
+not wish to, delete this permission from your version; the GNU General Public License version 3 or later then applies
+to it alone.
+
+VST is a registered trademark of Steinberg Media Technologies GmbH. CLAP is an open standard by Bitwig and u-he. This
+project is not affiliated with or endorsed by Steinberg, Bitwig or u-he.

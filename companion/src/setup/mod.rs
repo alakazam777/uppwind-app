@@ -22,6 +22,9 @@
 //! HKCU\Software\Image-Line\FL Studio <NN> (Devices et la case « Auto close »), FL ferme, apres une copie .reg.
 //! Jamais les preferences de Live, jamais un pilote, jamais HKLM ni rien qui demande l'administrateur.
 //! `--uninstall` (main.rs) remet d'abord les reglages de FL que le compagnon a ecrits.
+//! (29 oct.) Les plugins Uppwind Link (VST3) aussi, sauf --skip-plugins (src/plugin_install/) : sous Windows, dans
+//! C:\Program Files\Common Files\VST3, la SEULE ecriture qui demande l'administrateur (une invite, pour la copie
+//! seulement) ; sous macOS, dans ~/Library/Audio/Plug-Ins/VST3.
 
 pub mod ableton;
 pub mod env;
@@ -115,19 +118,24 @@ pub struct Opts {
     pub fl_settings: Option<bool>,
     /// --fl-free-midi : « all » ou des noms de peripheriques USB a desactiver dans FL
     pub free_midi: Vec<String>,
+    /// (29 oct.) les plugins Uppwind Link aussi (--skip-plugins : non)
+    pub plugins: bool,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { apply: false, mode: Mode::Install, json: false, force: false, daws: vec![Daw::Ableton, Daw::Fl], fl_settings: None, free_midi: vec![] }
+        Opts { apply: false, mode: Mode::Install, json: false, force: false, daws: vec![Daw::Ableton, Daw::Fl], fl_settings: None, free_midi: vec![], plugins: true }
     }
 }
 
 pub const HELP: &str = "uppwind-companion --setup [--apply] [--remove] [--json] [--daw ableton|fl|all] [--force]\n\
-  [--fl-settings | --no-fl-settings] [--fl-free-midi all|NAME]\n\
+  [--fl-settings | --no-fl-settings] [--fl-free-midi all|NAME] [--skip-plugins]\n\
   Without --apply nothing is changed: it says what it would do.\n\
   --fl-settings also writes FL Studio's MIDI and audio settings (FL closed, a backup first); with --remove it puts\n\
-  them back. --fl-free-midi disables a USB MIDI device in FL, so the browser can open it.";
+  them back. --fl-free-midi disables a USB MIDI device in FL, so the browser can open it.\n\
+  It also installs (or with --remove, removes) the Uppwind Link plugins (VST3); --skip-plugins leaves them out.\n\
+  On Windows they go in C:\\Program Files\\Common Files\\VST3: Windows asks for administrator rights once.\n\
+uppwind-companion --install-plugins [--dry-run] [--remove] [--force]   the Uppwind Link plugins only";
 
 pub fn parse(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts::default();
@@ -142,6 +150,11 @@ pub fn parse(args: &[String]) -> Result<Opts, String> {
             "--force" => o.force = true,
             "--fl-settings" => o.fl_settings = Some(true),
             "--no-fl-settings" => o.fl_settings = Some(false),
+            crate::plugin_install::SKIP_FLAG => o.plugins = false,
+            // (le dossier d'essai des plugins : lu par plugin_install::early)
+            crate::plugin_install::DIR_FLAG => {
+                it.next();
+            }
             "--fl-free-midi" => match it.next() {
                 Some(n) if !n.starts_with("--") && !n.trim().is_empty() => o.free_midi.push(n.trim().to_string()),
                 _ => return Err("--fl-free-midi takes all, or the name of a MIDI device as FL lists it".into()),
@@ -200,6 +213,11 @@ pub struct Report {
     pub scripts: Vec<Target>,
     /// les reglages de FL que --fl-settings ecrirait ou remettrait (fl_settings.rs)
     pub fl_settings: fl_settings::FlSettings,
+    /// (29 oct.) les plugins Uppwind Link (VST3) : ce qui est la, ce que --apply ferait (src/plugin_install/)
+    pub plugins: crate::plugin_install::Report,
+    /// leur dossier (None : introuvable, rien n'y sera fait)
+    #[serde(skip)]
+    pub plugin_target: Option<crate::plugin_install::Target>,
     pub checks: Vec<Check>,
     pub done: Vec<String>,
     pub errors: Vec<String>,
@@ -239,8 +257,9 @@ fn machine_checks(r: &Report) -> Vec<Check> {
             (Some(_), true) => "create them in loopMIDI (type the name, click +)",
             (Some(_), false) => "start loopMIDI (its tray icon has Autostart), then create them",
             (None, _) if cfg!(windows) => "install loopMIDI (tobias-erichsen.de), then create them",
-            // (26 oct.) macOS : le compagnon cree lui-meme les deux ports (CoreMIDI, midi_ports.rs) tant qu'il tourne
-            (None, _) => "start the companion (it creates them on macOS while it runs), or Audio MIDI Setup › IAC Driver: Device is online, add the two buses",
+            // (26 oct.) macOS : le compagnon cree lui-meme les deux ports (CoreMIDI, midi_ports.rs) ; (29 oct.) dans son
+            // gardien, qui lui survit
+            (None, _) => "start the companion (on macOS it creates them, and they stay after it quits), or Audio MIDI Setup › IAC Driver: Device is online, add the two buses",
         };
         c.push(Check::todo("midi.ports", &format!("MIDI port{} {} missing: {how}.", if miss.len() > 1 { "s" } else { "" }, miss.join(" and "))));
     }
@@ -386,6 +405,7 @@ pub fn gather(probe: &Probe, o: &Opts, stamp: &str) -> Report {
         }
     }
     let fls = fl_settings::prepare(reg, fl::IL, &flx, probe, o, &backups, stamp);
+    let (plugins, plugin_target) = plugins_of(probe, o);
     let mut r = Report {
         companion: env!("CARGO_PKG_VERSION"),
         mode: if o.apply { "apply" } else { "dry-run" },
@@ -398,6 +418,8 @@ pub fn gather(probe: &Probe, o: &Opts, stamp: &str) -> Report {
         fl: flx,
         scripts: targets,
         fl_settings: fls,
+        plugins,
+        plugin_target,
         checks: vec![],
         done: vec![],
         errors: vec![],
@@ -406,9 +428,55 @@ pub fn gather(probe: &Probe, o: &Opts, stamp: &str) -> Report {
     r
 }
 
+/// (29 oct.) Les plugins Uppwind Link : leur dossier (--plugins-dir, la fausse machine, sinon celui du systeme), ce qui
+/// y est, et ce que --apply ferait (rien avec --skip-plugins).
+fn plugins_of(probe: &Probe, o: &Opts) -> (crate::plugin_install::Report, Option<crate::plugin_install::Target>) {
+    use crate::plugin_install as pi;
+    let b = pi::Bundle::embedded();
+    let t = match pi::target_for(&probe.paths, probe.fake, false) {
+        Ok(t) => t,
+        // (un dossier introuvable : dit, rien n'est tente)
+        Err(e) => return (pi::unavailable(&b, e), None),
+    };
+    let mut r = pi::inspect(&b, &t);
+    if o.plugins {
+        pi::plan(&mut r, o.mode == Mode::Remove, o.force);
+    } else {
+        r.action = pi::Action::None;
+        r.reason = format!("left out ({})", pi::SKIP_FLAG);
+    }
+    (r, Some(t))
+}
+
+fn plugin_checks(r: &Report) -> Vec<Check> {
+    use crate::plugin_install::{Action as A, Status as S};
+    let p = &r.plugins;
+    if !p.supported {
+        return vec![];
+    }
+    let what = format!("Uppwind Link plugins (VST3) in {}", p.folder.display());
+    let why = if cfg!(target_os = "macos") { "needed for FL Studio, and on a Mac for your DAW's sound" } else { "needed for FL Studio" };
+    let admin = if p.admin { " (Windows asks for administrator rights once)" } else { "" };
+    let st = p.after.unwrap_or(p.status);
+    let mut c = vec![match st {
+        S::UpToDate => Check::ok("plugins.vst3", &format!("{what}: up to date.")),
+        S::Missing if r.intent == "remove" => Check::ok("plugins.vst3", &format!("{what}: not installed.")),
+        _ if !p.embedded && r.intent == "install" => Check::info("plugins.vst3", &format!("{what}: this build of the companion does not carry them (a development build): the released one installs them.")),
+        S::Missing => Check::todo("plugins.vst3", &format!("{what}: not installed ({why}); --setup --apply installs them{admin}.")),
+        S::Newer => Check::info("plugins.vst3", &format!("{what}: installed by a newer companion ({}).", p.installed_by.as_deref().unwrap_or("?"))),
+        _ if r.intent == "remove" && p.action == A::Skip => Check::info("plugins.vst3", &format!("{what}: not installed by Uppwind Link, left alone.")),
+        _ => Check::todo("plugins.vst3", &format!("{what}: {} installed; --setup --apply replaces them{admin}.", if st == S::Outdated { "an older version is" } else { "different files are" })),
+    }];
+    if !p.held.is_empty() {
+        c.push(Check::info("plugins.held", "A DAW still has older Uppwind Link plugins loaded: restart it; the old file goes once it is free."));
+    }
+    c
+}
+
 fn finish_checks(r: &mut Report) {
     let mut c = machine_checks(r);
     c.extend(script_checks(r));
+    c.extend(plugin_checks(r));
     if r.ableton.found() {
         c.extend(ableton::checks(&r.ableton));
     }
@@ -459,6 +527,12 @@ pub fn apply(r: &mut Report) {
         }
         let again = scripts::inspect(&scripts::bundle(t.daw), &t.dir, &t.library);
         t.after = Some(again.status);
+    }
+    // (29 oct.) les plugins : sous Windows, l'invite d'administrateur (dite sur stderr : la sortie --json reste du JSON)
+    if let Some(t) = r.plugin_target.clone() {
+        let a = crate::plugin_install::apply(&mut r.plugins, &crate::plugin_install::Bundle::embedded(), &t, &|l| eprintln!("{l}…"));
+        r.done.extend(a.done);
+        r.errors.extend(a.errors);
     }
     finish_checks(r);
 }
@@ -615,6 +689,7 @@ fn print_text(r: &Report) {
             println!("    after: {a:?}");
         }
     }
+    print_plugins(r);
     print_fl_settings(r);
     println!();
     println!("Checks:");
@@ -648,7 +723,8 @@ fn print_text(r: &Report) {
         }
     }
     let fla = r.fl_settings.action.as_str();
-    if r.mode != "apply" && (r.scripts.iter().any(|t| matches!(t.action, Action::Install | Action::Update | Action::Remove)) || fla == "write" || fla == "restore") {
+    let plugins_change = matches!(r.plugins.action, crate::plugin_install::Action::Install | crate::plugin_install::Action::Update | crate::plugin_install::Action::Remove);
+    if r.mode != "apply" && (r.scripts.iter().any(|t| matches!(t.action, Action::Install | Action::Update | Action::Remove)) || fla == "write" || fla == "restore" || plugins_change) {
         println!();
         println!("Run again with --apply to do it.");
     }
@@ -657,6 +733,31 @@ fn print_text(r: &Report) {
             "{}",
             if r.intent == "install" { "Add --fl-settings (FL Studio closed) to write FL's settings too." } else { "Add --fl-settings to put FL's settings back too." }
         );
+    }
+}
+
+/// (29 oct.) La partie « plugins » du rapport texte.
+fn print_plugins(r: &Report) {
+    use crate::plugin_install::Action as A;
+    let p = &r.plugins;
+    if !p.supported {
+        return;
+    }
+    println!();
+    println!("Uppwind Link plugins (VST3: Uppwind Link Return, Uppwind Link Notes) → {}", p.folder.display());
+    let changed: Vec<String> = p.files.iter().filter(|f| f.state != "same").map(|f| format!("{} {}", f.name, f.state)).collect();
+    println!(
+        "  now: {:?}{}{}{}",
+        p.status,
+        p.installed_by.as_ref().map(|v| format!(", installed by companion {v}")).unwrap_or_default(),
+        if p.embedded { "" } else { " (this build carries no plugins)" },
+        if changed.is_empty() { String::new() } else { format!(" [{}]", changed.join(", ")) }
+    );
+    let verb = if r.mode == "apply" { "did" } else { "would" };
+    let admin = if p.admin && matches!(p.action, A::Install | A::Update | A::Remove) && r.mode != "apply" { " (Windows asks for administrator rights)" } else { "" };
+    println!("  {verb}: {:?} — {}{admin}", p.action, p.reason);
+    if let Some(a) = p.after {
+        println!("  after: {a:?}");
     }
 }
 

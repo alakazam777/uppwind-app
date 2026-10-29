@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Uppwind
 [package]
 name = "uppwind-companion"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Uppwind Link companion: shows the windows of the plugins hosted in Ableton Live inside Uppwind Studio, plays them, and brings the DAW's sound back."
 license = "GPL-3.0-or-later"
@@ -47,6 +47,8 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
+    # --stop : les compagnons de la meme session Windows seulement (ProcessIdToSessionId)
+    "Win32_System_RemoteDesktop",
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Storage_FileSystem",

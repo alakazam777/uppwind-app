@@ -230,7 +230,7 @@ pub fn checks(f: &Fl) -> Vec<Check> {
             // (26 oct.) FL pour Mac range ses reglages hors du registre : le compagnon ne les lit pas encore
             c.push(Check::info(
                 "fl.settings",
-                "FL Studio for Mac: check by hand in Options › MIDI settings that the \"Uppwind Link\" input is enabled with Controller type \"Uppwind Link (user)\" and a Port number, and that the \"Uppwind Link Back\" output has the same Port.",
+                "FL Studio for Mac: check by hand in Options › MIDI settings that the \"Uppwind Link\" input is enabled with Controller type \"Uppwind Link (user)\" and a Port number, and that the \"Uppwind Link Back\" output has the same Port. The \"Uppwind Link\" output must have no port (---): FL gives it the input's port when the controller type is picked again.",
             ));
         } else if f.found() {
             c.push(Check::info("fl.settings", "FL Studio's MIDI settings are unknown (FL saves them when it closes)."));

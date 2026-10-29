@@ -33,6 +33,9 @@ supprimer un canal, choisir les ports MIDI d'un canal (getChannelMidiInPort se l
 caps ne contient donc ni 'plugins', ni 'add', ni 'remove' : le studio dit « Add the plugin in FL's
 channel rack; it appears here instantly ».
 
+(27 oct., 1.2.1) Nos propres reponses revenues sur l'entree : le Script output dit pourquoi (la sortie « Uppwind Link »
+a le numero de l'entree) et comment reparer.
+
 (26 oct., 1.2.0) Les notes par le plugin « Uppwind Link Notes » (cap 'notes'), le son par « Uppwind Link
 Return », les commandes toujours ici (FL refuse les sockets aux scripts, et un script ne vit que sur une
 entree MIDI : loopMIDI reste pour ces commandes). Le chemin d'une note :
@@ -67,7 +70,7 @@ import ui
 
 import uwlink_protocol as P
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 TAG = "[Uppwind Link]"
 DAW_NAME = "FL Studio"
 CAPS = ["list", "bind", "set", "audition", "tempo", "notes"]
@@ -956,7 +959,13 @@ def _list_page(start):
 def _dispatch(cmd, req, data):
     spec = P.COMMANDS[cmd]
     if spec[1] == "daw":
-        return                      # nos propres reponses revenues par une boucle : on les ignore
+        # nos propres reponses revenues par une boucle : on les ignore. (27 oct.) La boucle a une cause connue : la
+        # sortie « Uppwind Link » a le numero de port de l'entree (FL le lui redonne quand on rechoisit le type de
+        # controleur de l'entree) ; les reponses partent la, jamais vers « Uppwind Link Back » : le studio attend.
+        _say(("loop",), "FL Studio sends this script's replies into the 'Uppwind Link' OUTPUT: the studio never gets "
+             "them. In Options > MIDI settings, set that output's Port to none (---); only 'Uppwind Link Back' keeps "
+             "port %s." % _port())
+        return
     v = P.validate_message(cmd, data, "studio")
     if not v["ok"]:
         if cmd != P.ERROR:

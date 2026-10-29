@@ -25,6 +25,8 @@
 //!
 //! (26 oct.) macOS : la meme console (fenetres, capture, gestes, --setup, --install, --autostart, --background,
 //! --stop, plugins) ; pas encore la fenetre d'installation ni l'icone (voir README, « macOS »).
+//! (29 oct.) macOS : les ports MIDI vivent dans le gardien (midi_ports.rs, --midi-ports-keeper, lance par le
+//! compagnon), qui lui survit ; --stop-midi-ports l'arrete.
 
 // hors Windows, une bonne part du code (la capture WGC/DWM, la fenetre d'installation, l'icone) n'est pas appelee
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
@@ -42,6 +44,8 @@ mod live;
 mod macos;
 #[cfg(target_os = "macos")]
 mod midi_ports;
+// (29 oct.) les plugins Uppwind Link (VST3) embarques, et leur installation (--install-plugins, --setup, l'assistant)
+mod plugin_install;
 mod plugin_link;
 mod plugins;
 mod popups;
@@ -49,6 +53,8 @@ mod protocol;
 mod security;
 mod session;
 mod setup;
+// (29 oct.) le fichier d'etat : 0600 sous macOS et Linux, pairingV2, pluginPort retire a la sortie propre
+mod state_file;
 mod stream;
 mod testwin;
 // (24 oct.) le compagnon s'installe lui-meme : la fenetre d'installation, l'icone, la fenetre d'etat
@@ -70,6 +76,8 @@ const LICENSE_TEXT: &str = include_str!("../../LICENSE");
 const EXCEPTION_TEXT: &str = include_str!("../../LICENSE-EXCEPTION.txt");
 const SCRIPTS_LICENSE_TEXT: &str = include_str!("../../LICENSE-MIT");
 const NOTICES_TEXT: &str = include_str!("../../THIRD-PARTY-NOTICES.txt");
+/// (29 oct.) la permission des plugins (n'importe quel hote VST 3 ou CLAP peut les charger), quand l'exe les embarque
+const PLUGINS_EXCEPTION_TEXT: &str = include_str!("../../LICENSE-EXCEPTION-PLUGINS.txt");
 
 pub const DEFAULT_PORT: u16 = 47410;
 pub const PORT_TRIES: u16 = 10;
@@ -84,6 +92,10 @@ pub struct Shared {
     pub demo: bool,
     /// --test-window : la fenetre d'essai du compagnon (testwin.rs), proposee au studio en plus des plugins de Live.
     pub test_window: Option<u64>,
+    /// (29 oct.) un studio a fait la poignee de main v2 avec ce jeton : un hello v1 (le jeton en clair) est refuse
+    pub pairing_v2: std::sync::atomic::AtomicBool,
+    /// le fichier d'etat ou le noter (« pairingV2 ») ; None : les essais
+    pub state: Option<PathBuf>,
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -115,12 +127,13 @@ pub fn shown_path_in(p: &std::path::Path, home: &std::path::Path) -> String {
     s
 }
 
-/// --pairing-code : le code du fichier d'etat (celui du compagnon qui tourne, meme en fond) → « UWC-<port>-<jeton> ».
+/// --pairing-code : le code du fichier d'etat (celui du compagnon qui tourne, meme en fond) → (29 oct.)
+/// « UWC2-<port>-<jeton> » (security::pairing_code).
 pub fn pairing_code_of(state_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(state_json).ok()?;
     let token = v["token"].as_str().filter(|t| security::token_well_formed(t))?;
     let port = v["port"].as_u64().filter(|p| *p > 0 && *p < 65536)?;
-    Some(format!("UWC-{port}-{token}"))
+    Some(security::pairing_code(port as u16, token))
 }
 
 #[derive(Default)]
@@ -220,6 +233,12 @@ fn parse_args() -> Result<Args, String> {
             "--no-plugins" => a.no_plugins = true,
             // (26 oct.) macOS : pas de ports MIDI virtuels (midi_ports.rs) ; sans effet ailleurs
             "--no-midi-ports" => a.no_midi_ports = true,
+            // (29 oct.) macOS : lue avant parse_args (midi_ports::early) ; ailleurs, pas de gardien a arreter
+            #[cfg(not(target_os = "macos"))]
+            "--stop-midi-ports" => {
+                println!("No MIDI ports keeper on this system (macOS only).");
+                std::process::exit(0);
+            }
             // le retour audio (audio/mod.rs les lit lui-meme)
             o if audio::is_server_flag(o).is_some() => {
                 if audio::is_server_flag(o) == Some(true) {
@@ -244,13 +263,23 @@ fn parse_args() -> Result<Args, String> {
                 println!("{SCRIPTS_LICENSE_TEXT}");
                 println!();
                 println!("{NOTICES_TEXT}");
+                // (29 oct.) les plugins que cet exe embarque et installe : leurs notices voyagent avec eux
+                if !plugin_install::notices().is_empty() {
+                    println!();
+                    println!("{PLUGINS_EXCEPTION_TEXT}");
+                    println!();
+                    println!("{}", plugin_install::notices());
+                }
                 std::process::exit(0);
             }
             "-h" | "--help" => {
                 println!("Uppwind Link companion {}. {NOTICE}", env!("CARGO_PKG_VERSION"));
                 println!("uppwind-companion [--list | --probe TITLE [--seconds S]] [--port N] [--new-token] [--capture wgc|dwm|print] [--dev-origins] [--allow-origin URL] [--studio-origin URL|none] [--state-file PATH] [--demo] [--test-window [--test-window-at X,Y] [--test-window-unaware] [--test-window-ghost]] [--bench TITLE [--bench-clicks \"x,y;x,y\"] [--bench-out DIR]] [--background] [--plugin-port N | --no-plugins] [--no-midi-ports (macOS)]");
                 println!("  Studio origin accepted by default: {} (only that one). --dev-origins adds http://localhost and http://127.0.0.1 on ports 5174 and 5747; --allow-origin adds one https:// or local origin (for your own development server only).", security::default_studio_origin());
-                println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH]");
+                println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH] | --stop-midi-ports (macOS)");
+                if cfg!(target_os = "macos") {
+                    println!("  macOS: the MIDI ports live in a small helper process that outlives the companion (DAWs keep them across restarts). --stop leaves it running; --stop-midi-ports and --uninstall stop it (the ports go).");
+                }
                 println!("{}", setup::HELP);
                 std::process::exit(0);
             }
@@ -480,6 +509,11 @@ fn main() {
     START.get_or_init(Instant::now);
     // --setup (setup/mod.rs) : ses propres options, une simulation sans --apply
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // (29 oct.) les plugins (plugin_install/) : la copie elevee de Windows (seule, avant tout le reste),
+    // --install-plugins, et le dossier d'essai --plugins-dir (garde pour --setup, --wizard, --uninstall)
+    if let Some(code) = plugin_install::early(&raw) {
+        std::process::exit(code);
+    }
     if raw.iter().any(|a| a == "--setup") {
         std::process::exit(setup::main(&raw));
     }
@@ -493,6 +527,12 @@ fn main() {
         wizard::Early::App(m) => Some(m),
         wizard::Early::Console => None,
     };
+    // (29 oct.) macOS : le gardien des ports MIDI (lance par le compagnon), son arret, son essai (midi_ports.rs) ; apres
+    // wizard::early pour le bac a sable, avant tout le reste
+    #[cfg(target_os = "macos")]
+    if let Some(code) = midi_ports::early(&raw) {
+        std::process::exit(code);
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -505,21 +545,27 @@ fn main() {
     }
     if args.stop {
         // (24 oct.) un compagnon avec son icone s'arrete proprement (l'icone part avec lui)
+        let mut stopped = false;
         if tray::single::request_quit(Duration::from_secs(5)) {
             println!("Stopped Uppwind Link.");
-            std::process::exit(0);
+            stopped = true;
         }
         let state = args.state_file.clone().unwrap_or_else(wizard::state_file);
-        match install::stop(&state) {
-            Ok(m) => {
-                println!("{m}");
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
+        if !stopped {
+            match install::stop(&state) {
+                Ok(m) => {
+                    println!("{m}");
+                    stopped = true;
+                }
+                Err(e) => eprintln!("{e}"),
             }
         }
+        // (27 oct.) et ceux lances en console, qui ne prennent pas le verrou de l'icone
+        for m in install::stop_others() {
+            stopped |= m.starts_with("Stopped");
+            println!("{m}");
+        }
+        std::process::exit(if stopped { 0 } else { 1 });
     }
     if args.pairing_code {
         // le code du compagnon qui tourne (en fond ou avec son icone : son journal ne le contient pas)
@@ -597,7 +643,12 @@ fn main() {
     }
 
     let state = args.state_file.clone().unwrap_or_else(wizard::state_file);
+    // (29 oct., audit MAC-1) 0600 sous macOS et Linux, avant toute lecture ; ce que le lancement d'avant y avait note
+    if let Err(e) = state_file::secure(&state) {
+        eprintln!("warning: cannot make {} private ({e})", shown_path(&state));
+    }
     let token = load_token(&state, args.new_token);
+    let pairing_v2 = state_file::read(&state).map(|v| state_file::pairing_v2(&v, &token)).unwrap_or(false);
     // la machine elle-meme, et rien d'autre (un seul socket a l'ecoute, sur 127.0.0.1)
     let listener = match bind(args.port) {
         Ok(l) => l,
@@ -607,6 +658,10 @@ fn main() {
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    // (27 oct.) un autre compagnon tourne deja : le studio essaie les ports dans l'ordre et peut lui parler a lui
+    for (pid, path) in install::other_companions() {
+        println!("Another companion is running (pid {pid}, {path}): the studio may connect to it instead of this one (port {port}). Stop them all with: uppwind-companion --stop");
+    }
     let allow = match &args.studio {
         None => security::Allowlist::new(args.dev_origins, &args.allow),
         Some(studio) => security::Allowlist::with_studio(studio.as_deref(), args.dev_origins, &args.allow),
@@ -637,9 +692,14 @@ fn main() {
         st["pluginSecret"] = json!(uwl_proto::secret_hex(&plugin_secret));
         st["pluginProtocol"] = json!(uwl_proto::VERSION);
     }
-    if let Err(e) = std::fs::write(&state, serde_json::to_string_pretty(&st).unwrap()) {
+    if pairing_v2 {
+        st["pairingV2"] = json!(true);
+    }
+    if let Err(e) = state_file::write(&state, &st) {
         eprintln!("warning: cannot write {} ({e})", shown_path(&state));
     }
+    // (29 oct.) a la sortie propre, pluginPort est retire du fichier (state_file.rs)
+    state_file::at_exit(&state);
 
     println!("Uppwind Link companion {}: your DAW's plugin windows and sound, in Uppwind Studio", env!("CARGO_PKG_VERSION"));
     println!("{NOTICE}");
@@ -658,7 +718,7 @@ fn main() {
     } else {
         println!("PAIRING CODE (paste it once in the studio's Plugin window; keep it to yourself):");
         println!();
-        println!("    UWC-{port}-{token}");
+        println!("    {}", security::pairing_code(port, &token));
     }
     println!();
     println!("Saved in {} (the same code next time; --new-token makes a new one and unpairs the studio).", shown_path(&state));
@@ -675,9 +735,14 @@ fn main() {
     audio::server_start(&raw, args.demo);
     #[cfg(target_os = "macos")]
     if !args.no_midi_ports && !args.demo {
-        match midi_ports::start() {
-            Ok(p) => println!("MIDI ports (CoreMIDI, while the companion runs): {}", p.join(", ")),
-            Err(e) => eprintln!("warning: {e} (make the ports in Audio MIDI Setup › IAC Driver instead)"),
+        // (29 oct.) les ports vivent dans le gardien, qui survit au compagnon (FL Studio les garde d'un redemarrage a
+        // l'autre) ; deja la : rien n'est cree ; le gardien ne vient pas : ici, comme avant (midi_ports.rs)
+        let o = midi_ports::open(&midi_ports::default_names(), &midi_ports::keeper_dir());
+        for l in &o.lines {
+            println!("{l}");
+        }
+        for w in &o.warnings {
+            eprintln!("warning: {w}");
         }
     }
     match plugin_port {
@@ -709,13 +774,19 @@ fn main() {
         capture: args.capture.clone(),
         demo: args.demo,
         test_window,
+        pairing_v2: std::sync::atomic::AtomicBool::new(pairing_v2),
+        state: Some(state.clone()),
     });
     // (24 oct.) avec l'icone : l'icone et la fenetre d'etat sur un fil a elles (STA pour WebView2 ; ce fil-ci garde son
     // MTA) ; quand l'icone quitte, tout s'arrete. Le code n'y est que montre (la fenetre, le bouton Copy), jamais ecrit.
     #[cfg(windows)]
     if let (Some(mode), Some(guard)) = (app, guard) {
         let token = shared.token.clone();
-        std::thread::spawn(move || std::process::exit(tray::run(mode, guard, port, token)));
+        std::thread::spawn(move || {
+            let code = tray::run(mode, guard, port, token);
+            state_file::on_exit();
+            std::process::exit(code)
+        });
     }
     // un fil par connexion, au plus session::MAX_CONNECTIONS a la fois (comptees des l'acceptation)
     session::serve(listener, shared, session::MAX_CONNECTIONS);
@@ -729,7 +800,7 @@ mod tests {
     #[test]
     fn the_pairing_code_comes_from_the_state_file() {
         let t = "0123456789abcdef".repeat(4);
-        assert_eq!(pairing_code_of(&json!({"port": 47411, "token": t, "pid": 7}).to_string()), Some(format!("UWC-47411-{t}")));
+        assert_eq!(pairing_code_of(&json!({"port": 47411, "token": t, "pid": 7}).to_string()), Some(format!("UWC2-47411-{t}")));
         assert_eq!(pairing_code_of(&json!({"port": 47411, "token": "short"}).to_string()), None);
         assert_eq!(pairing_code_of(&json!({"token": t}).to_string()), None, "no port");
         assert_eq!(pairing_code_of("not json"), None);

@@ -247,13 +247,16 @@ pub struct Parts {
     pub arp_key: String,
     pub state_file: PathBuf,
     pub extra_args: Vec<String>,
+    /// (29 oct.) ou vont les plugins Uppwind Link (simules dans le bac a sable, comme Live et FL)
+    pub plugins: crate::plugin_install::Target,
 }
 
 pub fn parts() -> Result<Parts, String> {
     let dirs = Dirs::from_env()?;
     let probe = Probe::from_env()?;
     let simulate_daws = trial() && !probe.fake;
-    Ok(Parts { dirs, simulate_daws, probe, arp_key: arp::key()?, state_file: state_file(), extra_args: extra_args() })
+    let plugins = crate::plugin_install::target_for(&probe.paths, probe.fake, simulate_daws)?;
+    Ok(Parts { dirs, simulate_daws, probe, arp_key: arp::key()?, state_file: state_file(), extra_args: extra_args(), plugins })
 }
 
 impl Parts {
@@ -267,6 +270,8 @@ impl Parts {
             state_file: self.state_file.clone(),
             extra_args: self.extra_args.clone(),
             stamp: crate::setup::scripts::now_stamp(),
+            plugins: self.plugins.clone(),
+            plugin_bundle: crate::plugin_install::Bundle::embedded(),
         }
     }
 }
@@ -298,6 +303,14 @@ impl<F: Fn(&str)> flow::Hooks for RealHooks<F> {
     }
     fn stop_running(&self) -> Option<String> {
         crate::tray::single::request_quit(Duration::from_secs(6)).then(|| "Closed the Uppwind Link that was running (it starts again at the end).".to_string())
+    }
+    /// (29 oct.) macOS : le gardien des ports MIDI, dont le fichier est a cote du fichier d'etat (midi_ports.rs)
+    fn stop_midi_ports(&self) -> Result<Option<String>, String> {
+        #[cfg(target_os = "macos")]
+        let r = crate::midi_ports::stop_keeper(&crate::midi_ports::dir_of(&self.state_file), &crate::midi_ports::default_names());
+        #[cfg(not(target_os = "macos"))]
+        let r = Ok(None);
+        r
     }
     fn start(&self, exe: &Path, args: &[String]) -> Result<Option<u16>, String> {
         let pid = spawn_detached(exe, args)?;
@@ -436,7 +449,24 @@ fn console_install(installed: Option<String>, interactive: bool) -> i32 {
         if m.daws.iter().any(|d| d.daw == "fl" && d.fl_settings.as_ref().is_some_and(|f| f.changes > 0)) {
             c.fl_settings = ask("Apply FL Studio's MIDI settings for you? (FL Studio closed; a backup is kept; uninstalling puts them back)", true);
         }
+        // (29 oct.) les plugins Uppwind Link (VST3)
+        if m.plugins.selectable && matches!(m.plugins.action.as_str(), "install" | "update") {
+            let q = format!(
+                "Install the Uppwind Link plugins (VST3, needed for FL Studio) in {}?{}",
+                m.plugins.folder,
+                if m.plugins.admin { " Windows asks for administrator rights once." } else { "" }
+            );
+            if !ask(&q, true) {
+                c.daws.retain(|d| d != steps::PLUGINS);
+            }
+        }
         c.autostart = ask("Start Uppwind Link with Windows?", true);
+    }
+    // (29 oct.) --wizard --quiet promet « sans question » : pas d'invite d'administrateur de Windows non plus — des
+    // plugins qui la demanderaient attendent `--install-plugins`
+    if !interactive && m.plugins.admin && c.wants_plugins() {
+        c.daws.retain(|d| d != steps::PLUGINS);
+        println!("The Uppwind Link plugins need administrator rights, which a quiet setup does not ask for: not installed. Run: uppwind-companion --install-plugins");
     }
     let reg = arp::ArpRegistry;
     let env = p.env(&reg);
@@ -450,7 +480,7 @@ fn console_install(installed: Option<String>, interactive: bool) -> i32 {
     };
     let o = flow::install(&env, &exe, &c, &hooks);
     println!();
-    for l in o.done.iter().chain(o.scripts.iter()).chain(o.fl_lines.iter()) {
+    for l in o.done.iter().chain(o.scripts.iter()).chain(o.fl_lines.iter()).chain(o.plugin_lines.iter()) {
         println!("  {l}");
     }
     for e in &o.errors {

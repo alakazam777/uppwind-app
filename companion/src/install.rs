@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 //   --autostart on|off un LaunchAgent ~/Library/LaunchAgents/com.uppwind.link.companion.plist (RunAtLoad), ECRIT
 //                      mais pas charge : il part a la prochaine ouverture de session (ou `launchctl bootstrap
 //                      gui/<uid> <plist>`, que le compagnon ne lance jamais lui-meme) ;
-//   --background       la sortie au journal (dup2), --stop : SIGTERM au pid du fichier d'etat s'il est bien a nous.
+//   --background       la sortie au journal (dup2), --stop : SIGTERM au pid du fichier d'etat s'il est bien a nous
+//                      (jamais le gardien des ports MIDI, le meme programme : midi_ports.rs ; --uninstall l'arrete,
+//                      par wizard/flow.rs).
 
 pub const APP_DIR: &str = "Uppwind Link";
 #[cfg(windows)]
@@ -391,6 +393,81 @@ pub fn is_companion_image(path: &str) -> bool {
     }
 }
 
+/// (27 oct.) Les autres compagnons de cette session Windows : (pid, chemin), ce processus exclu. Un compagnon lance en
+/// console ne prend pas le verrou de l'icone (tray/single.rs) : lors d'un essai, un vieux tournait a cote du nouveau, et
+/// le studio parlait au vieux (le premier port de la plage).
+#[cfg(windows)]
+pub fn other_companions() -> Vec<(u32, String)> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    let me = std::process::id();
+    let session = |pid: u32| {
+        let mut s = 0u32;
+        unsafe { ProcessIdToSessionId(pid, &mut s) }.ok().map(|_| s)
+    };
+    let mine = session(me);
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            let pid = e.th32ProcessID;
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            let exe = String::from_utf16_lossy(&e.szExeFile[..len]);
+            if pid != me && is_companion_image(&exe) && session(pid) == mine {
+                let mut path = exe.clone();
+                if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    let mut buf = [0u16; 1024];
+                    let mut n = buf.len() as u32;
+                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok() {
+                        path = String::from_utf16_lossy(&buf[..n as usize]);
+                    }
+                    let _ = CloseHandle(h);
+                }
+                out.push((pid, path));
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+#[cfg(not(windows))]
+pub fn other_companions() -> Vec<(u32, String)> {
+    Vec::new()
+}
+
+/// (27 oct.) --stop : apres le compagnon a icone et celui du fichier d'etat, ceux qui restent (lances en console).
+#[cfg(windows)]
+pub fn stop_others() -> Vec<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    other_companions()
+        .into_iter()
+        .map(|(pid, path)| unsafe {
+            match OpenProcess(PROCESS_TERMINATE, false, pid) {
+                Ok(h) => {
+                    let r = TerminateProcess(h, 0);
+                    let _ = CloseHandle(h);
+                    match r {
+                        Ok(()) => format!("Stopped the companion (pid {pid}, {path})."),
+                        Err(e) => format!("cannot stop pid {pid} ({path}): {e}"),
+                    }
+                }
+                Err(e) => format!("cannot stop pid {pid} ({path}): {e}"),
+            }
+        })
+        .collect()
+}
+#[cfg(not(windows))]
+pub fn stop_others() -> Vec<String> {
+    Vec::new()
+}
+
 /// --stop : le compagnon du fichier d'etat, s'il tourne et si c'est bien un uppwind-companion*.exe.
 #[cfg(windows)]
 pub fn stop(state: &Path) -> Result<String, String> {
@@ -436,6 +513,10 @@ pub fn stop(state: &Path) -> Result<String, String> {
     let image = String::from_utf8_lossy(&buf[..n as usize]).to_string();
     if !is_companion_image(&image) {
         return Err(format!("pid {pid} is not a companion ({image}): left alone."));
+    }
+    // (29 oct.) le gardien des ports MIDI est le meme programme (midi_ports.rs) : --stop le laisse, reconnu a son option
+    if crate::midi_ports::is_keeper(pid) {
+        return Err(format!("pid {pid} is the MIDI ports keeper, not a companion: left alone (--stop-midi-ports stops it)."));
     }
     if unsafe { kill(pid as i32, SIGTERM) } != 0 {
         return Err(format!("cannot stop pid {pid}: {}", std::io::Error::last_os_error()));

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Uppwind
-//! Une connexion du studio : poignee de main controlee (Host, Origin), appairage (jeton dans le premier message),
-//! puis les messages du protocole, les gestes et le flux d'images d'UNE fenetre de plugin. Un fil par connexion
-//! (socket non bloquant, TCP_NODELAY) ; la capture tourne sur un fil a elle (stream.rs) pour que les gestes soient
-//! injectes des leur arrivee, meme pendant une capture.
+//! Une connexion du studio : poignee de main controlee (Host, Origin), appairage (29 oct., v2 : le defi du compagnon,
+//! la preuve du studio, puis celle du compagnon, security.rs ; le jeton ne circule plus), puis les messages du
+//! protocole, les gestes et le flux d'images d'UNE fenetre de plugin. Un fil par connexion (socket non bloquant,
+//! TCP_NODELAY) ; la capture tourne sur un fil a elle (stream.rs) pour que les gestes soient injectes des leur
+//! arrivee, meme pendant une capture.
 
 use crate::capture;
 use crate::input::{self, Injector, Mode};
@@ -41,6 +42,10 @@ pub const MAX_MSGS_PER_SEC: u32 = 1000; // (des mouvements a 250/s au plus, plus
 pub const CLOSE_BAD_TOKEN: u16 = 4401;
 pub const CLOSE_LOCKED: u16 = 4429;
 pub const CLOSE_PROTOCOL: u16 = 4400;
+/// (29 oct.) un hello v1 (le jeton en clair) alors qu'un studio a deja fait la v2 avec ce jeton : « reload the studio »
+pub const CLOSE_V1_REFUSED: u16 = 4426;
+/// (29 oct.) la poignee de main de l'appairage : 2 (le defi et les preuves) ; un hello sans « v » est la v1
+pub const AUTH_VERSION: u32 = 2;
 pub const DEMO_ID: u64 = 1;
 /// Apres le dernier geste, la voie rapide (capture continue, tuiles) continue encore un instant.
 pub const GESTURE_HOLD: Duration = Duration::from_millis(250);
@@ -174,6 +179,8 @@ struct Conn<'a> {
     audio: Option<crate::audio::feed::Feed>,
     /// (25 oct., sans loopMIDI) le lien du studio avec le Remote Script de Live par son canal local (link_relay.rs)
     link: Option<crate::link_relay::Relay>,
+    /// (29 oct.) la generation des avis (un plugin d'avant refuse, plugin_link) deja dite a ce studio
+    notices: u64,
 }
 
 enum Fatal {
@@ -560,6 +567,19 @@ impl<'a> Conn<'a> {
         }
     }
 
+    /// (29 oct.) Un plugin d'avant (protocole v1) a ete refuse : le studio le dit (« notice »), une fois par nouveau venu.
+    fn poll_notices(&mut self) -> Result<(), Fatal> {
+        let generation = crate::plugin_link::notices_generation();
+        if generation == self.notices {
+            return Ok(());
+        }
+        self.notices = generation;
+        match crate::plugin_link::old_notice() {
+            Some(n) => self.send_text(n.to_string()),
+            None => Ok(()),
+        }
+    }
+
     fn log_inputs(&mut self, force: bool) {
         let Some(since) = self.stats.since else { return };
         if !force && since.elapsed() < Duration::from_secs(10) {
@@ -792,6 +812,30 @@ fn editor_request(path: &str, open: bool, known: Option<String>) -> String {
     json!({ "type": kind, "ok": true, "path": path, "window": window, "title": title, "wasOpen": live::was_open(&rep) }).to_string()
 }
 
+/// (29 oct.) La premiere poignee de main v2 reussie avec ce jeton : un hello v1 (le jeton en clair) est refuse desormais,
+/// et le fichier d'etat le garde (« pairingV2 », d'un lancement a l'autre, tant que le jeton ne change pas).
+fn note_v2(sh: &Shared) {
+    if sh.pairing_v2.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    crate::log("pairing: a studio proved the pairing code (v2); a studio that sends the code in clear (v1) is refused from now on");
+    if let Some(p) = &sh.state {
+        if let Err(e) = crate::state_file::mark_pairing_v2(p, &sh.token) {
+            crate::log(&format!("warning: cannot note it in {} ({e})", crate::shown_path(p)));
+        }
+    }
+}
+
+/// Un studio d'avant reessaie chaque seconde : le journal le dit une fois par minute au plus.
+fn log_v1_refused(origin: &str) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.map(|t| t.elapsed() >= Duration::from_secs(60)).unwrap_or(true) {
+        *last = Some(Instant::now());
+        crate::log(&format!("REFUSED: {origin} sent the pairing code in clear (an older studio page): reload the studio (said once a minute)"));
+    }
+}
+
 /// La place d'une connexion dans le compte de `serve` (rendue quand le fil se termine, meme sur une panique).
 struct Slot(Arc<AtomicUsize>);
 
@@ -857,10 +901,16 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         last_devices: None,
         audio: None,
         link: None,
+        notices: 0,
     };
-    crate::log(&format!("studio connected from {origin}: waiting for the pairing token"));
+    crate::log(&format!("studio connected from {origin}: waiting for the pairing proof"));
 
-    // 1. l'appairage : le premier message, dans les 10 s
+    // 1. l'appairage (29 oct., v2) : le defi tout de suite (rien d'autre ne part avant la preuve du studio), puis le
+    //    premier message, dans les 10 s
+    let nonce_c = security::new_nonce();
+    if c.send_text(json!({ "type": "challenge", "v": AUTH_VERSION, "nonce": security::hex(&nonce_c) }).to_string()).is_err() {
+        return;
+    }
     let t0 = Instant::now();
     loop {
         if t0.elapsed() > HELLO_TIMEOUT {
@@ -868,20 +918,57 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
             c.close(CLOSE_PROTOCOL, "no hello");
             return;
         }
+        if c.flush().is_err() {
+            return;
+        }
         match c.ws.read() {
             Ok(Message::Text(t)) => {
                 let parsed = protocol::parse(t.as_str());
-                let (version, token) = match parsed {
-                    Ok(ClientMsg::Hello { version, token }) => (version, token),
+                let (version, token, v, nonce, proof) = match parsed {
+                    Ok(ClientMsg::Hello { version, token, v, nonce, proof }) => (version, token, v, nonce, proof),
                     _ => {
                         crate::log("REFUSED: the first message is not hello");
-                        let _ = c.send_text(protocol::error("not-paired", "the first message must be hello with the pairing token"));
+                        let _ = c.send_text(protocol::error("not-paired", "the first message must be hello with the pairing proof"));
                         c.close(CLOSE_PROTOCOL, "hello first");
                         return;
                     }
                 };
+                let v2 = match v {
+                    None | Some(1) => false,
+                    Some(2) => true,
+                    Some(n) => {
+                        crate::log(&format!("REFUSED: the studio speaks pairing handshake {n}, the companion {AUTH_VERSION}"));
+                        let _ = c.send_text(protocol::error("bad-hello", "unknown pairing handshake: update the companion"));
+                        c.close(CLOSE_PROTOCOL, "bad hello");
+                        return;
+                    }
+                };
+                // (29 oct.) le jeton en clair (un studio d'avant) apres une v2 reussie avec ce jeton : refuse, sans meme
+                // le regarder — recharger la page donne le studio qui prouve
+                if !v2 && sh.pairing_v2.load(Ordering::SeqCst) {
+                    log_v1_refused(&origin);
+                    let _ = c.send_text(protocol::error("v1-refused", "this companion only takes the newer pairing handshake: reload the studio page"));
+                    c.close(CLOSE_V1_REFUSED, "reload the studio");
+                    return;
+                }
+                // v2 : un nonce et une preuve en 64 hex minuscules (sinon : un message faux, pas un code faux)
+                let studio = match (v2, nonce.as_deref().and_then(security::hex32), proof.as_deref().and_then(security::hex32)) {
+                    (false, _, _) => None,
+                    (true, Some(ns), Some(pf)) => Some((ns, pf)),
+                    (true, _, _) => {
+                        crate::log(&format!("REFUSED: a malformed pairing proof from {origin}"));
+                        let _ = c.send_text(protocol::error("bad-hello", "hello v2 needs a nonce and a proof (64 lowercase hex each)"));
+                        c.close(CLOSE_PROTOCOL, "bad hello");
+                        return;
+                    }
+                };
                 let now = Instant::now();
-                let ok = token.as_deref().map(|t| security::token_eq(t, &sh.token)).unwrap_or(false);
+                let key = security::hex32(&sh.token);
+                let ok = match (&studio, key) {
+                    (Some((ns, pf)), Some(k)) => security::studio_proof_ok(&k, sh.port, &nonce_c, ns, pf),
+                    (Some(_), None) => false,
+                    (None, _) => token.as_deref().map(|t| security::token_eq(t, &sh.token)).unwrap_or(false),
+                };
                 let mut guard = sh.guard.lock().unwrap();
                 if !ok {
                     // (audit de publication) trop d'essais faux : les suivants sont ralentis et refuses, mais le bon
@@ -895,7 +982,8 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                         let _ = c.send_text(protocol::error("locked", "too many wrong pairing codes: wait 30 s"));
                         c.close(CLOSE_LOCKED, "locked");
                     } else {
-                        crate::log(&format!("REFUSED: {} pairing token from {origin}", if token.is_some() { "wrong" } else { "missing" }));
+                        let what = if v2 { "wrong pairing proof" } else if token.is_some() { "wrong pairing token" } else { "missing pairing token" };
+                        crate::log(&format!("REFUSED: {what} from {origin}"));
                         let _ = c.send_text(protocol::error("bad-token", "wrong pairing code: copy it again from the companion window"));
                         c.close(CLOSE_BAD_TOKEN, "bad token");
                     }
@@ -907,23 +995,34 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     crate::log(&format!("note: the studio speaks protocol {:?}, the companion {PROTOCOL_VERSION}", version));
                 }
                 let (live_on, _) = c.windows();
-                let hello = json!({
+                let mut hello = json!({
                     "type": "hello", "version": PROTOCOL_VERSION, "companion": env!("CARGO_PKG_VERSION"),
                     "capture": if sh.demo { "demo" } else { sh.capture.as_deref().unwrap_or("wgc") },
                     "input": true, "modes": ["direct", "focus"], "tiles": true,
                     "live": live_on, "liveChannel": sh.demo || live::available(), "demo": sh.demo,
                     // (24 oct.) le retour audio sans cable : la capture d'un processus marche-t-elle sur ce Windows ?
-                    "audio": sh.demo || crate::audio::available().is_ok(), "audioFormats": ["f32", "i16"],
-                    "audioError": if sh.demo { None } else { crate::audio::available().err() },
+                    // (28 oct.) ou le son du plugin Uppwind Link Return, qui ne demande pas Windows (un Mac, par exemple)
+                    "audio": sh.demo || crate::audio::available().is_ok() || crate::plugin_link::available(), "audioFormats": ["f32", "i16"],
+                    "audioError": if sh.demo || crate::plugin_link::available() { None } else { crate::audio::available().err() },
                     // (25 oct.) les plugins Uppwind Link (Return, Notes) peuvent se connecter
                     "plugins": crate::plugin_link::available(),
                     // (25 oct.) le lien du studio par le canal local du script de Live (« link », « routes ») : sans loopMIDI
                     "linkTransport": true,
                 });
+                // (29 oct., v2) la preuve du compagnon : le studio la verifie avant de rien envoyer d'autre
+                if let (Some((ns, _)), Some(k)) = (&studio, key) {
+                    hello["v"] = json!(AUTH_VERSION);
+                    hello["proof"] = json!(security::hex(&security::companion_proof_for_studio(&k, sh.port, ns, &nonce_c)));
+                }
                 if c.send_text(hello.to_string()).is_err() {
                     return;
                 }
-                crate::log(&format!("PAIRED with {origin}"));
+                if v2 {
+                    note_v2(&sh);
+                    crate::log(&format!("PAIRED with {origin} (both proved the pairing code)"));
+                } else {
+                    crate::log(&format!("PAIRED with {origin} (an older studio: the pairing code came in clear; refused as soon as a studio proves it)"));
+                }
                 crate::tray::status::paired(&origin); // (24 oct.) la fenetre d'etat
                 break;
             }
@@ -996,7 +1095,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 break;
             }
         }
-        if c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
+        if c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
             break;
         }
         // 1 ms quand une fenetre est suivie ou que le son du DAW part (les gestes et les paquets de 5 ms partent au plus
@@ -1037,6 +1136,11 @@ mod tests {
 
     /// Le serveur du compagnon (la meme boucle que main.rs) : `failures` essais faux avant le blocage, `max` connexions.
     fn server_with(demo: bool, failures: u32, max: usize) -> u16 {
+        server_full(demo, failures, max, None, false)
+    }
+
+    /// (29 oct.) … avec un fichier d'etat d'essai (pairingV2 y est note) et ce qu'il disait au demarrage.
+    fn server_full(demo: bool, failures: u32, max: usize, state: Option<std::path::PathBuf>, pairing_v2: bool) -> u16 {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let sh = Arc::new(Shared {
@@ -1047,6 +1151,8 @@ mod tests {
             capture: None,
             demo,
             test_window: None,
+            pairing_v2: std::sync::atomic::AtomicBool::new(pairing_v2),
+            state,
         });
         std::thread::spawn(move || serve(l, sh, max));
         port
@@ -1071,8 +1177,44 @@ mod tests {
         tungstenite::client(req, s).map(|(ws, _)| ws).map_err(|e| e.to_string())
     }
 
+    /// La poignee de main HTTP, puis (29 oct.) le defi que le compagnon envoie tout de suite → (le client, son nonce).
+    fn opened(port: u16) -> (Client, [u8; 32]) {
+        let mut ws = connect(port, &format!("127.0.0.1:{port}"), Some("http://localhost:5747")).expect("handshake");
+        let ch = text(&mut ws);
+        assert_eq!((ch["type"].as_str(), ch["v"].as_u64()), (Some("challenge"), Some(2)), "{ch}");
+        let nc = security::hex32(ch["nonce"].as_str().unwrap_or("")).expect("a nonce of 64 lowercase hex");
+        (ws, nc)
+    }
+
     fn good(port: u16) -> Client {
-        connect(port, &format!("127.0.0.1:{port}"), Some("http://localhost:5747")).expect("handshake")
+        opened(port).0
+    }
+
+    fn key() -> [u8; 32] {
+        security::hex32(TOKEN).unwrap()
+    }
+
+    /// Le hello v2 d'un studio qui connait le jeton : un nonce neuf, sa preuve sur le defi.
+    fn hello_v2(port: u16, nc: &[u8; 32]) -> (String, [u8; 32]) {
+        let ns = security::new_nonce();
+        let proof = security::studio_proof(&key(), port, nc, &ns);
+        (json!({"type": "hello", "version": 1, "v": 2, "nonce": security::hex(&ns), "proof": security::hex(&proof)}).to_string(), ns)
+    }
+
+    /// Un studio d'aujourd'hui : le defi, sa preuve, puis la preuve du compagnon, verifiee → le client appaire, et le hello.
+    fn pair_v2(port: u16) -> (Client, serde_json::Value) {
+        let (mut ws, nc) = opened(port);
+        let (msg, ns) = hello_v2(port, &nc);
+        ws.send(Message::text(msg)).unwrap();
+        let h = text(&mut ws);
+        assert_eq!((h["type"].as_str(), h["v"].as_u64()), (Some("hello"), Some(2)), "{h}");
+        let proof = hex32_of(&h["proof"]);
+        assert_eq!(proof, security::companion_proof_for_studio(&key(), port, &ns, &nc), "the companion proves it knows the token");
+        (ws, h)
+    }
+
+    fn hex32_of(v: &serde_json::Value) -> [u8; 32] {
+        security::hex32(v.as_str().unwrap_or("")).expect("64 lowercase hex")
     }
 
     fn text(ws: &mut Client) -> serde_json::Value {
@@ -1202,9 +1344,7 @@ mod tests {
     #[test]
     fn paired_studio_lists_watches_and_gets_frames() {
         let port = server();
-        let mut ws = good(port);
-        ws.send(Message::text(json!({"type": "hello", "version": 1, "token": TOKEN}).to_string())).unwrap();
-        let h = text(&mut ws);
+        let (mut ws, h) = pair_v2(port);
         assert_eq!(h["type"], "hello");
         assert_eq!(h["input"], true);
         ws.send(Message::text(r#"{"type":"list"}"#.to_string())).unwrap();
@@ -1253,9 +1393,7 @@ mod tests {
     #[test]
     fn inputs_are_acknowledged_measured_and_mark_the_frames() {
         let port = server();
-        let mut ws = good(port);
-        ws.send(Message::text(json!({"type": "hello", "version": 1, "token": TOKEN}).to_string())).unwrap();
-        text(&mut ws);
+        let (mut ws, _) = pair_v2(port);
         // sans fenetre suivie : refuse
         ws.send(Message::text(r#"{"type":"input","kind":"pointer","action":"down","x":5,"y":5,"n":1}"#.to_string())).unwrap();
         let a = text_of(&mut ws, "inputack");
@@ -1403,9 +1541,7 @@ mod tests {
         assert_eq!(text(&mut ws)["code"], "not-paired");
         assert_eq!(close_code(&mut ws), Some(CLOSE_PROTOCOL));
 
-        let mut ws = good(port);
-        ws.send(Message::text(json!({"type": "hello", "version": 1, "token": TOKEN}).to_string())).unwrap();
-        let h = text_of(&mut ws, "hello");
+        let (mut ws, h) = pair_v2(port);
         assert_eq!((h["audio"].as_bool(), h["audioFormats"][0].as_str()), (Some(true), Some("f32")));
         ws.send(Message::text(json!({"type": "watch", "id": DEMO_ID, "fps": 30}).to_string())).unwrap();
         ws.send(Message::text(r#"{"type":"audio","action":"start","target":"live","rate":48000,"format":"f32","ms":5}"#.to_string())).unwrap();
@@ -1450,5 +1586,107 @@ mod tests {
             }
         }
         assert!(late <= 3, "{late} audio packets after stop");
+    }
+
+    /// (29 oct., v2, audit OUT-1) Le defi part des l'ouverture et rien d'autre ; une preuve fausse, faite pour un autre
+    /// port, rejouee d'une connexion d'avant (un autre defi), ou les preuves echangees : 4401, rien n'est appaire ; une
+    /// preuve absente ou mal ecrite : 4400. Le compagnon ne donne sa preuve qu'a un studio qui a prouve la sienne.
+    #[test]
+    fn v2_proofs_wrong_replayed_relayed_or_missing_are_refused() {
+        let port = server_with(true, 50, MAX_CONNECTIONS);
+        // le defi : une seule chose avant le hello, et jamais deux fois le meme nonce
+        let (mut a, nc1) = opened(port);
+        let (_b, nc2) = opened(port);
+        assert_ne!(nc1, nc2);
+        // une connexion juste, dont on garde le hello pour le rejouer
+        let (msg, _) = hello_v2(port, &nc1);
+        a.send(Message::text(msg.clone())).unwrap();
+        assert_eq!(text(&mut a)["v"], 2);
+        let bad = |port: u16, make: &dyn Fn(&[u8; 32]) -> String| -> (serde_json::Value, Option<u16>) {
+            let (mut ws, nc) = opened(port);
+            ws.send(Message::text(make(&nc))).unwrap();
+            let e = text(&mut ws);
+            (e, close_code(&mut ws))
+        };
+        let ns = [0x33u8; 32];
+        let v2 = |nonce: &[u8; 32], proof: &[u8]| json!({"type": "hello", "version": 1, "v": 2, "nonce": security::hex(nonce), "proof": security::hex(proof)}).to_string();
+        let cases: Vec<(&str, Box<dyn Fn(&[u8; 32]) -> String>)> = vec![
+            ("a replayed hello (an older challenge)", Box::new(move |_| msg.clone())),
+            ("a random proof", Box::new(move |_| v2(&ns, &[9u8; 32]))),
+            ("the right proof for another port (a relay)", Box::new(move |nc| v2(&ns, &security::studio_proof(&key(), port.wrapping_add(1), nc, &ns)))),
+            ("the companion's proof instead of the studio's", Box::new(move |nc| v2(&ns, &security::companion_proof_for_studio(&key(), port, &ns, nc)))),
+            ("another token", Box::new(move |nc| v2(&ns, &security::studio_proof(&[1u8; 32], port, nc, &ns)))),
+        ];
+        for (what, make) in &cases {
+            let (e, code) = bad(port, make.as_ref());
+            assert_eq!((e["code"].as_str(), code), (Some("bad-token"), Some(CLOSE_BAD_TOKEN)), "{what}: {e}");
+            assert!(e.get("proof").is_none(), "{what}: the companion gives nothing");
+        }
+        let hex_ns = security::hex(&ns);
+        let hex_ab = security::hex(&[0xab; 32]);
+        let malformed = [
+            json!({"type": "hello", "version": 1, "v": 2, "nonce": hex_ns}).to_string(),
+            json!({"type": "hello", "version": 1, "v": 2, "proof": hex_ns}).to_string(),
+            json!({"type": "hello", "version": 1, "v": 2, "nonce": hex_ab.to_uppercase(), "proof": hex_ns}).to_string(),
+            json!({"type": "hello", "version": 1, "v": 2, "nonce": hex_ns, "proof": hex_ab.to_uppercase()}).to_string(),
+            json!({"type": "hello", "version": 1, "v": 2, "nonce": &hex_ns[2..], "proof": hex_ns}).to_string(),
+            json!({"type": "hello", "version": 1, "v": 3, "nonce": hex_ns, "proof": hex_ns}).to_string(),
+        ];
+        for m in malformed {
+            let (e, code) = bad(port, &|_| m.clone());
+            assert_eq!((e["code"].as_str(), code), (Some("bad-hello"), Some(CLOSE_PROTOCOL)), "{m}: {e}");
+        }
+        // les preuves fausses comptent : apres `failures`, ralenties, mais la bonne passe toujours
+        let port = server_with(true, 2, MAX_CONNECTIONS);
+        for _ in 0..2 {
+            let (e, _) = bad(port, &|_| v2(&ns, &[9u8; 32]));
+            assert_eq!(e["code"], "bad-token");
+        }
+        let t0 = Instant::now();
+        let (e, code) = bad(port, &|_| v2(&ns, &[9u8; 32]));
+        assert_eq!((e["code"].as_str(), code), (Some("locked"), Some(CLOSE_LOCKED)));
+        assert!(t0.elapsed() >= LOCKED_DELAY - Duration::from_millis(50));
+        pair_v2(port);
+    }
+
+    /// (29 oct.) Un studio d'avant (v1, le jeton en clair) est accepte jusqu'a la premiere v2 reussie avec ce jeton,
+    /// puis refuse (4426) sans que le jeton soit regarde ; c'est note dans le fichier d'etat et garde au lancement suivant.
+    #[test]
+    fn v1_is_accepted_until_a_studio_proves_the_code_then_refused() {
+        let dir = std::env::temp_dir().join(format!("uwc-pairing-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state.json");
+        crate::state_file::write(&state, &json!({"port": 1, "token": TOKEN, "pid": 1})).unwrap();
+        let port = server_full(true, 50, MAX_CONNECTIONS, Some(state.clone()), false);
+        let v1 = json!({"type": "hello", "version": 1, "token": TOKEN}).to_string();
+        // avant : la v1 marche (un studio d'avant, un compagnon mis a jour : rien ne casse)
+        let mut ws = good(port);
+        ws.send(Message::text(v1.clone())).unwrap();
+        let h = text(&mut ws);
+        assert_eq!(h["type"], "hello");
+        assert!(h.get("proof").is_none(), "v1: nothing to prove to");
+        assert!(!crate::state_file::pairing_v2(&crate::state_file::read(&state).unwrap(), TOKEN));
+        drop(ws);
+        // un studio d'aujourd'hui : la v2, notee dans le fichier
+        pair_v2(port);
+        let t0 = Instant::now();
+        while !crate::state_file::pairing_v2(&crate::state_file::read(&state).unwrap(), TOKEN) {
+            assert!(t0.elapsed() < Duration::from_secs(3), "pairingV2 noted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // ensuite : la v1 est refusee, meme avec le bon jeton ; un faux jeton aussi (sans etre compare)
+        for t in [TOKEN.to_string(), "f".repeat(64)] {
+            let mut ws = good(port);
+            ws.send(Message::text(json!({"type": "hello", "version": 1, "token": t}).to_string())).unwrap();
+            assert_eq!(text(&mut ws)["code"], "v1-refused");
+            assert_eq!(close_code(&mut ws), Some(CLOSE_V1_REFUSED));
+        }
+        pair_v2(port);
+        // le lancement suivant (main.rs lit pairingV2 pour ce jeton) : la v1 reste refusee
+        let port = server_full(true, 50, MAX_CONNECTIONS, Some(state.clone()), crate::state_file::pairing_v2(&crate::state_file::read(&state).unwrap(), TOKEN));
+        let mut ws = good(port);
+        ws.send(Message::text(v1)).unwrap();
+        assert_eq!(text(&mut ws)["code"], "v1-refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+[package]
+name = "uppwind-link"
+description = "Uppwind Link Return (the DAW's sound to the studio, ASIO-safe) and Uppwind Link Notes (the studio's notes as the plugin's MIDI output): replaces VB-CABLE and loopMIDI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "uppwind_link"
+# cdylib : le .vst3 / .clap ; rlib : les tests et l'hote d'essai
+crate-type = ["cdylib", "rlib"]
+
+# nice-plug (ISC) : la suite de NIH-plug, maintenue par la communaute (RustAudio), sur crates.io ; ses liaisons VST3
+# sont la crate `vst3` (MIT/Apache-2.0). Sans editeur ni journal (default-features = false) : aucune fenetre.
+[dependencies]
+nice-plug = { version = "0.4.2", default-features = false, features = ["vst3"] }
+uwl-proto = { path = "../proto" }
+serde_json = "1"
+# (29 oct., protocole v2) le nonce de chaque connexion, du generateur du systeme (ProcessPrng sous Windows, deja la par
+# std ; getentropy sous macOS) : MIT OR Apache-2.0, la meme version que tungstenite (testhost)
+getrandom = "0.4"

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Uppwind
-//! (25 oct., phase 0) Une connexion d'un plugin « Uppwind Link » : la poignee de main (HELLO, le secret, la version,
+//! (25 oct., phase 0) Une connexion d'un plugin « Uppwind Link » : la poignee de main (HELLO, la version, les preuves,
 //! l'identite), puis les trames jusqu'a la fin. Un fil par connexion ; rien ici ne touche au studio directement : le son
 //! passe aux abonnes (Instance::push_audio), les notes partent de Hub::send_midi par une copie du socket.
+//! (29 oct., protocole v2, audit PL-1) HELLO porte un nonce, jamais le secret ; le compagnon repond CHALLENGE (son
+//! nonce et sa preuve), le plugin AUTH (la sienne), verifiee en temps constant AVANT toute trame : sans elle, rien n'est
+//! enregistre ni montre au studio. Un plugin v1 (le secret en clair) est refuse, et le studio le dit (Hub::note_old).
 
 use super::{Hub, Instance};
 use serde_json::Value;
@@ -15,14 +18,55 @@ use std::time::{Duration, Instant};
 use uwl_proto as p;
 
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
-/// Un secret faux pendant le blocage attend ceci avant d'etre refuse (le bon secret, lui, n'attend jamais).
+/// (v2) AUTH, apres le CHALLENGE, dans ce delai.
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Un secret (ou une preuve) faux pendant le blocage attend ceci avant d'etre refuse (le bon, lui, n'attend jamais).
 pub const LOCKED_DELAY: Duration = Duration::from_secs(1);
 const LOG_EVERY: Duration = Duration::from_secs(10);
+/// (29 oct.) Ce qu'un plugin v1 lit (son statut) et ce que le studio montre.
+pub const OLD_PLUGIN: &str = "an older Uppwind Link plugin: reinstall the plugins and restart your DAW";
 
 fn welcome(s: &mut TcpStream, status: u8, message: &str) {
     let mut out = Vec::new();
     p::encode_welcome(&p::Welcome { version: p::VERSION, status, message: message.into() }, &mut out);
     let _ = s.write_all(&out);
+}
+
+/// La trame suivante dans `limit` depuis `t0`. Err(Some(raison)) : a dire dans le journal (le delai, une trame
+/// absurde) ; Err(None) : le pair est parti (ferme, une erreur du socket), rien a dire.
+fn next_frame(s: &mut TcpStream, rd: &mut p::FrameReader, buf: &mut [u8], t0: Instant, limit: Duration, what: &str) -> Result<(u8, Vec<u8>), Option<String>> {
+    loop {
+        match rd.next() {
+            Ok(Some(f)) => return Ok(f),
+            Ok(None) => {}
+            // (un navigateur qui ecrirait « POST / HTTP/1.1 » tombe ici : une longueur absurde)
+            Err(e) => return Err(Some(e.to_string())),
+        }
+        if t0.elapsed() > limit {
+            return Err(Some(format!("no {what} within {} s", limit.as_secs())));
+        }
+        match s.read(buf) {
+            Ok(0) => return Err(None),
+            Ok(n) => rd.extend(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(_) => return Err(None),
+        }
+    }
+}
+
+/// Un secret (v1) ou une preuve (v2) faux : compte ; trop en 30 s, les suivants sont ralentis et refuses — mais le bon
+/// passe toujours, sinon n'importe quel programme local fermerait la porte aux vrais plugins du DAW.
+fn refuse_wrong(s: &mut TcpStream, hub: &Hub, what: &str, who: &p::Hello) {
+    let locked = hub.locked();
+    hub.failure();
+    if locked {
+        std::thread::sleep(LOCKED_DELAY);
+        welcome(s, p::status::REFUSED, &format!("too many wrong {what}s: wait 30 s"));
+        crate::log(&format!("plugin link REFUSED: wrong {what} while the door is slowed down (too many wrong ones)"));
+    } else {
+        welcome(s, p::status::BAD_SECRET, &format!("wrong {what}: the companion state file changed (restart the DAW's plugin)"));
+        crate::log(&format!("plugin link REFUSED: wrong {what} from {} {} (pid {})", who.kind.name(), who.host, who.pid));
+    }
 }
 
 pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr) {
@@ -33,52 +77,43 @@ pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr) {
     let mut buf = vec![0u8; 64 * 1024];
 
     // 1. HELLO, la premiere trame, dans les 2 s
-    let t0 = Instant::now();
-    let hello = loop {
-        match rd.next() {
-            Ok(Some((p::ty::HELLO, body))) => match p::decode_hello(&body) {
-                Ok(h) => break h,
-                Err(e) => {
-                    crate::log(&format!("plugin link REFUSED {peer}: {e}"));
-                    return;
-                }
-            },
-            Ok(Some((t, _))) => {
-                crate::log(&format!("plugin link REFUSED {peer}: the first frame (0x{t:02x}) is not hello"));
-                return;
-            }
-            Ok(None) => {}
+    let hello = match next_frame(&mut s, &mut rd, &mut buf, Instant::now(), HELLO_TIMEOUT, "hello") {
+        Ok((p::ty::HELLO, body)) => match p::decode_hello(&body) {
+            Ok(h) => h,
             Err(e) => {
-                // (un navigateur qui ecrirait « POST / HTTP/1.1 » tombe ici : une longueur absurde)
                 crate::log(&format!("plugin link REFUSED {peer}: {e}"));
                 return;
             }
-        }
-        if t0.elapsed() > HELLO_TIMEOUT {
-            crate::log(&format!("plugin link: no hello within 2 s from {peer}: closed"));
+        },
+        Ok((t, _)) => {
+            crate::log(&format!("plugin link REFUSED {peer}: the first frame (0x{t:02x}) is not hello"));
             return;
         }
-        match s.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => rd.extend(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-            Err(_) => return,
+        Err(Some(e)) => {
+            crate::log(&format!("plugin link REFUSED {peer}: {e}: closed"));
+            return;
         }
+        Err(None) => return,
     };
 
-    // 2. les controles. (audit de publication, comme l'appairage du studio) trop de secrets faux : les suivants sont
-    // ralentis et refuses, mais le bon secret passe toujours — sinon n'importe quel programme local fermerait la porte
-    // aux vrais plugins du DAW
-    if !hub.secret_ok(&hello.secret) {
-        let locked = hub.locked();
-        hub.failure();
-        if locked {
-            std::thread::sleep(LOCKED_DELAY);
-            welcome(&mut s, p::status::REFUSED, "too many wrong secrets: wait 30 s");
-            crate::log("plugin link REFUSED: wrong secret while the door is slowed down (too many wrong secrets)");
-        } else {
-            welcome(&mut s, p::status::BAD_SECRET, "wrong secret: the companion state file changed (restart the DAW's plugin)");
-            crate::log(&format!("plugin link REFUSED: wrong secret from {} {} (pid {})", hello.kind.name(), hello.host, hello.pid));
+    // 2. la version. (29 oct.) Un plugin v1 a mis le secret en clair dans son HELLO : refuse, avec quoi faire. Son secret
+    // est compare d'abord (temps constant), comme avant : seul un vrai plugin d'avant fait apparaitre l'avis au studio
+    if let Some(old_secret) = hello.v1_secret() {
+        if !hub.secret_ok(old_secret) {
+            refuse_wrong(&mut s, &hub, "secret", &hello);
+            return;
+        }
+        // (l'avis d'abord : quand le plugin lit le refus, le studio peut deja le savoir)
+        let new = hub.note_old(&hello);
+        welcome(&mut s, p::status::BAD_VERSION, OLD_PLUGIN);
+        if new {
+            crate::log(&format!(
+                "plugin link REFUSED an older Uppwind Link plugin (protocol 1): {} \"{}\" in {} (pid {}): reinstall the plugins and restart the DAW",
+                hello.kind.name(),
+                hello.name,
+                if hello.host.is_empty() { "?" } else { &hello.host },
+                hello.pid
+            ));
         }
         return;
     }
@@ -90,6 +125,29 @@ pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr) {
     if !(8000..=384_000).contains(&hello.rate) || hello.max_block > 65536 || hello.channels == 0 || hello.channels > p::MAX_CHANNELS {
         welcome(&mut s, p::status::REFUSED, "bad format");
         crate::log(&format!("plugin link REFUSED: bad format from {} ({} Hz, block {}, {} ch)", hello.name, hello.rate, hello.max_block, hello.channels));
+        return;
+    }
+
+    // 3. (v2) le defi : la preuve du compagnon (le plugin la verifie avant tout), puis celle du plugin, avant toute trame
+    let nonce = crate::security::new_nonce();
+    let mut out = Vec::new();
+    p::encode_challenge(&p::Challenge { nonce, proof: hub.companion_proof(&hello.nonce, &nonce) }, &mut out);
+    if s.write_all(&out).is_err() {
+        return;
+    }
+    let proof = match next_frame(&mut s, &mut rd, &mut buf, Instant::now(), AUTH_TIMEOUT, "auth") {
+        Ok((p::ty::AUTH, body)) => body,
+        Ok((t, _)) => {
+            crate::log(&format!("plugin link REFUSED {} {}: frame 0x{t:02x} instead of auth", hello.kind.name(), hello.host));
+            return;
+        }
+        Err(e) => {
+            crate::log(&format!("plugin link: {} {} gave no proof ({}): closed", hello.kind.name(), hello.host, e.as_deref().unwrap_or("it left")));
+            return;
+        }
+    };
+    if !hub.plugin_proof_ok(&nonce, &hello.nonce, &proof) {
+        refuse_wrong(&mut s, &hub, "proof", &hello);
         return;
     }
     let serial = hub.next_serial();

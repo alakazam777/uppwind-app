@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Uppwind
-# Uppwind Link -- a release, on a tag v*: builds uppwind-companion.exe exactly as RELEASING.md step 4 says, checks it
-# (step 5), attests its provenance and publishes ONLY the exe and SHA256SUMS (never the .pdb or target/).
+# Uppwind Link -- a release, on a tag v*: builds the Uppwind Link plugins, then uppwind-companion.exe with the plugins
+# inside, exactly as RELEASING.md step 4 says, checks both (step 5), attests the provenance and publishes ONLY the exe
+# and SHA256SUMS (never a .pdb or target/). The plugins are not a separate download: the companion installs them.
 # macOS (uppwind-companion-macos.dmg: signed with the Developer ID, notarized, stapled, macos-build.yml) joins the
 # release only when the repository variable MACOS_RELEASE is 1 (off by default: the Mac build has to pass a test in a
 # real DAW first; macos-preview.yml makes the same .dmg as a workflow artifact, without a release).
@@ -23,7 +24,7 @@ jobs:
   windows:
     name: Windows build
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     outputs:
@@ -48,6 +49,8 @@ jobs:
           "version $version"
       - name: Tests
         run: |
+          cargo test --release --locked --manifest-path plugin/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           cargo test --release --locked --manifest-path companion/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I tests/test_protocol.py
@@ -56,24 +59,47 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I tests/test_ableton.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          # the notices list the macOS crates too: fetch the crates of every target first
+          # the notices list the macOS crates too: fetch the crates of every target first (the companion's, the plugins')
           cargo fetch --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo fetch --locked --manifest-path plugin/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I dev/third_party_notices.py --check
           if ($LASTEXITCODE -ne 0) { exit 1 }
       # RELEASING.md step 4: from the repository folder (.cargo/config.toml applies), the path remapping added with
-      # --config (never RUSTFLAGS), a fresh target folder, --locked
+      # --config (never RUSTFLAGS), fresh target folders, --locked: the plugins first, bundled, then the companion,
+      # which embeds that bundle (UWL_PLUGIN_BUNDLE; companion/build.rs refuses any other layout)
       - name: Build (RELEASING.md step 4)
         run: |
           if ($env:CARGO_HOME) { $cargoHome = $env:CARGO_HOME } else { $cargoHome = Join-Path $env:USERPROFILE '.cargo' }
           $src = $env:GITHUB_WORKSPACE
-          if (Test-Path companion/target) { Remove-Item -Recurse -Force companion/target }
+          foreach ($t in @('plugin/target', 'companion/target')) { if (Test-Path $t) { Remove-Item -Recurse -Force $t } }
           "CARGO_HOME=$cargoHome"
           "checkout folder=$src"
-          cargo --config "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$cargoHome=/cargo', '--remap-path-prefix=$src=/src']" build --release --locked --manifest-path companion/Cargo.toml
+          $remap = "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$cargoHome=/cargo', '--remap-path-prefix=$src=/src']"
+          cargo --config $remap build --release --locked --manifest-path plugin/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: Check the program (RELEASING.md step 5)
-        run: python -I dev/release_check.py companion/target/release/uppwind-companion.exe
+          & ./plugin/target/release/uwl-bundle.exe --out plugin/target/release/bundled
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $env:UWL_PLUGIN_BUNDLE = Join-Path $src 'plugin\target\release\bundled\Uppwind Link.vst3'
+          "UWL_PLUGIN_BUNDLE=$env:UWL_PLUGIN_BUNDLE"
+          cargo --config $remap build --release --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      # the plugins' DLL (the .vst3 of the bundle) and the program: no path of the runner, System32 DLLs only, the C
+      # runtime inside, reproducible; then the program installs exactly that DLL (into a folder of the runner, never
+      # Program Files, no administrator prompt)
+      - name: Check the plugins and the program (RELEASING.md step 5)
+        run: |
+          $dll = 'plugin/target/release/bundled/Uppwind Link.vst3/Contents/x86_64-win/Uppwind Link.vst3'
+          python -I dev/release_check.py $dll companion/target/release/uppwind-companion.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $vst3 = Join-Path $env:RUNNER_TEMP 'vst3-check'
+          & ./companion/target/release/uppwind-companion.exe --install-plugins --plugins-dir $vst3
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $want = (Get-FileHash -Algorithm SHA256 $dll).Hash.ToLowerInvariant()
+          $got = (Get-FileHash -Algorithm SHA256 (Join-Path $vst3 'Uppwind Link.vst3\Contents\x86_64-win\Uppwind Link.vst3')).Hash.ToLowerInvariant()
+          if ($want -ne $got) { throw "the companion installs $got, the checked plugins are $want" }
+          "plugins inside the companion: SHA-256 $want"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: uppwind-companion-windows
@@ -152,7 +178,9 @@ jobs:
           $notes = @(
             "Uppwind Link companion $env:GITHUB_REF_NAME for Windows 10 (version 2004 or later) and Windows 11, 64-bit."
             ""
-            "**What it is.** ``uppwind-companion.exe`` is the local program that lets Uppwind Studio (https://uppwind.lucasmoreau.fr/atelier) show and play the windows of the plugins hosted in Ableton Live, and bring the sound of Ableton Live or FL Studio back to the studio without a virtual cable. It listens on 127.0.0.1 only and never connects to the internet. Double-click it: a setup window installs it for your Windows account (no administrator rights) and the DAW scripts you tick. See the README for the security model and the pairing."
+            "**What it is.** ``uppwind-companion.exe`` is the local program that lets Uppwind Studio (https://uppwind.lucasmoreau.fr/atelier) show and play the windows of the plugins hosted in Ableton Live, and bring the sound of Ableton Live or FL Studio back to the studio without a virtual cable. It listens on 127.0.0.1 only and never connects to the internet. Double-click it: a setup window installs it for your Windows account and the DAW scripts you tick. See the README for the security model and the pairing."
+            ""
+            "**The Uppwind Link plugins are inside** (VST3: *Uppwind Link Return* sends the DAW's sound to the studio with any audio driver, ASIO included; *Uppwind Link Notes* plays the studio's notes in the DAW, sample-accurate). The setup window installs them in ``C:\Program Files\Common Files\VST3``, the folder FL Studio and Ableton Live read: **Windows asks once for administrator rights**, for that copy only (everything else stays in your user folder). Untick them to skip it; ``uppwind-companion.exe --install-plugins`` installs them later, and uninstalling Uppwind Link removes them."
             ""
             "**Unsigned:** Windows SmartScreen will show *More info* → *Run anyway*. Verify the file first:"
             ""
@@ -160,22 +188,26 @@ jobs:
             "  - PowerShell: ``Get-FileHash uppwind-companion.exe``"
             "- Built by GitHub Actions from this tag, with an artifact attestation: ``gh attestation verify uppwind-companion.exe --repo $repo``"
             ""
-            "**Rebuild it byte for byte** (RELEASING.md, steps 4 and 5): $rustc, Visual Studio build tools of the ``windows-2025`` runner, build folder ``$env:GITHUB_WORKSPACE``, ``cargo build --release --locked`` with the ``--remap-path-prefix`` flags of RELEASING.md."
+            "**Rebuild it byte for byte** (RELEASING.md, steps 4 and 5): $rustc, Visual Studio build tools of the ``windows-2025`` runner, build folder ``$env:GITHUB_WORKSPACE``, ``cargo build --release --locked`` with the ``--remap-path-prefix`` flags of RELEASING.md: first ``plugin/Cargo.toml`` and ``uwl-bundle``, then ``companion/Cargo.toml`` with ``UWL_PLUGIN_BUNDLE`` naming that bundle."
             ""
           )
           if ($env:WITH_MACOS -eq 'true') {
             $mhash = ($sums | Where-Object { $_ -like '*uppwind-companion-macos.dmg' }).Split(' ')[0]
             $notes += @(
-              "**macOS** (11 or later, Apple silicon and Intel): ``uppwind-companion-macos.dmg`` holds ``uppwind-companion``, signed with a Developer ID, notarized by Apple and stapled. Open the .dmg, copy ``uppwind-companion`` where you like and start it from Terminal."
+              "**macOS** (11 or later, Apple silicon and Intel): ``uppwind-companion-macos.dmg`` holds ``uppwind-companion`` and ``Uppwind Link.vst3``, both signed with a Developer ID; the .dmg is notarized by Apple and stapled. There is no setup window on a Mac yet: everything starts from Terminal."
+              ""
+              "1. Open the .dmg, copy ``uppwind-companion`` where you like, and in Terminal run ``./uppwind-companion --install``: it copies itself to ``~/Library/Application Support/Uppwind Link/`` (no administrator rights; ``--autostart on`` starts it at every login)."
+              "2. ``~/Library/Application\ Support/Uppwind\ Link/uppwind-companion --setup --apply`` installs the DAW scripts and the Uppwind Link plugins in ``~/Library/Audio/Plug-Ins/VST3`` (``--install-plugins``: the plugins alone; or drag ``Uppwind Link.vst3`` from the .dmg into that folder). On a Mac, **Uppwind Link Return** on the DAW's master is how its sound reaches the studio."
+              "3. Start it from Terminal: ``~/Library/Application\ Support/Uppwind\ Link/uppwind-companion``; it prints the pairing code."
               ""
               "- SHA-256 (also in ``SHA256SUMS``): ``$mhash`` (``shasum -a 256 uppwind-companion-macos.dmg``)"
               "- ``gh attestation verify uppwind-companion-macos.dmg --repo $repo``"
               ""
-              "Assets: ``uppwind-companion.exe``, ``uppwind-companion-macos.dmg`` and ``SHA256SUMS`` only. The DAW scripts are in the repository (and inside the programs)."
+              "Assets: ``uppwind-companion.exe``, ``uppwind-companion-macos.dmg`` and ``SHA256SUMS`` only. The DAW scripts and the Uppwind Link plugins are inside the programs (and their sources in the repository)."
             )
           } else {
             $notes += @(
-              "Assets: ``uppwind-companion.exe`` and ``SHA256SUMS`` only. The DAW scripts are in the repository (and inside the exe)."
+              "Assets: ``uppwind-companion.exe`` and ``SHA256SUMS`` only. The DAW scripts and the Uppwind Link plugins are inside the exe (and their sources in the repository)."
               ""
               "**macOS coming:** the companion builds, is signed and notarized on macOS, but it has not been tried in a real DAW yet, so there is no Mac download in this release."
             )

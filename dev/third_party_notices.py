@@ -6,13 +6,14 @@
     python -I dev/third_party_notices.py [--check]
 
 Two files: THIRD-PARTY-NOTICES.txt (the companion, uppwind-companion.exe) and, when plugin/plugins/ is there,
-plugin/THIRD-PARTY-NOTICES.txt (the Uppwind Link plugins, the .vst3 bundle). Asks cargo which crates end up in each Windows binary (`cargo tree --target
-x86_64-pc-windows-msvc -e normal`, proc macros and their build-only dependencies left out, our own path crates
-left out), and for the companion also in the macOS one (aarch64-apple-darwin and x86_64-apple-darwin: the crates
-only the Mac program links get a list of their own), then reads each crate's licence files from the local cargo
-registry (CARGO_HOME, %USERPROFILE%\\.cargo by default). Run it after any dependency change; --check only says
-whether the files are up to date (for CI). Nothing is downloaded: `cargo fetch --locked --manifest-path
-companion/Cargo.toml` once first (it fetches the crates of every target, the macOS ones included).
+plugin/THIRD-PARTY-NOTICES.txt (the Uppwind Link plugins, the .vst3 bundle, which the companion also embeds and
+installs). Asks cargo which crates end up in each Windows binary (`cargo tree --target x86_64-pc-windows-msvc
+-e normal`, proc macros and their build-only dependencies left out, our own path crates left out), and also in the
+macOS ones (aarch64-apple-darwin and x86_64-apple-darwin: the crates only the Mac build links get a list of their
+own), then reads each crate's licence files from the local cargo registry (CARGO_HOME, %USERPROFILE%\\.cargo by
+default). Run it after any dependency change; --check only says whether the files are up to date (for CI). Nothing
+is downloaded: `cargo fetch --locked --manifest-path companion/Cargo.toml` and `cargo fetch --locked
+--manifest-path plugin/Cargo.toml` once first (they fetch the crates of every target, the macOS ones included).
 """
 import os
 import re
@@ -227,15 +228,33 @@ PLUGIN_HEAD = [
     "Uppwind Link plugins -- third-party notices", "=" * 43, "",
     "The Uppwind Link plugins (Uppwind Link Return and Uppwind Link Notes, the \"Uppwind Link.vst3\" bundle) are free",
     "software under the GNU General Public License, version 3 or (at your option) any later version: see ../LICENSE.",
-    "They are built with the Rust crates listed below, downloaded from crates.io when you build them (none of their",
-    "source is in this repository).", "",
+    "The Uppwind Link companion carries the bundle inside its program and installs it (uppwind-companion",
+    "--license prints these notices too). They are built with the Rust crates listed below, downloaded from crates.io",
+    "when you build them (none of their source is in this repository): a first list for Windows, then the crates that",
+    "only the macOS bundle links.", "",
     "Crates offered under several licences (\"MIT OR Apache-2.0\", \"BlueOak-1.0.0 OR MIT OR Apache-2.0\",",
     "\"Apache-2.0 OR MIT OR Unlicense\"…) are used under the MIT option; nice-plug, nice-plug-core and nice-log under",
     "the ISC licence; all compatible with the GPL version 3. The VST3 interfaces come from the vst3 crate (bindings",
     "generated from Steinberg's VST 3 SDK headers, MIT OR Apache-2.0). VST is a registered trademark of Steinberg",
     "Media Technologies GmbH.", "",
     "The test host and the bundler (testhost/: uwl-host, uwl-bundle) are development tools: they are not part of the",
-    "bundle.", ""]
+    "bundle.", "",
+    "The VST 3 interfaces that the vst3 crate's bindings are generated from (the pluginterfaces headers of Steinberg's",
+    "VST 3 SDK) are under the MIT licence, as published with the SDK (pluginterfaces/LICENSE.txt, VST 3 SDK 3.8):", "",
+    "    MIT License", "",
+    "    Copyright (c) 2026, Steinberg Media Technologies GmbH", "",
+    "    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated",
+    "    documentation files (the \"Software\"), to deal in the Software without restriction, including without",
+    "    limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the",
+    "    Software, and to permit persons to whom the Software is furnished to do so, subject to the following",
+    "    conditions:", "",
+    "    The above copyright notice and this permission notice shall be included in all copies or substantial portions",
+    "    of the Software.", "",
+    "    THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED",
+    "    TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL",
+    "    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF",
+    "    CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER",
+    "    DEALINGS IN THE SOFTWARE.", ""]
 
 
 def render(head, title, manifest, package=None, mac_title=None):
@@ -298,10 +317,11 @@ def main():
                      os.path.join(LINK, "companion", "Cargo.toml"),
                      mac_title="Crates linked only into the macOS uppwind-companion (%s)" % ", ".join(MAC_TARGETS))),
     ]
-    # the plugins are not in every copy of this folder (not published yet: only plugin/proto is, for the companion)
+    # the plugins (plugin/plugins): in a copy of this folder without them, the companion's notices only
     if os.path.isfile(os.path.join(LINK, "plugin", "plugins", "Cargo.toml")):
         files.append((PLUGIN_OUT, render(PLUGIN_HEAD, "Crates linked into the plugins' DLL (Windows, %s)" % TARGET,
-                                         os.path.join(LINK, "plugin", "Cargo.toml"), "uppwind-link")))
+                                         os.path.join(LINK, "plugin", "Cargo.toml"), "uppwind-link",
+                                         mac_title="Crates linked only into the macOS plugins (%s)" % ", ".join(MAC_TARGETS))))
     stale = 0
     for path, text in files:
         old = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""

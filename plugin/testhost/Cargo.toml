@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Uppwind
+[package]
+name = "uwl-testhost"
+description = "Uppwind Link: a tiny VST3 test host (loads the .vst3 bundle, plays real-time blocks, measures) and the bundler."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "uwl-host"
+path = "src/main.rs"
+
+[[bin]]
+name = "uwl-bundle"
+path = "src/bundle.rs"
+
+[dependencies]
+vst3 = "0.3"
+uwl-proto = { path = "../proto" }
+serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# (29 oct.) le nonce du studio d'essai (l'appairage v2)
+getrandom = "0.4"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading"]

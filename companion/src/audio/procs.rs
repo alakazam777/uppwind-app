@@ -13,6 +13,14 @@ pub fn daw_of_exe(exe: &str) -> Option<&'static str> {
     if name == "fl64.exe" || name == "fl.exe" {
         return Some("fl");
     }
+    // (28 oct.) macOS : « …/FL Studio 2026.app/Contents/MacOS/OsxFL », « …/Ableton Live 12 Suite.app/Contents/MacOS/Live »
+    // (les plugins ne donnent que ce dernier nom, link::host_exe)
+    if name == "osxfl" {
+        return Some("fl");
+    }
+    if name == "live" {
+        return Some("live");
+    }
     None
 }
 
@@ -133,6 +141,11 @@ mod tests {
         assert_eq!(daw_of_exe("Ableton Index.exe"), None);
         assert_eq!(daw_of_exe("chrome.exe"), None);
         assert_eq!(daw_of_exe("ilbridge.exe"), None);
+        assert_eq!(daw_of_exe("/Applications/FL Studio 2026.app/Contents/MacOS/OsxFL"), Some("fl"));
+        assert_eq!(daw_of_exe("OsxFL"), Some("fl"));
+        assert_eq!(daw_of_exe("/Applications/Ableton Live 12 Suite.app/Contents/MacOS/Live"), Some("live"));
+        assert_eq!(daw_of_exe("Live"), Some("live"));
+        assert_eq!(daw_of_exe("Live Helper"), None);
     }
 
     #[test]

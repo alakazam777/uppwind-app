@@ -7,12 +7,13 @@
 use super::ipc::Page;
 use crate::tray::status::{Audio, DawLine, Live, ScriptLine, StatusModel};
 use crate::wizard::flow::{Removal, UninstallPlan};
-use crate::wizard::steps::{Choices, DawItem, FlItem, Model, Outcome, Ports, Step, Todo, Wizard};
+use crate::wizard::steps::{Choices, DawItem, FlItem, Model, Outcome, PluginItem, Ports, Step, Todo, Wizard};
 use serde_json::{json, Value};
 use std::path::Path;
 
 const UL: &str = r"%USERPROFILE%\Documents\Ableton\User Library";
 const FLHW: &str = r"%USERPROFILE%\Documents\Image-Line\FL Studio\Settings\Hardware";
+const VST3: &str = r"C:\Program Files\Common Files\VST3\Uppwind Link.vst3";
 const CODE: &str = "UWC-47410-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // a made-up code
 
 fn daws(fl_running: bool, live_running: bool) -> Vec<DawItem> {
@@ -65,6 +66,17 @@ fn model(ports_ok: bool, fl_running: bool, live_running: bool) -> Model {
             loopmidi_installed: ports_ok,
             loopmidi_running: ports_ok,
         },
+        plugins: PluginItem {
+            available: true,
+            not_in_build: false,
+            status: "missing".into(),
+            action: "install".into(),
+            reason: "install them".into(),
+            folder: VST3.into(),
+            admin: true,
+            selectable: true,
+            held: false,
+        },
     }
 }
 
@@ -93,6 +105,9 @@ fn outcome() -> Outcome {
         ],
         fl: "written".into(),
         fl_lines: vec!["FL Studio’s MIDI settings were written (4 values); a copy of the whole Devices key is in backups\\fl-registry-20261024-151200.reg. Uninstalling Uppwind Link puts them back.".into()],
+        plugins: "installed".into(),
+        plugin_lines: vec![format!("Uppwind Link plugins (Uppwind Link Return, Uppwind Link Notes) installed in {VST3} (with administrator rights).")],
+        plugins_restart: false,
         backups: Some(r"%USERPROFILE%\AppData\Local\Uppwind Link\backups".into()),
         autostart: true,
         listed: true,
@@ -105,6 +120,11 @@ fn outcome() -> Outcome {
             ]),
             t("live-dev", "One Control Surface is enough", &["UppwindLink also opens your plugins’ windows for Uppwind Link. Had UppwindLinkDev in a second slot? Set that slot to None."]),
             t("fl", "Start FL Studio", &["Its MIDI settings are ready: Input “Uppwind Link”, Controller type “Uppwind Link (user)”, port 77."]),
+            t("plugins-scan", "Find the Uppwind Link plugins in your DAW", &[
+                "FL Studio: Options › Manage plugins › Find installed plugins (or restart FL Studio).",
+                "Ableton Live: Settings › Plug-Ins: Use VST3 Plug-In System Folders on, then Rescan.",
+                "Then put Uppwind Link Return on the master: your DAW’s sound comes back with any audio driver, ASIO included.",
+            ]),
             t("pair", "Pair the studio", &["Open the studio › Settings › Uppwind Link › Plugin windows: paste the code, then Pair."]),
         ],
     }
@@ -145,6 +165,7 @@ fn plan() -> UninstallPlan {
             r"Uppwind Link, its Start menu shortcut and its start with Windows (%USERPROFILE%\AppData\Local\Uppwind Link).".into(),
             format!(r"The Ableton Live script it installed ({UL}\Remote Scripts\UppwindLink)."),
             format!(r"The FL Studio script it installed ({FLHW}\Uppwind Link)."),
+            format!("The Uppwind Link plugins ({VST3}): Windows asks for administrator rights."),
             "Its log and its window data.".into(),
             "Its entry in Windows Settings › Apps.".into(),
         ],

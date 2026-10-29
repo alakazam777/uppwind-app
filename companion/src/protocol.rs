@@ -3,8 +3,16 @@
 //! Le protocole entre le studio (/atelier) et le compagnon : du JSON en messages texte, les images en messages
 //! binaires. Version 1 (etape 1 ; partie 1 : l'image, partie 2 : les gestes).
 //!
+//! L'appairage (29 oct., v2 : security.rs) : des l'ouverture, le compagnon envoie
+//!   {"type":"challenge","v":2,"nonce":"<64 hex>"}        son nonce Nc ; le studio repond (le PREMIER message) :
+//!   {"type":"hello","version":1,"v":2,"nonce":"<Ns>","proof":"<HMAC(jeton, uwl-studio|port|Nc|Ns)>"}
+//!   et le compagnon, si la preuve est juste : hello {…, "v":2, "proof":"<HMAC(jeton, uwl-companion|port|Ns|Nc)>"}.
+//!   Le studio n'envoie rien d'autre avant d'avoir verifie cette preuve. Fermetures : 4400 (pas hello), 4401 (preuve
+//!   ou jeton faux), 4429 (trop d'essais faux), 4426 (hello v1 refuse : ce jeton a deja servi en v2, « reload »).
+//!
 //! Studio → compagnon (texte) :
-//!   {"type":"hello","version":1,"token":"<64 hex>"}      le PREMIER message, obligatoire (sinon : ferme)
+//!   {"type":"hello","version":1,"token":"<64 hex>"}      (v1, le jeton en clair) accepte tant qu'aucun studio n'a
+//!                                                         fait la v2 avec ce jeton (un studio d'avant le 29 oct.)
 //!   {"type":"list"}                                       → windows
 //!   {"type":"devices"}                                    → devices (les plugins du set, par le script UppwindLink)
 //!   {"type":"live"}                                       → live {channel, answers, ms?, error?, script?, live?} : le
@@ -54,7 +62,8 @@ pub const COORD_MAX: f64 = 16384.0;
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMsg {
-    Hello { version: Option<u32>, token: Option<String> },
+    /// v1 : `token` (en clair) ; v2 (29 oct.) : `v` = 2, `nonce` (Ns) et `proof` (la preuve du studio), jamais le jeton
+    Hello { version: Option<u32>, token: Option<String>, v: Option<u32>, nonce: Option<String>, proof: Option<String> },
     List,
     Devices,
     /// Le script de dev de Live repond-il maintenant ? → live {channel, answers, ms?, error?} (23 oct.)
@@ -340,8 +349,13 @@ mod tests {
 
     #[test]
     fn parses_the_messages() {
-        assert_eq!(parse(r#"{"type":"hello","version":1,"token":"ab"}"#), Ok(ClientMsg::Hello { version: Some(1), token: Some("ab".into()) }));
-        assert_eq!(parse(r#"{"type":"hello"}"#), Ok(ClientMsg::Hello { version: None, token: None }));
+        assert_eq!(parse(r#"{"type":"hello","version":1,"token":"ab"}"#), Ok(ClientMsg::Hello { version: Some(1), token: Some("ab".into()), v: None, nonce: None, proof: None }));
+        assert_eq!(parse(r#"{"type":"hello"}"#), Ok(ClientMsg::Hello { version: None, token: None, v: None, nonce: None, proof: None }));
+        // (29 oct.) la v2 : un nonce et une preuve, jamais le jeton
+        assert_eq!(
+            parse(r#"{"type":"hello","version":1,"v":2,"nonce":"aa","proof":"bb"}"#),
+            Ok(ClientMsg::Hello { version: Some(1), token: None, v: Some(2), nonce: Some("aa".into()), proof: Some("bb".into()) })
+        );
         assert_eq!(parse(r#"{"type":"list"}"#), Ok(ClientMsg::List));
         assert_eq!(parse(r#"{"type":"live"}"#), Ok(ClientMsg::Live));
         assert_eq!(parse(r#"{"type":"watch","id":42}"#), Ok(ClientMsg::Watch { id: 42, fps: None, quality: None }));

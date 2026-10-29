@@ -3,11 +3,15 @@
 [package]
 name = "uwl-proto"
 description = "Uppwind Link: the tiny versioned protocol between the Uppwind Link plugins and the companion (localhost TCP)."
-# written out, not inherited from ../Cargo.toml: the companion builds with this crate in a copy of the repository
-# that has no plugin workspace (the plugins are not published yet)
+# written out, not inherited from ../Cargo.toml: the companion builds this crate on its own, without the plugin
+# workspace
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 publish = false
 
+# (29 oct.) les preuves de la poignee de main v2 (src/lib.rs, `auth`) : HMAC-SHA256, RustCrypto (MIT OR Apache-2.0).
+# sha2 sans ses options par defaut (pas d'OID, pas d'allocation de plus).
 [dependencies]
+hmac = "0.13"
+sha2 = { version = "0.11", default-features = false }

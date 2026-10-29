@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Uppwind
-# Uppwind Link -- cargo deny's rules for the companion (CI and RELEASING.md step 1):
+# Uppwind Link -- cargo deny's rules for the companion and the plugins it carries (CI and RELEASING.md step 1):
 #   cargo deny --manifest-path companion/Cargo.toml --config deny.toml check advisories bans licenses sources
+#   cargo deny --manifest-path plugin/Cargo.toml --config deny.toml check advisories bans licenses sources
 
 [graph]
-# the systems the companion is built for
+# the systems the companion and the plugins are built for
 targets = [
     "x86_64-pc-windows-msvc",
     "aarch64-apple-darwin",
@@ -16,13 +17,15 @@ targets = [
 ignore = []
 
 [licenses]
-# the licences already accepted for the crates the companion links (THIRD-PARTY-NOTICES.txt); our own crates are
-# GPL-3.0-or-later
+# the licences already accepted for the crates the companion and the plugins link (THIRD-PARTY-NOTICES.txt,
+# plugin/THIRD-PARTY-NOTICES.txt); our own crates are GPL-3.0-or-later. ISC: nice-plug, nice-plug-core,
+# nice-plug-derive and nice-log, which the plugins are built with (a permissive licence, compatible with the GPL)
 allow = [
     "MIT",
     "Apache-2.0",
     "Unlicense",
     "IJG",
+    "ISC",
     "Unicode-3.0",
     "Zlib",
     "GPL-3.0-or-later",

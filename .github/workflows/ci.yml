@@ -17,9 +17,9 @@ env:
 
 jobs:
   windows:
-    name: Windows (companion, scripts, notices)
+    name: Windows (companion, plugins, scripts, notices)
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,10 +30,37 @@ jobs:
           rustup default $env:RUST_VERSION
           rustc -V
           cargo -V
-      # from the repository folder, so that cargo reads .cargo/config.toml (the same flags as a release);
-      # the_real_registry_in_a_test_key runs here: it writes HKCU\Software\UppwindLinkTest on the runner and deletes it
+      # the plugins first: their tests, then the VST3 bundle that the companion embeds (UWL_PLUGIN_BUNDLE, for the
+      # steps below), with the commands of a release (RELEASING.md step 4) but without the path remapping
+      - name: Plugin tests
+        run: cargo test --release --locked --manifest-path plugin/Cargo.toml
+      - name: Plugin build and bundle
+        run: |
+          cargo build --release --locked --manifest-path plugin/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & ./plugin/target/release/uwl-bundle.exe --out plugin/target/release/bundled
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'plugin\target\release\bundled\Uppwind Link.vst3'
+          "UWL_PLUGIN_BUNDLE=$bundle" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      # from the repository folder, so that cargo reads .cargo/config.toml (the same flags as a release), with the
+      # plugins inside (UWL_PLUGIN_BUNDLE); the_real_registry_in_a_test_key runs here: it writes
+      # HKCU\Software\UppwindLinkTest on the runner and deletes it
       - name: Companion tests
         run: cargo test --release --locked --manifest-path companion/Cargo.toml
+      # into a folder of the runner (--plugins-dir: never Program Files, never an administrator prompt)
+      - name: The companion installs the plugins it carries, byte for byte, and removes them
+        run: |
+          cargo build --release --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $vst3 = Join-Path $env:RUNNER_TEMP 'vst3-check'
+          & ./companion/target/release/uppwind-companion.exe --install-plugins --plugins-dir $vst3
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $want = (Get-FileHash -Algorithm SHA256 (Join-Path $env:UWL_PLUGIN_BUNDLE 'Contents\x86_64-win\Uppwind Link.vst3')).Hash
+          $got = (Get-FileHash -Algorithm SHA256 (Join-Path $vst3 'Uppwind Link.vst3\Contents\x86_64-win\Uppwind Link.vst3')).Hash
+          if ($want -ne $got) { throw "the companion installed $got, the bundle is $want" }
+          & ./companion/target/release/uppwind-companion.exe --install-plugins --remove --plugins-dir $vst3
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (Test-Path (Join-Path $vst3 'Uppwind Link.vst3')) { throw "the plugins were not removed" }
       - name: Python tests
         run: |
           python --version
@@ -44,16 +71,19 @@ jobs:
           python -I tests/test_ableton.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
       # reads the crates from the cargo registry (offline): cargo fetch first, for the macOS crates the notices list too
+      # (the companion's and the plugins')
       - name: Third-party notices up to date
         run: |
           cargo fetch --locked --manifest-path companion/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo fetch --locked --manifest-path plugin/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           python -I dev/third_party_notices.py --check
 
   macos:
-    name: macOS arm64 (companion, build and tests only)
+    name: macOS arm64 (companion and plugins, build and tests only)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,8 +94,26 @@ jobs:
           rustup default "$RUST_VERSION"
           rustc -V
           uname -m
+      - name: Plugin tests
+        run: cargo test --release --locked --manifest-path plugin/Cargo.toml
+      # this runner's architecture only, signed ad hoc (no secret here); the signed, universal build: macos-build.yml
+      - name: Plugin build and bundle
+        run: |
+          cargo build --release --locked --manifest-path plugin/Cargo.toml
+          plugin/target/release/uwl-bundle --out "$RUNNER_TEMP/bundle" --sign -
+          codesign --verify --deep --strict "$RUNNER_TEMP/bundle/Uppwind Link.vst3"
+          echo "UWL_PLUGIN_BUNDLE=$RUNNER_TEMP/bundle/Uppwind Link.vst3" >> "$GITHUB_ENV"
       - name: Companion tests
         run: cargo test --release --locked --manifest-path companion/Cargo.toml
+      # into a folder of the runner: the same bytes, so the bundle's signature stays valid
+      - name: The companion installs the plugins it carries, byte for byte, and removes them
+        run: |
+          cargo build --release --locked --manifest-path companion/Cargo.toml
+          companion/target/release/uppwind-companion --install-plugins --plugins-dir "$RUNNER_TEMP/vst3-check"
+          diff -r "$UWL_PLUGIN_BUNDLE" "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          companion/target/release/uppwind-companion --install-plugins --remove --plugins-dir "$RUNNER_TEMP/vst3-check"
+          test ! -e "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
 
   supply-chain:
     name: Dependencies (cargo audit, cargo deny)
@@ -91,9 +139,14 @@ jobs:
       # companion: `cargo tree --target <each target> -i glib` prints nothing. cargo deny below, which looks at the
       # Windows and macOS targets only (deny.toml), checks every advisory with no exception.
       - name: cargo audit
-        run: cargo audit --deny warnings --file companion/Cargo.lock --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2024-0370
+        run: |
+          cargo audit --deny warnings --file companion/Cargo.lock --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2024-0370
+          cargo audit --deny warnings --file plugin/Cargo.lock
+      # the plugins ship inside the companion: the same rules (deny.toml), ISC allowed for nice-plug
       - name: cargo deny
-        run: cargo deny --manifest-path companion/Cargo.toml --config deny.toml check advisories bans licenses sources
+        run: |
+          cargo deny --manifest-path companion/Cargo.toml --config deny.toml check advisories bans licenses sources
+          cargo deny --manifest-path plugin/Cargo.toml --config deny.toml check advisories bans licenses sources
 
   secrets:
     name: Secrets (gitleaks, tree and history)

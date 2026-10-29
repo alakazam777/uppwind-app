@@ -9,10 +9,16 @@
 //!    de dev, localhost et 127.0.0.1 sur quelques ports, seulement avec --dev-origins ; --allow-origin n'accepte que
 //!    https:// ou une adresse locale). Pas d'Origin (un programme local, curl) : refuse aussi. L'origine seule ne
 //!    suffit pas (un programme local peut la falsifier) : d'ou le jeton.
-//! 4. Le premier message doit porter le jeton d'appairage (256 bits, compare en temps constant). Trop d'essais faux :
-//!    on bloque un moment (`PairingGuard`).
+//! 4. L'appairage (29 oct., v2, audit OUT-1) : des l'ouverture, le compagnon envoie un defi (son nonce) ; le studio
+//!    repond par sa preuve, HMAC-SHA256(jeton, "uwl-studio|" port "|" Nc "|" Ns), et le compagnon, s'il la trouve
+//!    juste (temps constant), par la sienne, HMAC-SHA256(jeton, "uwl-companion|" port "|" Ns "|" Nc). Le jeton (256
+//!    bits) ne circule plus. Le studio n'envoie rien d'autre avant d'avoir verifie la preuve du compagnon : un programme
+//!    qui ecoute a sa place n'apprend rien. Trop de preuves fausses : on ralentit (`PairingGuard`). Un studio d'avant
+//!    (v1, le jeton en clair) est accepte tant qu'aucun studio n'a fait la v2 avec ce jeton (`pairingV2` dans le
+//!    fichier d'etat), puis refuse (4426, « reload the studio »).
 
 use std::time::{Duration, Instant};
+use uwl_proto::auth;
 
 /// L'origine du studio en ligne (/atelier) : la seule que le compagnon accepte par defaut.
 pub const PROD_ORIGIN: &str = "https://uppwind.lucasmoreau.fr";
@@ -152,19 +158,78 @@ pub fn token_well_formed(t: &str) -> bool {
     t.len() == 64 && t.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-/// Les codes d'appairage (« UWC-<port>-<64 hex> ») d'un texte, sans leur jeton → le texte nettoye et combien il y en
-/// avait. Sert a nettoyer un journal ecrit par un compagnon d'avant (qui y mettait le code en clair).
+/// (29 oct.) Le code d'appairage qu'un compagnon v2 montre : « UWC2-<port>-<jeton> ». Le « 2 » dit au studio que ce
+/// compagnon prouve qu'il connait le jeton : le studio ne lui enverra jamais le jeton lui-meme (pas de retour a la v1).
+/// Un studio garde aussi les codes d'avant (« UWC-… », v1), pour les compagnons 0.1.
+pub fn pairing_code(port: u16, token: &str) -> String {
+    format!("UWC2-{port}-{token}")
+}
+
+/// 64 caracteres hexadecimaux minuscules → 32 octets (un jeton, un nonce, une preuve venus du studio). Sinon None :
+/// une seule ecriture possible, celle que les deux cotes signent.
+pub fn hex32(s: &str) -> Option<[u8; 32]> {
+    if !token_well_formed(s) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Un nonce neuf (32 octets du generateur du systeme).
+pub fn new_nonce() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).expect("no system random source");
+    b
+}
+
+/// La preuve que le studio doit envoyer : HMAC-SHA256(jeton, "uwl-studio|" port "|" Nc "|" Ns) (uwl-proto, auth). Le
+/// studio la calcule lui-meme (Web Crypto) ; ici, pour les essais.
+#[cfg(test)]
+pub fn studio_proof(token: &[u8; 32], port: u16, companion_nonce: &[u8; 32], studio_nonce: &[u8; 32]) -> [u8; 32] {
+    auth::proof(token, auth::STUDIO, port, companion_nonce, studio_nonce)
+}
+
+/// La preuve recue du studio est-elle la bonne ? (temps constant)
+pub fn studio_proof_ok(token: &[u8; 32], port: u16, companion_nonce: &[u8; 32], studio_nonce: &[u8; 32], given: &[u8]) -> bool {
+    auth::verify(token, auth::STUDIO, port, companion_nonce, studio_nonce, given)
+}
+
+/// La preuve du compagnon au studio, apres la sienne : HMAC-SHA256(jeton, "uwl-companion|" port "|" Ns "|" Nc).
+pub fn companion_proof_for_studio(token: &[u8; 32], port: u16, studio_nonce: &[u8; 32], companion_nonce: &[u8; 32]) -> [u8; 32] {
+    auth::proof(token, auth::COMPANION, port, studio_nonce, companion_nonce)
+}
+
+/// Les codes d'appairage (« UWC-<port>-<64 hex> », et depuis le 29 oct. « UWC2-… ») d'un texte, sans leur jeton → le
+/// texte nettoye et combien il y en avait. Sert a nettoyer un journal ecrit par un compagnon d'avant (qui y mettait le
+/// code en clair).
 pub fn scrub_pairing_codes(text: &str) -> (String, usize) {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let (mut n, mut i, mut last) = (0usize, 0usize, 0usize);
-    while let Some(off) = text[i..].find("UWC-") {
+    while let Some(off) = text[i..].find("UWC") {
         let at = i + off;
-        let mut j = at + 4;
+        // « UWC- » ou « UWC2- »
+        let mut j = at + 3;
+        if j < b.len() && b[j] == b'2' {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'-' {
+            i = at + 3;
+            continue;
+        }
+        let digits = j + 1;
+        j = digits;
         while j < b.len() && b[j].is_ascii_digit() {
             j += 1;
         }
-        if j > at + 4 && j < b.len() && b[j] == b'-' {
+        if j > digits && j < b.len() && b[j] == b'-' {
             let (t0, t1) = (j + 1, j + 1 + 64);
             if t1 <= b.len() && b[t0..t1].iter().all(|c| c.is_ascii_hexdigit()) && (t1 == b.len() || !b[t1].is_ascii_hexdigit()) {
                 out.push_str(&text[last..t0]);
@@ -175,7 +240,8 @@ pub fn scrub_pairing_codes(text: &str) -> (String, usize) {
                 continue;
             }
         }
-        i = at + 4;
+        // (apres « UWC », toujours une frontiere de caractere : ce sont trois octets ASCII)
+        i = at + 3;
     }
     out.push_str(&text[last..]);
     (out, n)
@@ -340,6 +406,35 @@ mod tests {
         assert_eq!(scrub_pairing_codes("é UWC-5-é UWC-"), ("é UWC-5-é UWC-".to_string(), 0), "not a code, and UTF-8 stays whole");
         let long = format!("UWC-2-{t}0");
         assert_eq!(scrub_pairing_codes(&long).1, 0, "65 hex digits: not a code");
+        // (29 oct.) les codes v2 aussi ; « UWC3- », « UWCx » ne sont pas des codes
+        let v2 = format!("a UWC2-47410-{t} b UWC3-1-{t} UWCé UWC2é UWC2-");
+        let (s, n) = scrub_pairing_codes(&v2);
+        assert_eq!(n, 1, "{s}");
+        assert!(s.contains("UWC2-47410-<removed>") && s.contains(&format!("UWC3-1-{t}")), "{s}");
+        assert_eq!(scrub_pairing_codes(&pairing_code(47411, &t)), ("UWC2-47411-<removed>".to_string(), 1));
+    }
+
+    /// (29 oct., v2) Les preuves de l'appairage : celles d'uwl-proto (les valeurs attendues viennent du module hmac de
+    /// Python, comme dans uwl-proto) ; le jeton et les nonces ne s'ecrivent que d'une facon.
+    #[test]
+    fn studio_proofs_and_strict_hex() {
+        let t = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let key = hex32(t).unwrap();
+        assert_eq!(key, std::array::from_fn::<u8, 32, _>(|i| i as u8));
+        let (nc, ns) = ([0x22u8; 32], [0x33u8; 32]);
+        let ps = studio_proof(&key, 47410, &nc, &ns);
+        assert_eq!(hex(&ps), "fc4756cc3ed3f609d234404a686e1e70b2f4e2faa4acc1fead089ed839782746");
+        assert_eq!(hex(&companion_proof_for_studio(&key, 47410, &ns, &nc)), "2ddee8d1ac156e9775b516a12b88a8ac4e598390d0ed7ef8b4d2eb492ff986e9");
+        assert!(studio_proof_ok(&key, 47410, &nc, &ns, &ps));
+        assert!(!studio_proof_ok(&key, 47411, &nc, &ns, &ps), "another port");
+        assert!(!studio_proof_ok(&key, 47410, &[0x23; 32], &ns, &ps), "a new challenge: an old proof is worthless");
+        assert!(!studio_proof_ok(&key, 47410, &nc, &ns, &companion_proof_for_studio(&key, 47410, &ns, &nc)), "the companion's proof is not the studio's");
+        assert!(!studio_proof_ok(&key, 47410, &nc, &ns, &ps[..16]));
+        assert_eq!(hex32(&t.to_uppercase()), None, "lowercase only: one spelling, the one both sides sign");
+        assert_eq!(hex32(&t[1..]), None);
+        assert_eq!(hex32(&format!("{}g", &t[1..])), None);
+        assert_ne!(new_nonce(), new_nonce());
+        assert_eq!(pairing_code(47410, t), format!("UWC2-47410-{t}"));
     }
 
     #[test]

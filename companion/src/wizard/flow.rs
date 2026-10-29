@@ -12,6 +12,7 @@
 use super::arp;
 use super::steps::{target_id, Choices, Outcome, Todo};
 use crate::install::{self, shortcut, Dirs, Shortcut};
+use crate::plugin_install as plugins;
 use crate::setup::env::{Probe, Registry};
 use crate::setup::scripts::{self, Action, Daw, Status, Target, MARKER};
 use crate::setup::{self, Mode, Opts, Report};
@@ -33,6 +34,10 @@ pub struct Env<'a> {
     pub extra_args: Vec<String>,
     /// l'horodatage des copies de sauvegarde
     pub stamp: String,
+    /// (29 oct.) ou vont les plugins Uppwind Link (le dossier VST3 du systeme ; un dossier d'essai dans les tests ;
+    /// `simulate` dans le bac a sable), et lesquels (ceux de l'exe ; un faux bundle dans les tests)
+    pub plugins: plugins::Target,
+    pub plugin_bundle: plugins::Bundle,
 }
 
 /// Les effets sur le systeme, a part (la fenetre les fait ; les essais n'en font aucun).
@@ -41,6 +46,11 @@ pub trait Hooks {
     /// un Uppwind Link qui tourne (l'icone) : on lui demande de s'arreter → ce qu'on en dit
     fn stop_running(&self) -> Option<String> {
         None
+    }
+    /// (29 oct.) macOS : le gardien des ports MIDI (midi_ports.rs), qui survit au compagnon, arrete → ce qu'on en dit ;
+    /// Ok(None) : il n'y en avait pas
+    fn stop_midi_ports(&self) -> Result<Option<String>, String> {
+        Ok(None)
     }
     /// lance le compagnon installe dans la zone de notification → son port
     fn start(&self, _exe: &Path, _args: &[String]) -> Result<Option<u16>, String> {
@@ -116,6 +126,16 @@ pub fn plan_uninstall(env: &Env) -> UninstallPlan {
             p.puts_back.push(format!("The {} script folder that was there before Uppwind Link.", t.daw.label()));
         }
     }
+    // (29 oct.) les plugins Uppwind Link qu'il a mis
+    let mut pr = plugins::inspect(&env.plugin_bundle, &env.plugins);
+    plugins::plan(&mut pr, true, false);
+    if pr.action == plugins::Action::Remove {
+        p.removes.push(format!(
+            "The Uppwind Link plugins ({}){}.",
+            crate::shown_path(&pr.folder),
+            if pr.admin && !env.plugins.simulate { ": Windows asks for administrator rights" } else { "" }
+        ));
+    }
     if r.fl_settings.available {
         p.puts_back.push("FL Studio’s MIDI settings, as they were before Uppwind Link changed them.".into());
         p.fl_running = r.fl.running.clone();
@@ -157,6 +177,12 @@ pub fn install(env: &Env, src: &Path, c: &Choices, h: &dyn Hooks) -> Outcome {
 
     h.progress("Setting up your DAWs");
     let report = daws(env, c, &mut o);
+
+    // (29 oct.) les plugins Uppwind Link (VST3) : sous Windows, l'invite d'administrateur arrive ici
+    if c.wants_plugins() {
+        h.progress("Installing the Uppwind Link plugins");
+        install_plugins(env, &mut o, &|l| h.progress(l));
+    }
 
     h.progress("Start with Windows");
     match set_autostart(&env.dirs, c.autostart, &env.extra_args) {
@@ -231,7 +257,8 @@ fn daws(env: &Env, c: &Choices, o: &mut Outcome) -> Option<Report> {
         daws.push(Daw::Fl);
     }
     let fl_settings = want_fl && c.fl_settings;
-    let opts = Opts { apply: !env.simulate_daws, mode: Mode::Install, json: true, force: false, daws, fl_settings: Some(fl_settings), free_midi: vec![] };
+    // (les plugins : a part, install_plugins, avec leur propre ligne de progression)
+    let opts = Opts { apply: !env.simulate_daws, mode: Mode::Install, json: true, force: false, daws, fl_settings: Some(fl_settings), free_midi: vec![], plugins: false };
     let mut r = setup::gather(env.probe, &opts, &env.stamp);
     r.scripts.retain(|t| c.wants(&target_id(t)));
     if env.simulate_daws {
@@ -276,6 +303,33 @@ fn daws(env: &Env, c: &Choices, o: &mut Outcome) -> Option<Report> {
         o.backups = Some(env.probe.paths.backups().display().to_string());
     }
     Some(r)
+}
+
+/// (29 oct.) Les plugins Uppwind Link, embarques dans l'exe, dans le dossier VST3 (plugin_install/) : ce qui a ete
+/// fait dans `o` (plugins, plugin_lines ; une vraie panne dans errors, l'invite refusee non).
+fn install_plugins(env: &Env, o: &mut Outcome, progress: &dyn Fn(&str)) {
+    let b = env.plugin_bundle;
+    let mut r = plugins::inspect(&b, &env.plugins);
+    plugins::plan(&mut r, false, false);
+    let a = plugins::apply(&mut r, &b, &env.plugins, progress);
+    o.plugins = match r.action {
+        plugins::Action::None => "unchanged",
+        plugins::Action::Skip | plugins::Action::Remove => "skipped",
+        _ if env.plugins.simulate => "simulated",
+        _ if a.refused => "refused",
+        _ if !a.errors.is_empty() => "failed",
+        plugins::Action::Install => "installed",
+        plugins::Action::Update => "updated",
+    }
+    .into();
+    match r.action {
+        plugins::Action::None => o.plugin_lines.push(format!("Uppwind Link plugins: already up to date in {}.", crate::shown_path(&r.folder))),
+        plugins::Action::Skip => o.plugin_lines.push(format!("Uppwind Link plugins: {}.", r.reason)),
+        _ => {}
+    }
+    o.plugin_lines.extend(a.done);
+    o.errors.extend(a.errors);
+    o.plugins_restart = a.restart;
 }
 
 fn todo_of(id: &str, title: &str, lines: &[&str]) -> Todo {
@@ -356,6 +410,33 @@ fn todo(env: &Env, c: &Choices, r: Option<&Report>, o: &Outcome) -> Vec<Todo> {
                 &["In FL Studio: Options › Audio settings — Device: Primary Sound Driver (or a Windows output, not a hardware ASIO driver), playing into an output you do not listen to."],
             ));
         }
+    }
+    // (29 oct.) les plugins Uppwind Link : les retrouver dans le DAW, l'invite refusee, un DAW a relancer
+    match o.plugins.as_str() {
+        "installed" | "updated" => {
+            let (live, fl) = r.map(|r| (r.ableton.found(), r.fl.found())).filter(|(l, f)| *l || *f).unwrap_or((true, true));
+            let mut lines = Vec::new();
+            if fl {
+                lines.push("FL Studio: Options › Manage plugins › Find installed plugins (or restart FL Studio).".to_string());
+            }
+            if live {
+                lines.push("Ableton Live: Settings › Plug-Ins: Use VST3 Plug-In System Folders on, then Rescan.".to_string());
+            }
+            lines.push("Then put Uppwind Link Return on the master: your DAW’s sound comes back with any audio driver, ASIO included.".to_string());
+            v.push(Todo { id: "plugins-scan".into(), title: "Find the Uppwind Link plugins in your DAW".into(), lines });
+        }
+        "refused" => v.push(Todo {
+            id: "plugins".into(),
+            title: "Install the Uppwind Link plugins".into(),
+            lines: vec![
+                format!("The administrator prompt was refused, so they are not installed. FL Studio finds VST3 plugins only in {}.", crate::shown_path(&env.plugins.vst3)),
+                "Open Uppwind Link › Set up again to install them (one prompt).".into(),
+            ],
+        }),
+        _ => {}
+    }
+    if o.plugins_restart {
+        v.push(todo_of("plugins-restart", "Restart your DAW", &["It still has the previous Uppwind Link plugins loaded: the new ones load when it starts again."]));
     }
     let (link, back, _) = super::steps::ports_of(&env.probe.midi_in, &env.probe.midi_out);
     if link.is_none() || back.is_none() {
@@ -460,6 +541,31 @@ fn scripts_out(env: &Env, o: &mut Removal) -> bool {
     removed_live
 }
 
+/// (29 oct.) Les plugins Uppwind Link : retires s'ils sont du compagnon (son releve, ou ses octets), laisses sinon.
+/// L'invite d'administrateur refusee : ils restent (dit dans `kept`), la desinstallation continue.
+fn plugins_out(env: &Env, o: &mut Removal, progress: &dyn Fn(&str)) {
+    let b = env.plugin_bundle;
+    let mut r = plugins::inspect(&b, &env.plugins);
+    plugins::plan(&mut r, true, false);
+    let shown = crate::shown_path(&r.folder);
+    match r.action {
+        plugins::Action::Remove => {}
+        plugins::Action::Skip if r.supported && r.status != plugins::Status::Missing => {
+            o.done.push(format!("Uppwind Link plugins in {shown}: not installed by Uppwind Link, left as they are."));
+            return;
+        }
+        _ => return,
+    }
+    progress("Removing the Uppwind Link plugins");
+    let a = plugins::apply(&mut r, &b, &env.plugins, progress);
+    if a.refused {
+        o.kept.extend(a.done);
+    } else {
+        o.done.extend(a.done);
+    }
+    o.errors.extend(a.errors);
+}
+
 /// Les copies du programme mises de cote parce qu'elles tournaient (install.rs les nomme ainsi).
 fn asides(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
@@ -488,8 +594,16 @@ pub fn uninstall(env: &Env, h: &dyn Hooks) -> Removal {
     }
     h.progress("Removing the DAW scripts");
     let removed_live = scripts_out(env, &mut o);
+    // (29 oct.) les plugins Uppwind Link qu'il a mis (sous Windows : une invite d'administrateur)
+    plugins_out(env, &mut o, &|l| h.progress(l));
 
     h.progress("Removing Uppwind Link");
+    // (29 oct.) macOS : les ports MIDI partent avec leur gardien (pas avant : FL ouvert bloque tout ce qui precede)
+    match h.stop_midi_ports() {
+        Ok(Some(l)) => o.done.push(l),
+        Ok(None) => {}
+        Err(e) => o.errors.push(e),
+    }
     let web = webview_dir(&env.dirs);
     let mut later: Vec<PathBuf> = Vec::new();
     if web.exists() {
@@ -597,8 +711,14 @@ mod tests {
             state_file: root.join(".uppwind-companion.json"),
             extra_args: vec![],
             stamp: stamp.into(),
+            // (29 oct.) un dossier d'essai : jamais le dossier VST3 du systeme, jamais d'invite
+            plugins: plugins::Target::in_dir(&root.join("VST3")),
+            plugin_bundle: plugins::Bundle { files: TEST_PLUGINS },
         }
     }
+
+    /// (29 oct.) un faux bundle des plugins (celui de Windows : une DLL)
+    static TEST_PLUGINS: &[(&str, &[u8], bool)] = &[("Contents/x86_64-win/Uppwind Link.vst3", b"MZ a test plugin", false)];
 
     fn fake_exe(root: &Path) -> PathBuf {
         let p = root.join("Downloads").join("uppwind-companion.exe");
@@ -614,7 +734,9 @@ mod tests {
         let reg = FakeRegistry::default();
         let fl_before = probe.reg.value(r"HKCU\Software\Image-Line\FL Studio 26\Devices\MIDI input\Uppwind Link", "Port");
         let env = env_for(&dirs, &probe, &reg, &root, "20261024-120000");
-        let m = super::super::steps::Model::from_report(&setup::gather(&probe, &Opts { fl_settings: Some(true), ..Default::default() }, "20261024-120000"), None, None, false, String::new());
+        let mut m = super::super::steps::Model::from_report(&setup::gather(&probe, &Opts { fl_settings: Some(true), ..Default::default() }, "20261024-120000"), None, None, false, String::new());
+        // (les plugins : leur propre essai, plus bas ; ici comme une construction sans plugins)
+        m.plugins = Default::default();
         let c = Choices::defaults(&m);
         assert_eq!(c.daws.len(), 2, "{:?}", m.daws);
         let rec = Rec(Default::default());
@@ -734,6 +856,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// (29 oct.) le gardien des ports MIDI (macOS, midi_ports.rs) : ce que le crochet en dit, et s'il a ete appele
+    struct Keeper(Result<Option<String>, String>, std::cell::Cell<bool>);
+    impl Hooks for Keeper {
+        fn stop_midi_ports(&self) -> Result<Option<String>, String> {
+            self.1.set(true);
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn the_midi_ports_keeper_goes_with_the_program_never_while_fl_blocks() {
+        let root = temp_root("flow-keeper");
+        let (mut probe, dirs) = machine(&root, false);
+        let reg = FakeRegistry::default();
+        let c = Choices { daws: vec!["fl".into()], fl_settings: true, autostart: false, open_studio: false };
+        let o = install(&env_for(&dirs, &probe, &reg, &root, "20261029-120000"), &fake_exe(&root), &c, &NoHooks);
+        assert_eq!(o.fl, "written", "{:?}", o.fl_lines);
+        // FL ouvert : rien n'est retire, le gardien (et les ports de FL) restent
+        probe.processes.push("FL64.exe".into());
+        let k = Keeper(Ok(Some("Stopped the MIDI ports keeper (pid 7).".into())), Default::default());
+        let u = uninstall(&env_for(&dirs, &probe, &reg, &root, "20261029-120100"), &k);
+        assert!(u.blocked.is_some() && !k.1.get(), "{:#?}", u);
+        // FL ferme : il part avec le programme, et c'est dit
+        probe.processes.retain(|p| p != "FL64.exe");
+        let u = uninstall(&env_for(&dirs, &probe, &reg, &root, "20261029-120200"), &k);
+        assert!(k.1.get() && u.ok && u.done.iter().any(|l| l == "Stopped the MIDI ports keeper (pid 7)."), "{:#?}", u);
+        // ne pas pouvoir l'arreter : dit, et la desinstallation n'est pas reussie
+        let e = Keeper(Err("cannot stop the MIDI ports keeper (pid 7).".into()), Default::default());
+        let u = uninstall(&env_for(&dirs, &probe, &reg, &root, "20261029-120300"), &e);
+        assert!(e.1.get() && !u.ok && u.errors.iter().any(|l| l.contains("MIDI ports keeper")), "{:#?}", u);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_sandbox_simulates_the_daws_and_carries_its_folder() {
         let root = temp_root("flow-sandbox");
@@ -741,12 +896,16 @@ mod tests {
         let reg = FakeRegistry::default();
         let mut env = env_for(&dirs, &probe, &reg, &root, "20261024-150000");
         env.simulate_daws = true;
+        env.plugins.simulate = true;
         env.extra_args = vec!["--sandbox".into(), r"D:\my sandbox".into()];
-        let m = super::super::steps::Model::from_report(&setup::gather(&probe, &Opts { fl_settings: Some(true), ..Default::default() }, "x"), None, None, true, String::new());
+        let mut m = super::super::steps::Model::from_report(&setup::gather(&probe, &Opts { fl_settings: Some(true), ..Default::default() }, "x"), None, None, true, String::new());
+        m.plugins = super::super::steps::tests::plugins("install");
         let o = install(&env, &fake_exe(&root), &Choices::defaults(&m), &NoHooks);
         assert!(o.ok && o.simulated, "{:#?}", o);
         assert!(o.scripts.iter().all(|s| s.contains("simulated")), "{:?}", o.scripts);
         assert_eq!(o.fl, "simulated");
+        assert_eq!(o.plugins, "simulated", "{:?}", o.plugin_lines);
+        assert!(!root.join("VST3").exists(), "no plugin written");
         assert!(!root.join("E").join("Ableton").join("User Library").join("Remote Scripts").exists(), "nothing written in Live's folders");
         assert_eq!(shortcut::read(&dirs.start_menu_link()).unwrap().args, r#"--app --sandbox "D:\my sandbox""#);
         assert_eq!(shortcut::read(&dirs.startup_link()).unwrap().args, r#"--background --sandbox "D:\my sandbox""#);
@@ -754,6 +913,49 @@ mod tests {
         let u = uninstall(&env, &NoHooks);
         assert!(u.ok && u.simulated, "{:#?}", u);
         assert!(!dirs.exe().exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (29 oct.) les plugins Uppwind Link : installes avec le reste (dans un dossier d'essai, sans invite), dits dans ce
+    /// qui reste a faire, retires par la desinstallation ; ceux d'un autre, laisses.
+    #[test]
+    fn the_plugins_come_with_the_install_and_go_with_the_uninstall() {
+        let root = temp_root("flow-plugins");
+        let (probe, dirs) = machine(&root, false);
+        let reg = FakeRegistry::default();
+        let env = env_for(&dirs, &probe, &reg, &root, "20261029-130000");
+        let dll = root.join("VST3").join("Uppwind Link.vst3").join("Contents").join("x86_64-win").join("Uppwind Link.vst3");
+        let c = Choices { daws: vec!["fl".into(), super::super::steps::PLUGINS.into()], fl_settings: false, autostart: false, open_studio: false };
+        let rec = Rec(Default::default());
+        let o = install(&env, &fake_exe(&root), &c, &rec);
+        assert!(o.ok, "{:#?}", o);
+        assert_eq!(o.plugins, "installed", "{:?}", o.plugin_lines);
+        assert!(o.plugin_lines.iter().any(|l| l.contains("installed in")), "{:?}", o.plugin_lines);
+        assert_eq!(std::fs::read(&dll).unwrap(), TEST_PLUGINS[0].1);
+        assert!(rec.0.borrow().iter().any(|l| l == "Installing the Uppwind Link plugins"), "{:?}", rec.0.borrow());
+        let scan = o.todo.iter().find(|t| t.id == "plugins-scan").expect("say where to find them");
+        assert!(scan.lines.iter().any(|l| l.contains("Find installed plugins")), "{scan:?}");
+        // deja la : rien a faire, pas de ligne de recherche dans le DAW
+        let o2 = install(&env, &fake_exe(&root), &c, &NoHooks);
+        assert_eq!(o2.plugins, "unchanged");
+        assert!(!o2.todo.iter().any(|t| t.id.starts_with("plugins")), "{:#?}", o2.todo);
+        // pas coches : pas touches
+        let mut c3 = c.clone();
+        c3.daws.retain(|d| d != super::super::steps::PLUGINS);
+        assert_eq!(install(&env, &fake_exe(&root), &c3, &NoHooks).plugins, "");
+        // la desinstallation les annonce, puis les retire
+        assert!(plan_uninstall(&env).removes.iter().any(|l| l.starts_with("The Uppwind Link plugins")), "{:?}", plan_uninstall(&env).removes);
+        let u = uninstall(&env, &NoHooks);
+        assert!(u.ok, "{:#?}", u);
+        assert!(u.done.iter().any(|l| l.starts_with("Removed the Uppwind Link plugins")), "{:?}", u.done);
+        assert!(!root.join("VST3").join("Uppwind Link.vst3").exists() && !env.plugins.marker.exists());
+        // un bundle que le compagnon n'a pas mis : laisse
+        std::fs::create_dir_all(dll.parent().unwrap()).unwrap();
+        std::fs::write(&dll, "a build of my own").unwrap();
+        assert!(!plan_uninstall(&env).removes.iter().any(|l| l.starts_with("The Uppwind Link plugins")));
+        let u = uninstall(&env, &NoHooks);
+        assert!(u.done.iter().any(|l| l.contains("not installed by Uppwind Link, left as they are")), "{:?}", u.done);
+        assert!(dll.is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

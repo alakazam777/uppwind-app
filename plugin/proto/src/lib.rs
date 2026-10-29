@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Uppwind
 //! Uppwind Link — le protocole entre les plugins du DAW (« Uppwind Link Return », « Uppwind Link Notes ») et le
-//! compagnon. Version 1 (phase 0, 25 oct. 2026). Aucune dependance : le plugin, l'hote d'essai et le compagnon
-//! partagent ce fichier (pas de jumeaux a garder d'accord).
+//! compagnon. Version 2 (29 oct. 2026 : la poignee de main a preuves des deux cotes ; la version 1 du 25 oct. donnait
+//! le secret en clair a qui ecoutait). Deux dependances, hmac et sha2 (RustCrypto, MIT/Apache-2.0) : le plugin, l'hote
+//! d'essai et le compagnon partagent ce fichier (pas de jumeaux a garder d'accord), preuves comprises (`auth`).
 //!
 //! TCP sur 127.0.0.1 seulement. Le compagnon ecoute ; son port et un secret a part (PAS le jeton d'appairage du
 //! studio : un plugin ne peut ni filmer ni cliquer) sont dans son fichier d'etat %USERPROFILE%\.uppwind-companion.json
@@ -15,10 +16,29 @@
 //!   5  …  le contenu
 //! ```
 //!
+//! La poignee de main (v2). Le secret ne circule jamais ; chaque cote prouve qu'il le connait, sur deux nonces neufs
+//! (32 octets du generateur du systeme) et le port de la connexion (`auth`) :
+//!
+//! ```text
+//!   plugin    → HELLO      version 2, nonce Np (a la place du secret de la v1), le reste comme avant
+//!   compagnon → CHALLENGE  Nc, Pc = HMAC-SHA256(secret, "uwl-companion|" port "|" hex(Np) "|" hex(Nc))
+//!   plugin      verifie Pc (temps constant) AVANT tout : faux ou absent → il ferme, attend, n'envoie aucun son et
+//!               ne joue aucune note ; un WELCOME qui arrive sans CHALLENGE verifie ne vaut rien
+//!   plugin    → AUTH       Pp = HMAC-SHA256(secret, "uwl-plugin|" port "|" hex(Nc) "|" hex(Np))
+//!   compagnon   verifie Pp (temps constant) ; faux → WELCOME 1 et il ferme
+//!   compagnon → WELCOME    0 (les trames peuvent partir), 3 (identite deja connectee : le plugin en prend une neuve)…
+//! ```
+//!
+//! Le port (celui que le plugin a appele, celui que le compagnon ecoute) est dans les preuves : un programme qui
+//! ecoute sur un vieux port du fichier d'etat ne peut pas relayer la poignee de main vers le vrai compagnon (les ports
+//! different, les preuves aussi). Un refus du HELLO (version, format) part en WELCOME tout de suite, sans CHALLENGE.
+//! Un plugin v1 (le secret en clair dans HELLO) est refuse : WELCOME 2 « an older Uppwind Link plugin… ».
+//!
 //! Plugin → compagnon :
 //! - HELLO   0x01  la premiere trame, dans les 2 s (au plus MAX_HELLO octets) : « UWLP », version u16, kind u8
-//!   (1 Return, 2 Notes), flags u8, secret [32], instance u64, rate u32, max_block u32, channels u8, pid u32,
-//!   name (u8 + UTF-8), host (u8 + UTF-8 : l'exe du DAW, pour l'affichage seulement).
+//!   (1 Return, 2 Notes), flags u8, nonce [32] (v1 : le secret), instance u64, rate u32, max_block u32, channels u8,
+//!   pid u32, name (u8 + UTF-8), host (u8 + UTF-8 : l'exe du DAW, pour l'affichage seulement).
+//! - AUTH    0x04  (v2) la preuve du plugin [32], la reponse au CHALLENGE (la seule trame permise entre les deux).
 //! - AUDIO   0x10  (Return) pos u64 (la trame du premier echantillon), t f64 (l'instant de cette trame, ms depuis
 //!   1970), rate u32, frames u16, ch u8, flags u8 (1 silence, 2 discontinuite, 4 contourne), puis frames × ch f32
 //!   entrelaces. Les memes bits que les paquets « UWA1 » du studio.
@@ -31,8 +51,10 @@
 //! - STATS   0x30  du JSON (UTF-8), toutes les 2 s : compteurs et mesures, pour le journal. Rien de vital.
 //!
 //! Compagnon → plugin :
-//! - WELCOME 0x02  version u16, status u8 (0 ok, 1 mauvais secret, 2 version, 3 instance deja connectee, 4 refuse),
-//!   message (u8 + UTF-8). Sauf 0, la connexion se ferme ensuite.
+//! - CHALLENGE 0x03 (v2) le nonce du compagnon [32], sa preuve [32].
+//! - WELCOME 0x02  version u16, status u8 (0 ok, 1 mauvais secret ou mauvaise preuve, 2 version, 3 instance deja
+//!   connectee, 4 refuse), message (u8 + UTF-8). Sauf 0, la connexion se ferme ensuite. En v2, le verdict apres AUTH
+//!   (ou le refus du HELLO).
 //! - EVENTS  0x20  (Notes) count u16, puis par evenement, 16 octets : t f64 (ms depuis 1970 : quand le DAW doit le
 //!   jouer), n u32 (son numero, pour la mesure), len u8, data [3] (un message MIDI de canal : notes, CC, pitch bend…).
 //!
@@ -42,9 +64,14 @@
 
 use std::fmt;
 
-pub const VERSION: u16 = 1;
+/// (29 oct.) 2 : la poignee de main a preuves (CHALLENGE, AUTH). Le compagnon refuse un plugin v1.
+pub const VERSION: u16 = 2;
+/// La version d'avant : le secret en clair dans HELLO (refusee, mais reconnue pour dire quoi faire).
+pub const V1: u16 = 1;
 pub const MAGIC: [u8; 4] = *b"UWLP";
 pub const SECRET_LEN: usize = 32;
+pub const NONCE_LEN: usize = 32;
+pub const PROOF_LEN: usize = 32;
 /// Une trame AUDIO de 8192 trames stereo fait 64 Ko : large.
 pub const MAX_FRAME: usize = 256 * 1024;
 /// Avant l'appairage, une trame ne depasse pas ca (la poignee de main).
@@ -58,6 +85,10 @@ pub const EVENT_BYTES: usize = 16;
 pub mod ty {
     pub const HELLO: u8 = 0x01;
     pub const WELCOME: u8 = 0x02;
+    /// (v2) compagnon → plugin : son nonce et sa preuve, la reponse au HELLO
+    pub const CHALLENGE: u8 = 0x03;
+    /// (v2) plugin → compagnon : sa preuve, la reponse au CHALLENGE
+    pub const AUTH: u8 = 0x04;
     pub const AUDIO: u8 = 0x10;
     pub const FORMAT: u8 = 0x11;
     pub const EVENTS: u8 = 0x20;
@@ -217,7 +248,9 @@ pub struct Hello {
     pub version: u16,
     pub kind: Kind,
     pub flags: u8,
-    pub secret: [u8; SECRET_LEN],
+    /// (v2) le nonce du plugin, 32 octets neufs a chaque connexion. Un plugin v1 mettait ici le secret lui-meme, en
+    /// clair : voir `v1_secret`.
+    pub nonce: [u8; NONCE_LEN],
     /// L'identite de l'instance (au hasard a sa creation, gardee dans le projet du DAW).
     pub instance: u64,
     pub rate: u32,
@@ -228,13 +261,20 @@ pub struct Hello {
     pub host: String,
 }
 
+impl Hello {
+    /// Ce qu'un plugin v1 (refuse) envoyait a la place du nonce : le secret, en clair. None pour un plugin v2.
+    pub fn v1_secret(&self) -> Option<&[u8; SECRET_LEN]> {
+        (self.version == V1).then_some(&self.nonce)
+    }
+}
+
 pub fn encode_hello(h: &Hello, out: &mut Vec<u8>) {
     let at = begin(ty::HELLO, out);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&h.version.to_le_bytes());
     out.push(h.kind.code());
     out.push(h.flags);
-    out.extend_from_slice(&h.secret);
+    out.extend_from_slice(&h.nonce);
     out.extend_from_slice(&h.instance.to_le_bytes());
     out.extend_from_slice(&h.rate.to_le_bytes());
     out.extend_from_slice(&h.max_block.to_le_bytes());
@@ -253,8 +293,8 @@ pub fn decode_hello(p: &[u8]) -> Result<Hello, Error> {
     let version = r.u16()?;
     let kind = Kind::from_code(r.u8()?).ok_or(Error::Bad("kind"))?;
     let flags = r.u8()?;
-    let mut secret = [0u8; SECRET_LEN];
-    secret.copy_from_slice(r.take(SECRET_LEN)?);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(r.take(NONCE_LEN)?);
     let instance = r.u64()?;
     let rate = r.u32()?;
     let max_block = r.u32()?;
@@ -268,7 +308,44 @@ pub fn decode_hello(p: &[u8]) -> Result<Hello, Error> {
     if host.chars().any(|c| c.is_control()) {
         return Err(Error::Bad("host"));
     }
-    Ok(Hello { version, kind, flags, secret, instance, rate, max_block, channels, pid, name, host })
+    Ok(Hello { version, kind, flags, nonce, instance, rate, max_block, channels, pid, name, host })
+}
+
+/// (v2) La reponse du compagnon au HELLO : son nonce et sa preuve (`auth::companion_proof`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Challenge {
+    pub nonce: [u8; NONCE_LEN],
+    pub proof: [u8; PROOF_LEN],
+}
+
+pub fn encode_challenge(c: &Challenge, out: &mut Vec<u8>) {
+    let at = begin(ty::CHALLENGE, out);
+    out.extend_from_slice(&c.nonce);
+    out.extend_from_slice(&c.proof);
+    finish(at, out);
+}
+
+/// Exactement 64 octets (une trame plus courte ou plus longue est refusee).
+pub fn decode_challenge(p: &[u8]) -> Result<Challenge, Error> {
+    if p.len() != NONCE_LEN + PROOF_LEN {
+        return Err(Error::Short);
+    }
+    let mut c = Challenge { nonce: [0; NONCE_LEN], proof: [0; PROOF_LEN] };
+    c.nonce.copy_from_slice(&p[..NONCE_LEN]);
+    c.proof.copy_from_slice(&p[NONCE_LEN..]);
+    Ok(c)
+}
+
+/// (v2) La preuve du plugin (`auth::plugin_proof`), la reponse au CHALLENGE.
+pub fn encode_auth(proof: &[u8; PROOF_LEN], out: &mut Vec<u8>) {
+    let at = begin(ty::AUTH, out);
+    out.extend_from_slice(proof);
+    finish(at, out);
+}
+
+/// Exactement 32 octets.
+pub fn decode_auth(p: &[u8]) -> Result<[u8; PROOF_LEN], Error> {
+    p.try_into().map_err(|_| Error::Short)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -609,6 +686,81 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     d == 0
 }
 
+// ─── les preuves (v2, 29 oct.) ───────────────────────────────────────────────────────────────────────────────
+
+/// Les preuves de la poignee de main : HMAC-SHA256 sur une etiquette (qui prouve), le port de la connexion et les deux
+/// nonces en hexadecimal minuscule, le texte « <etiquette><port>|<hex 1>|<hex 2> ». Le compagnon s'en sert aussi avec
+/// le studio (le jeton d'appairage pour cle : companion/src/security.rs, public/js/atelier/companion-link.js).
+/// La verification passe par `Mac::verify_slice` (temps constant). Le secret, lui, ne circule jamais.
+pub mod auth {
+    use super::{NONCE_LEN, PROOF_LEN, SECRET_LEN};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    /// Ce que le compagnon prouve (au plugin ; au studio aussi, avec le jeton)
+    pub const COMPANION: &str = "uwl-companion|";
+    /// Ce que le plugin prouve
+    pub const PLUGIN: &str = "uwl-plugin|";
+    /// Ce que le studio prouve (companion/src/security.rs)
+    pub const STUDIO: &str = "uwl-studio|";
+
+    pub type Nonce = [u8; NONCE_LEN];
+
+    fn push_hex(b: &[u8], out: &mut Vec<u8>) {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        for x in b {
+            out.push(H[(x >> 4) as usize]);
+            out.push(H[(x & 15) as usize]);
+        }
+    }
+
+    /// Le texte signe : « <etiquette><port>|<hex(first)>|<hex(second)> » (le port en decimal, sans zero devant).
+    pub fn message(label: &str, port: u16, first: &Nonce, second: &Nonce) -> Vec<u8> {
+        let mut m = Vec::with_capacity(label.len() + 7 + 4 * NONCE_LEN + 1);
+        m.extend_from_slice(label.as_bytes());
+        m.extend_from_slice(port.to_string().as_bytes());
+        m.push(b'|');
+        push_hex(first, &mut m);
+        m.push(b'|');
+        push_hex(second, &mut m);
+        m
+    }
+
+    fn mac(key: &[u8], label: &str, port: u16, first: &Nonce, second: &Nonce) -> Hmac<Sha256> {
+        // (HMAC prend une cle de n'importe quelle longueur : pas d'erreur possible ici)
+        let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes keys of any length");
+        m.update(&message(label, port, first, second));
+        m
+    }
+
+    pub fn proof(key: &[u8], label: &str, port: u16, first: &Nonce, second: &Nonce) -> [u8; PROOF_LEN] {
+        mac(key, label, port, first, second).finalize().into_bytes().into()
+    }
+
+    /// La preuve recue est-elle la bonne ? (temps constant ; une longueur fausse : non)
+    pub fn verify(key: &[u8], label: &str, port: u16, first: &Nonce, second: &Nonce, given: &[u8]) -> bool {
+        given.len() == PROOF_LEN && mac(key, label, port, first, second).verify_slice(given).is_ok()
+    }
+
+    /// Celle du compagnon au plugin : HMAC(secret, "uwl-companion|" port "|" hex(Np) "|" hex(Nc)).
+    pub fn companion_proof(secret: &[u8; SECRET_LEN], port: u16, plugin_nonce: &Nonce, companion_nonce: &Nonce) -> [u8; PROOF_LEN] {
+        proof(secret, COMPANION, port, plugin_nonce, companion_nonce)
+    }
+
+    pub fn companion_proof_ok(secret: &[u8; SECRET_LEN], port: u16, plugin_nonce: &Nonce, companion_nonce: &Nonce, given: &[u8]) -> bool {
+        verify(secret, COMPANION, port, plugin_nonce, companion_nonce, given)
+    }
+
+    /// Celle du plugin au compagnon : HMAC(secret, "uwl-plugin|" port "|" hex(Nc) "|" hex(Np)).
+    pub fn plugin_proof(secret: &[u8; SECRET_LEN], port: u16, companion_nonce: &Nonce, plugin_nonce: &Nonce) -> [u8; PROOF_LEN] {
+        proof(secret, PLUGIN, port, companion_nonce, plugin_nonce)
+    }
+
+    pub fn plugin_proof_ok(secret: &[u8; SECRET_LEN], port: u16, companion_nonce: &Nonce, plugin_nonce: &Nonce, given: &[u8]) -> bool {
+        verify(secret, PLUGIN, port, companion_nonce, plugin_nonce, given)
+    }
+}
+
 /// L'identite d'une instance en texte (16 caracteres hexadecimaux) : ce que le studio voit et renvoie.
 pub fn instance_hex(id: u64) -> String {
     format!("{id:016x}")
@@ -641,7 +793,7 @@ mod tests {
             version: VERSION,
             kind: Kind::Notes,
             flags: 0,
-            secret: [7u8; 32],
+            nonce: [7u8; 32],
             instance: 0x0123_4567_89ab_cdef,
             rate: 48000,
             max_block: 512,
@@ -675,6 +827,64 @@ mod tests {
         encode_hello(&h3, &mut o3);
         let back = decode_hello(&one_frame(&o3).1).unwrap();
         assert_eq!(back.host.len(), 254);
+        // (v2) le nonce n'est jamais pris pour un secret ; un HELLO v1 (meme place, le secret en clair) se reconnait
+        assert_eq!(h.v1_secret(), None);
+        let old = Hello { version: V1, ..h.clone() };
+        assert_eq!(old.v1_secret(), Some(&[7u8; 32]));
+    }
+
+    #[test]
+    fn challenge_and_auth_frames_have_exact_sizes() {
+        let c = Challenge { nonce: [0x22; NONCE_LEN], proof: [0x5c; PROOF_LEN] };
+        let mut out = Vec::new();
+        encode_challenge(&c, &mut out);
+        assert!(out.len() < MAX_HELLO);
+        let (t, p) = one_frame(&out);
+        assert_eq!((t, decode_challenge(&p)), (ty::CHALLENGE, Ok(c)));
+        assert_eq!(decode_challenge(&p[..63]), Err(Error::Short));
+        assert_eq!(decode_challenge(&[p.clone(), vec![0]].concat()), Err(Error::Short), "one byte too many");
+        out.clear();
+        encode_auth(&[0xa5; PROOF_LEN], &mut out);
+        let (t, p) = one_frame(&out);
+        assert_eq!((t, decode_auth(&p)), (ty::AUTH, Ok([0xa5; PROOF_LEN])));
+        assert_eq!(decode_auth(&p[..31]), Err(Error::Short));
+        assert_eq!(decode_auth(&[0u8; 33]), Err(Error::Short));
+    }
+
+    /// Les valeurs attendues viennent d'ailleurs (le module hmac de Python, 29 oct.) : la meme recette que le studio
+    /// (Web Crypto) et le faux compagnon des essais.
+    #[test]
+    fn proofs_match_an_independent_hmac_and_bind_label_port_and_nonces() {
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let (np, nc, ns) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+        assert_eq!(
+            std::str::from_utf8(&auth::message(auth::COMPANION, 47411, &np, &nc)).unwrap(),
+            format!("uwl-companion|47411|{}|{}", "11".repeat(32), "22".repeat(32))
+        );
+        let pc = auth::companion_proof(&key, 47411, &np, &nc);
+        assert_eq!(secret_hex(&pc), "3249cdee13451d6d64f6daf0b32fe2ce10177ea23bfbfacd76daeec9b7c0f5a1");
+        let pp = auth::plugin_proof(&key, 47411, &nc, &np);
+        assert_eq!(secret_hex(&pp), "dae2f9af0929923d1b5c741a39c6e011f0dd9bd19deaa6d67740c90f7d7c8691");
+        assert_eq!(secret_hex(&auth::proof(&key, auth::STUDIO, 47410, &nc, &ns)), "fc4756cc3ed3f609d234404a686e1e70b2f4e2faa4acc1fead089ed839782746");
+        assert_eq!(secret_hex(&auth::proof(&key, auth::COMPANION, 47410, &ns, &nc)), "2ddee8d1ac156e9775b516a12b88a8ac4e598390d0ed7ef8b4d2eb492ff986e9");
+        assert!(auth::companion_proof_ok(&key, 47411, &np, &nc, &pc));
+        assert!(auth::plugin_proof_ok(&key, 47411, &nc, &np, &pp));
+        // chaque morceau compte : un autre secret, un autre port (un relais), d'autres nonces (un rejeu), les roles
+        // echanges (un reflet), une preuve tronquee ou vide
+        let mut other = key;
+        other[0] ^= 1;
+        assert!(!auth::companion_proof_ok(&other, 47411, &np, &nc, &pc), "another secret");
+        assert!(!auth::companion_proof_ok(&key, 47412, &np, &nc, &pc), "another port: a relay through a stale port fails");
+        assert!(!auth::companion_proof_ok(&key, 47411, &[0x12; 32], &nc, &pc), "a new plugin nonce: an old proof is worthless");
+        assert!(!auth::companion_proof_ok(&key, 47411, &np, &[0x23; 32], &pc), "a new companion nonce");
+        assert!(!auth::companion_proof_ok(&key, 47411, &nc, &np, &pc), "the nonces swapped");
+        assert!(!auth::plugin_proof_ok(&key, 47411, &nc, &np, &pc), "the companion's proof is not a plugin's");
+        assert!(!auth::companion_proof_ok(&key, 47411, &np, &nc, &pp), "nor the other way round");
+        assert!(!auth::companion_proof_ok(&key, 47411, &np, &nc, &pc[..31]));
+        assert!(!auth::companion_proof_ok(&key, 47411, &np, &nc, &[]));
+        let mut flipped = pc;
+        flipped[31] ^= 0x80;
+        assert!(!auth::companion_proof_ok(&key, 47411, &np, &nc, &flipped));
     }
 
     #[test]

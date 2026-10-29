@@ -316,7 +316,12 @@ fn start_capture(w: &Want) -> Result<Feed, String> {
     } else {
         if let Err(e) = super::available() {
             crate::log(&format!("audio return REFUSED: this Windows cannot capture a single app ({e})"));
-            return Err(format!("this Windows cannot capture a single app: {e}"));
+            // (28 oct.) hors de Windows, le Return est le seul chemin : le dire plutot que « Windows »
+            return Err(if cfg!(windows) {
+                format!("this Windows cannot capture a single app: {e}")
+            } else {
+                "no Uppwind Link Return plugin is connected: put it on the DAW's master track".to_string()
+            });
         }
         // seulement un DAW de la liste blanche (ou la tonalite d'essai que le compagnon a lancee lui-meme)
         match super::procs::pick(&w.target, &super::procs::list(), false, w.test_tone) {

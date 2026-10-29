@@ -10,8 +10,10 @@
 //!   lisent. Ce secret n'est PAS le jeton du studio : un plugin ne peut ni filmer ni cliquer, il ne parle que de son et
 //!   de notes. --no-plugins : pas d'ecoute.
 //! - Une connexion qui ne vient pas de 127.0.0.1 est fermee ; 16 connexions au plus a la fois ; la premiere trame doit
-//!   etre HELLO (2 s, 1 Ko au plus), avec le bon secret (compare en temps constant) ; apres 5 secrets faux en 30 s, les
-//!   faux sont ralentis (1 s) et refuses pendant 30 s, le bon passe toujours.
+//!   etre HELLO (2 s, 1 Ko au plus). (29 oct., protocole v2) Le secret ne circule plus : le compagnon prouve qu'il le
+//!   connait (CHALLENGE), le plugin aussi (AUTH, 2 s), verifie en temps constant avant toute trame (conn.rs) ; apres 5
+//!   preuves fausses en 30 s, les fausses sont ralenties (1 s) et refusees pendant 30 s, la bonne passe toujours. Un
+//!   plugin v1 (le secret en clair) est refuse ; le studio le dit (« notice », Hub::note_old).
 //! - Le studio (session.rs, apres l'appairage seulement) :
 //!   {"type":"instances"} → {"type":"instances","list":[{id,kind,name,host,pid,rate,block,…}]}
 //!   {"type":"audio","action":"start","target":"plugin"|"plugin:<id>",…} → le son d'un Return, en paquets « UWA1 »
@@ -241,11 +243,29 @@ struct Guard {
     locked_until: Option<Instant>,
 }
 
+/// (29 oct.) Un plugin d'avant (protocole v1, le secret en clair) qui a essaye : le studio le dit, une fois par
+/// instance (il reessaie toutes les 2 s).
+struct OldPlugin {
+    kind: p::Kind,
+    name: String,
+    host: String,
+    pid: u32,
+    instance: u64,
+    at: Instant,
+}
+
+/// Les plugins d'avant sont oublies apres ce temps (et au plus OLD_MAX sont gardes).
+pub const OLD_KEEP: Duration = Duration::from_secs(600);
+pub const OLD_MAX: usize = 16;
+
 pub struct Hub {
     pub port: u16,
     secret: [u8; p::SECRET_LEN],
     instances: Mutex<HashMap<u64, Arc<Instance>>>,
     guard: Mutex<Guard>,
+    old: Mutex<Vec<OldPlugin>>,
+    /// +1 a chaque plugin d'avant de plus : les connexions du studio le disent (session.rs, « notice »)
+    notices: AtomicU64,
     serial: AtomicU64,
     /// combien de Notes sont connectes (les connexions du studio lisent alors toutes les 1 ms, pas 10)
     notes: AtomicU64,
@@ -279,6 +299,8 @@ impl Hub {
             secret,
             instances: Mutex::new(HashMap::new()),
             guard: Mutex::new(Guard { failures: 0, window: Instant::now(), locked_until: None }),
+            old: Mutex::new(Vec::new()),
+            notices: AtomicU64::new(0),
             serial: AtomicU64::new(0),
             notes: AtomicU64::new(0),
             returns_gen: AtomicU64::new(0),
@@ -324,8 +346,48 @@ impl Hub {
         Ok(hub)
     }
 
+    /// (v1, pour reconnaitre un vrai plugin d'avant) le secret en clair, compare en temps constant
     pub(crate) fn secret_ok(&self, s: &[u8]) -> bool {
         p::ct_eq(s, &self.secret)
+    }
+
+    /// (v2) La preuve du compagnon pour ce HELLO (le port : celui qu'on ecoute, celui que le plugin a appele).
+    pub(crate) fn companion_proof(&self, plugin_nonce: &[u8; p::NONCE_LEN], companion_nonce: &[u8; p::NONCE_LEN]) -> [u8; p::PROOF_LEN] {
+        p::auth::companion_proof(&self.secret, self.port, plugin_nonce, companion_nonce)
+    }
+
+    /// (v2) La preuve du plugin est-elle la bonne ? (temps constant)
+    pub(crate) fn plugin_proof_ok(&self, companion_nonce: &[u8; p::NONCE_LEN], plugin_nonce: &[u8; p::NONCE_LEN], given: &[u8]) -> bool {
+        p::auth::plugin_proof_ok(&self.secret, self.port, companion_nonce, plugin_nonce, given)
+    }
+
+    /// (29 oct.) Un plugin d'avant a essaye. → true s'il est nouveau (le journal et le studio le disent alors).
+    pub(crate) fn note_old(&self, h: &p::Hello) -> bool {
+        let mut v = self.old.lock().unwrap_or_else(|e| e.into_inner());
+        v.retain(|o| o.at.elapsed() < OLD_KEEP);
+        if v.iter().any(|o| o.instance == h.instance && o.pid == h.pid) {
+            return false;
+        }
+        if v.len() >= OLD_MAX {
+            v.remove(0);
+        }
+        v.push(OldPlugin { kind: h.kind, name: h.name.clone(), host: h.host.clone(), pid: h.pid, instance: h.instance, at: Instant::now() });
+        self.notices.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Change a chaque plugin d'avant de plus.
+    pub fn notices_generation(&self) -> u64 {
+        self.notices.load(Ordering::SeqCst)
+    }
+
+    /// Les plugins d'avant des dernieres minutes (le studio les montre ; jamais leur secret, qu'on ne garde pas).
+    pub fn old_json(&self) -> Vec<Value> {
+        let v = self.old.lock().unwrap_or_else(|e| e.into_inner());
+        v.iter()
+            .filter(|o| o.at.elapsed() < OLD_KEEP)
+            .map(|o| json!({ "kind": o.kind.name(), "name": o.name, "host": o.host, "daw": crate::audio::procs::daw_of_exe(&o.host), "pid": o.pid, "reason": conn::OLD_PLUGIN }))
+            .collect()
     }
 
     pub(crate) fn locked(&self) -> bool {
@@ -408,7 +470,16 @@ impl Hub {
     }
 
     pub fn instances_json(&self) -> Value {
-        json!({ "type": "instances", "port": self.port, "list": self.list().iter().map(|i| i.json()).collect::<Vec<_>>() })
+        json!({ "type": "instances", "port": self.port, "list": self.list().iter().map(|i| i.json()).collect::<Vec<_>>(), "refused": self.old_json() })
+    }
+
+    /// (29 oct.) Ce que le studio montre d'un plugin d'avant refuse (None : rien de recent).
+    pub fn old_notice(&self) -> Option<Value> {
+        let list = self.old_json();
+        let first = list.first()?;
+        let daw = first["daw"].as_str().map(|d| if d == "fl" { "FL Studio" } else { "Ableton Live" }).unwrap_or("your DAW");
+        let message = format!("An older Uppwind Link plugin ({} in {daw}) cannot connect to this companion: reinstall the plugins and restart your DAW.", first["name"].as_str().unwrap_or("Uppwind Link"));
+        Some(json!({ "type": "notice", "code": "old-plugin", "message": message, "plugins": list }))
     }
 
     /// Le studio demande le son d'un DAW (« auto », « live », « fl ») : un Return connecte de ce DAW passe avant la capture
@@ -543,6 +614,16 @@ pub fn available() -> bool {
 /// Un Notes est connecte : une note du studio ne doit pas attendre le repos de 10 ms de la connexion.
 pub fn notes_connected() -> bool {
     HUB.get().map(|h| h.notes_connected()).unwrap_or(false)
+}
+
+/// (29 oct.) La generation des avis (un plugin d'avant refuse) : une lecture atomique, a chaque tour des connexions.
+pub fn notices_generation() -> u64 {
+    HUB.get().map(|h| h.notices_generation()).unwrap_or(0)
+}
+
+/// L'avis lui-meme, quand la generation a change.
+pub fn old_notice() -> Option<Value> {
+    hub().and_then(|h| h.old_notice())
 }
 
 pub fn instances_json() -> String {

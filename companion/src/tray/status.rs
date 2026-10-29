@@ -118,7 +118,7 @@ pub struct StatusModel {
     pub sandbox: Option<String>,
     /// le serveur tourne : son port (0 : pas lance, l'essai de la fenetre)
     pub port: u16,
-    /// UWC-<port>-<jeton> : montre dans la fenetre et copie par le bouton, jamais dans une adresse
+    /// (29 oct.) UWC2-<port>-<jeton> : montre dans la fenetre et copie par le bouton, jamais dans une adresse
     pub code: String,
     pub live: Live,
     pub daws: Vec<DawLine>,
@@ -170,7 +170,7 @@ pub fn model(r: &Report, port: u16, token: &str, live: Live, audio_available: Re
         version: env!("CARGO_PKG_VERSION").into(),
         sandbox,
         port,
-        code: if port > 0 && !token.is_empty() { format!("UWC-{port}-{token}") } else { String::new() },
+        code: if port > 0 && !token.is_empty() { crate::security::pairing_code(port, token) } else { String::new() },
         live,
         daws: daws_of(r),
         ports: Ports { link, back, near, loopmidi_installed: r.midi.loopmidi.is_some(), loopmidi_running: r.midi.loopmidi_running },
@@ -233,7 +233,7 @@ mod tests {
         let m = model(&r, 0, "abc", Live::default(), Ok(10.0), false, None);
         assert_eq!(m.code, "", "no server, no code");
         let m = model(&r, 47410, "abc", Live::default(), Err("build 18363".into()), true, None);
-        assert_eq!(m.code, "UWC-47410-abc");
+        assert_eq!(m.code, "UWC2-47410-abc");
         assert!(m.audio.trouble.as_deref().is_some_and(|t| t.contains("cannot capture")), "{:?}", m.audio);
         assert!(m.daws.is_empty() && !m.ports.ok());
     }
