@@ -38,6 +38,10 @@ pub enum Job {
     Autostart(bool),
     /// la fenetre d'installation, lancee depuis la fenetre d'etat
     SetupAgain,
+    /// (9 nov., audit F1) armer ou desarmer le compagnon qui tourne
+    Arm(bool),
+    /// (9 nov., audit F2) un nouveau code d'appairage
+    NewCode,
 }
 
 #[derive(Debug)]
@@ -50,6 +54,10 @@ pub enum Done {
     Removed(Removal),
     Autostart(Result<Vec<String>, String>),
     Launched(Result<(), String>),
+    /// (9 nov.) l'armement maintenant
+    Armed(Result<bool, String>),
+    /// (9 nov.) le nouveau code (Err : il sert, mais n'a pas pu etre garde dans le fichier d'etat)
+    NewCode(Result<(), String>),
 }
 
 /// Une fenetre, vue de sa page.
@@ -239,6 +247,10 @@ impl View for StatusPage {
             Request::Autostart(on) => vec![Out::Run(Job::Autostart(on))],
             Request::SetupAgain => vec![Out::Run(Job::SetupAgain)],
             Request::Close => vec![Out::Close],
+            // (9 nov., audit F1/F2) seulement sur un compagnon qui tourne (l'essai de la fenetre n'a pas de serveur)
+            Request::Arm(_) | Request::NewCode if !self.model.as_ref().is_some_and(|m| m.port > 0) => vec![error("Uppwind Link is not running.")],
+            Request::Arm(on) => vec![Out::Run(Job::Arm(on))],
+            Request::NewCode => vec![Out::Run(Job::NewCode)],
             _ => vec![],
         }
     }
@@ -248,6 +260,24 @@ impl View for StatusPage {
                 self.busy = false;
                 let out = vec![Out::Send(json!({ "type": "status", "status": m }))];
                 self.model = Some(*m);
+                out
+            }
+            // (9 nov.) la page l'apprend tout de suite, puis la fenetre relue le confirme
+            Done::Armed(Ok(armed)) => {
+                if let Some(m) = self.model.as_mut() {
+                    m.remote.armed = armed;
+                }
+                let mut out = vec![Out::Send(json!({ "type": "armed", "armed": armed }))];
+                out.extend(self.refresh());
+                out
+            }
+            Done::Armed(Err(e)) => vec![error(&e)],
+            Done::NewCode(r) => {
+                let mut out = vec![match r {
+                    Ok(()) => Out::Send(json!({ "type": "newcode" })),
+                    Err(e) => error(&e),
+                }];
+                out.extend(self.refresh());
                 out
             }
             Done::Status(Err(e)) => {
@@ -384,6 +414,8 @@ pub fn run_job(job: Job, progress: &dyn Fn(&str)) -> Done {
             let exe = if p.dirs.exe().is_file() { p.dirs.exe() } else { std::env::current_exe().map_err(|e| e.to_string())? };
             wizard::spawn_detached(&exe, &args).map(|_| ())
         })),
+        Job::Arm(on) => Done::Armed(crate::tray::arm(on, "the status window")),
+        Job::NewCode => Done::NewCode(crate::tray::new_code()),
     }
 }
 
@@ -443,7 +475,7 @@ mod tests {
         assert!(matches!(s.on_request(Request::CopyCode)[0], Out::Send(ref v) if v["type"] == "error"));
         let probe = crate::setup::env::Probe::empty(crate::setup::env::Paths::in_root(std::path::Path::new("Z:\\nowhere")));
         let r = crate::tray::status::report(&probe);
-        let m = crate::tray::status::model(&r, 47410, "abc", Default::default(), Ok(1.0), true, None);
+        let m = crate::tray::status::model(&r, 47410, "abc", Default::default(), Default::default(), Ok(1.0), true, None);
         let out = s.on_done(Done::Status(Ok(Box::new(m.clone()))));
         assert_eq!(sends(&out)[0]["status"]["code"], "UWC2-47410-abc");
         assert!(matches!(&s.on_request(Request::CopyCode)[0], Out::Copy(c) if c == "UWC2-47410-abc"));

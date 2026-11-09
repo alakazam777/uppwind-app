@@ -44,6 +44,9 @@ pub const CLOSE_LOCKED: u16 = 4429;
 pub const CLOSE_PROTOCOL: u16 = 4400;
 /// (29 oct.) un hello v1 (le jeton en clair) alors qu'un studio a deja fait la v2 avec ce jeton : « reload the studio »
 pub const CLOSE_V1_REFUSED: u16 = 4426;
+/// (9 nov., audit F2) le code d'appairage a change (le studio s'est desappaire, ou la personne a demande un nouveau
+/// code) : les connexions appairees avec l'ancien se ferment, le studio oublie le code
+pub const CLOSE_REVOKED: u16 = 4403;
 /// (29 oct.) la poignee de main de l'appairage : 2 (le defi et les preuves) ; un hello sans « v » est la v1
 pub const AUTH_VERSION: u32 = 2;
 pub const DEMO_ID: u64 = 1;
@@ -181,6 +184,12 @@ struct Conn<'a> {
     link: Option<crate::link_relay::Relay>,
     /// (29 oct.) la generation des avis (un plugin d'avant refuse, plugin_link) deja dite a ce studio
     notices: u64,
+    /// (9 nov., audit F1) la generation de l'armement deja dite a ce studio (arming.rs)
+    arm_gen: u64,
+    /// (9 nov., audit F2) la generation des codes au debut de cette connexion : un nouveau code la ferme
+    rev_gen: u64,
+    /// (9 nov., F4) le son du DAW partait-il au dernier tour (la fenetre d'etat et l'icone le disent) ?
+    audio_was: bool,
 }
 
 enum Fatal {
@@ -350,7 +359,21 @@ impl<'a> Conn<'a> {
         Ok(())
     }
 
+    /// (9 nov., audit F1) Desarme : rien n'est filme, injecte ni ecoute ; la fenetre d'etat note la demande.
+    fn disarmed(&self) -> bool {
+        if self.sh.arming.armed() {
+            return false;
+        }
+        self.sh.arming.note_refused();
+        true
+    }
+
     fn on_watch(&mut self, id: u64, fps: Option<f64>, quality: Option<u8>) -> Result<(), Fatal> {
+        if self.disarmed() {
+            self.stop_watch(None)?;
+            crate::log("REFUSED a capture: remote control is off (allow it in the status window, the icon's menu or the console)");
+            return self.send_text(json!({ "type": "unwatched", "id": id, "reason": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string());
+        }
         let t0 = Instant::now();
         self.stop_watch(None)?;
         // seulement une fenetre de plugin de Live, jamais une autre fenetre de la machine
@@ -397,15 +420,27 @@ impl<'a> Conn<'a> {
         self.inj.set_mode(self.inj.mode); // (rien en cours d'une fenetre a l'autre)
         self.pointer = None;
         self.acked = self.seq;
+        crate::tray::status::watch_started(&self.watch.as_ref().map(|w| w.title.clone()).unwrap_or_default()); // (9 nov., F4)
         Ok(())
     }
 
     fn stop_watch(&mut self, reason: Option<&str>) -> Result<(), Fatal> {
+        self.stop_watch_with(reason, None)
+    }
+
+    /// `code` : (9 nov.) « disarmed » quand c'est l'armement qui l'arrete (le studio le reconnait).
+    fn stop_watch_with(&mut self, reason: Option<&str>, code: Option<&str>) -> Result<(), Fatal> {
         if let Some(mut w) = self.watch.take() {
             w.tx = None; // le fil de capture s'arrete
             crate::log(&format!("unwatch \"{}\" ({} frames sent)", w.title, w.sent));
+            crate::tray::status::watch_stopped(); // (9 nov., F4)
+            self.inj.forget(); // (9 nov.) plus de glisser ni de geste FOCUS en cours pour une fenetre qu'on ne suit plus
             if let Some(r) = reason {
-                self.send_text(json!({ "type": "unwatched", "id": w.id, "reason": r }).to_string())?;
+                let mut m = json!({ "type": "unwatched", "id": w.id, "reason": r });
+                if let Some(c) = code {
+                    m["code"] = json!(c);
+                }
+                self.send_text(m.to_string())?;
             }
         }
         Ok(())
@@ -492,6 +527,11 @@ impl<'a> Conn<'a> {
     }
 
     fn on_input(&mut self, raw: RawInput, recv: f64, merged: u64) -> Result<(), Fatal> {
+        // (9 nov., audit F1) desarme : aucun geste n'est injecte, quel qu'il soit
+        if self.disarmed() {
+            self.stats.refused += 1;
+            return self.input_ack(&raw, recv, now_f(), merged, Some(crate::arming::REFUSAL));
+        }
         let ev = match protocol::validate_input(&raw) {
             Ok(e) => e,
             Err(e) => {
@@ -548,6 +588,7 @@ impl<'a> Conn<'a> {
                     self.pointer = Some(p);
                 }
                 if o.applied {
+                    crate::tray::status::input_now(); // (9 nov., F4) la fenetre d'etat et l'icone le disent
                     self.input_n = raw.n.unwrap_or(self.input_n + 1);
                     self.latest_input.store(self.input_n, Ordering::SeqCst);
                     // une image au plus vite, en laissant au plugin le temps de lire le geste et de se redessiner
@@ -565,6 +606,45 @@ impl<'a> Conn<'a> {
                 self.input_ack(&raw, recv, inj, merged, Some(&e))
             }
         }
+    }
+
+    /// (9 nov., F4) Le son du DAW vient de partir ou de s'arreter pour cette connexion : la fenetre d'etat et l'icone.
+    fn report_activity(&mut self) {
+        let on = self.audio.is_some();
+        if on != self.audio_was {
+            self.audio_was = on;
+            crate::tray::status::audio_active(on);
+        }
+    }
+
+    /// (9 nov., audit F2) Un nouveau code : cette connexion, appairee avec l'ancien, se ferme (4403).
+    /// (9 nov., audit F1) L'armement a change : le studio le sait ; desarme, la capture, les gestes et le son s'arretent
+    /// tout de suite (sans attendre la prochaine demande du studio).
+    fn poll_arming(&mut self) -> Result<(), Fatal> {
+        if self.sh.revoked.load(Ordering::SeqCst) != self.rev_gen {
+            crate::log("pairing: a studio paired with the old pairing code: disconnected");
+            self.close(CLOSE_REVOKED, "new pairing code");
+            return Err(Fatal::Closed);
+        }
+        let g = self.sh.arming.generation();
+        if g == self.arm_gen {
+            return Ok(());
+        }
+        self.arm_gen = g;
+        let armed = self.sh.arming.armed();
+        self.send_text(json!({ "type": "armed", "armed": armed }).to_string())?;
+        if !armed {
+            self.stop_watch_with(Some(crate::arming::REFUSAL), Some(crate::arming::CODE))?;
+            if let Some(f) = self.audio.take() {
+                crate::log(&format!("audio return stopped: remote control is off ({}, {} packets sent)", f.label, f.sent));
+                let off = json!({ "type": "audio", "state": "off", "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string();
+                crate::tray::status::audio_reply(&off);
+                self.send_text(off)?;
+            }
+            self.inj.forget();
+            self.last_input = None;
+        }
+        Ok(())
     }
 
     /// (29 oct.) Un plugin d'avant (protocole v1) a ete refuse : le studio le dit (« notice »), une fois par nouveau venu.
@@ -638,6 +718,11 @@ impl<'a> Conn<'a> {
             },
             ClientMsg::Input(raw) => self.on_input(raw, recv, 0),
             ClientMsg::Audio { action, target, rate, format, ms } => {
+                // (9 nov., audit F1) desarme : le son du DAW ne part pas (arreter, lui, marche toujours)
+                if action == "start" && self.disarmed() {
+                    crate::log("REFUSED the audio return: remote control is off");
+                    return self.send_text(json!({ "type": "audio", "state": "off", "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string());
+                }
                 let r = crate::audio::feed::on_request(&mut self.audio, &action, target.as_deref(), rate, format.as_deref(), ms, self.sh.demo, crate::audio::test_tone());
                 crate::tray::status::audio_reply(&r); // (24 oct.) la fenetre d'etat : une capture qui echoue
                 self.send_text(r)
@@ -670,6 +755,16 @@ impl<'a> Conn<'a> {
                     Ok(()) => Ok(()),
                     Err(e) => self.send_text(protocol::error("link", &e)),
                 }
+            }
+            // (9 nov., audit F2) le studio se desappaire : le compagnon change de code (l'ancien ne marche plus, nulle part),
+            // puis ferme toutes les connexions appairees avec lui (poll_arming), celle-ci comprise
+            ClientMsg::Unpair => {
+                crate::log("pairing: the studio unpaired: making a new pairing code");
+                let mut m = json!({ "type": "unpaired", "ok": true });
+                if let Err(e) = self.sh.new_code("the studio unpaired") {
+                    m["warning"] = json!(e);
+                }
+                self.send_text(m.to_string())
             }
             ClientMsg::Routes => {
                 // un fil par demande (jusqu'a 1,5 s si Live se tait) : comptes avec Open/Close, pour qu'une rafale ne
@@ -814,13 +909,14 @@ fn editor_request(path: &str, open: bool, known: Option<String>) -> String {
 
 /// (29 oct.) La premiere poignee de main v2 reussie avec ce jeton : un hello v1 (le jeton en clair) est refuse desormais,
 /// et le fichier d'etat le garde (« pairingV2 », d'un lancement a l'autre, tant que le jeton ne change pas).
-fn note_v2(sh: &Shared) {
-    if sh.pairing_v2.swap(true, Ordering::SeqCst) {
+fn note_v2(sh: &Shared, token: &str) {
+    // (9 nov.) un nouveau code pendant cette poignee de main : la preuve portait sur l'ancien, rien a noter pour le neuf
+    if sh.token() != token || sh.pairing_v2.swap(true, Ordering::SeqCst) {
         return;
     }
     crate::log("pairing: a studio proved the pairing code (v2); a studio that sends the code in clear (v1) is refused from now on");
     if let Some(p) = &sh.state {
-        if let Err(e) = crate::state_file::mark_pairing_v2(p, &sh.token) {
+        if let Err(e) = crate::state_file::mark_pairing_v2(p, token) {
             crate::log(&format!("warning: cannot note it in {} ({e})", crate::shown_path(p)));
         }
     }
@@ -877,6 +973,9 @@ pub fn serve(listener: TcpListener, sh: Arc<Shared>, max: usize) {
 pub fn run(stream: TcpStream, sh: Arc<Shared>) {
     // les gestes partent tout de suite (pas d'algorithme de Nagle sur les petits messages)
     let _ = stream.set_nodelay(true);
+    // (9 nov., audit F2) la generation des codes avant meme de lire le jeton : un nouveau code pendant la poignee de main
+    // ferme aussi cette connexion
+    let rev_gen = sh.revoked.load(Ordering::SeqCst);
     let Some((ws, origin)) = handshake(stream, &sh) else { return };
     let _ = ws.get_ref().set_nonblocking(true);
     let (ed_tx, ed_rx) = mpsc::channel();
@@ -902,6 +1001,9 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         audio: None,
         link: None,
         notices: 0,
+        arm_gen: 0,
+        rev_gen,
+        audio_was: false,
     };
     crate::log(&format!("studio connected from {origin}: waiting for the pairing proof"));
 
@@ -963,11 +1065,12 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     }
                 };
                 let now = Instant::now();
-                let key = security::hex32(&sh.token);
+                let current = sh.token(); // (9 nov.) le jeton peut changer (un nouveau code) : celui de maintenant
+                let key = security::hex32(&current);
                 let ok = match (&studio, key) {
                     (Some((ns, pf)), Some(k)) => security::studio_proof_ok(&k, sh.port, &nonce_c, ns, pf),
                     (Some(_), None) => false,
-                    (None, _) => token.as_deref().map(|t| security::token_eq(t, &sh.token)).unwrap_or(false),
+                    (None, _) => token.as_deref().map(|t| security::token_eq(t, &current)).unwrap_or(false),
                 };
                 let mut guard = sh.guard.lock().unwrap();
                 if !ok {
@@ -995,6 +1098,11 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     crate::log(&format!("note: the studio speaks protocol {:?}, the companion {PROTOCOL_VERSION}", version));
                 }
                 let (live_on, _) = c.windows();
+                // (9 nov., audit F1) ce studio compte (les minutes sans studio s'arretent), puis l'etat de l'armement tel
+                // qu'il le lit ; tout changement ensuite lui est dit (« armed », poll_arming)
+                sh.arming.session_opened();
+                c.arm_gen = sh.arming.generation();
+                let armed = sh.arming.armed();
                 let mut hello = json!({
                     "type": "hello", "version": PROTOCOL_VERSION, "companion": env!("CARGO_PKG_VERSION"),
                     "capture": if sh.demo { "demo" } else { sh.capture.as_deref().unwrap_or("wgc") },
@@ -1008,6 +1116,9 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     "plugins": crate::plugin_link::available(),
                     // (25 oct.) le lien du studio par le canal local du script de Live (« link », « routes ») : sans loopMIDI
                     "linkTransport": true,
+                    // (9 nov., audit F1) la capture, les gestes et le son : seulement armes dans le compagnon (« armed »
+                    // suit chaque changement) ; (audit F2) « unpair » fait changer le code du compagnon
+                    "arming": true, "armed": armed, "unpair": true,
                 });
                 // (29 oct., v2) la preuve du compagnon : le studio la verifie avant de rien envoyer d'autre
                 if let (Some((ns, _)), Some(k)) = (&studio, key) {
@@ -1015,10 +1126,11 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     hello["proof"] = json!(security::hex(&security::companion_proof_for_studio(&k, sh.port, ns, &nonce_c)));
                 }
                 if c.send_text(hello.to_string()).is_err() {
+                    sh.arming.session_closed();
                     return;
                 }
                 if v2 {
-                    note_v2(&sh);
+                    note_v2(&sh, &current);
                     crate::log(&format!("PAIRED with {origin} (both proved the pairing code)"));
                 } else {
                     crate::log(&format!("PAIRED with {origin} (an older studio: the pairing code came in clear; refused as soon as a studio proves it)"));
@@ -1095,9 +1207,10 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 break;
             }
         }
-        if c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
+        if c.poll_arming().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
             break;
         }
+        c.report_activity();
         // 1 ms quand une fenetre est suivie ou que le son du DAW part (les gestes et les paquets de 5 ms partent au plus
         // 1 ms apres leur arrivee) ; (25 oct.) et quand un plugin Uppwind Link Notes attend des notes (mesure : sinon
         // une note jouee « tout de suite » attendait jusqu'a 10 ms ici)
@@ -1110,8 +1223,10 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
     if let Some(f) = c.audio.take() {
         crate::log(&format!("audio return stopped with the connection ({}, {} packets sent)", f.label, f.sent));
     }
+    c.report_activity(); // (9 nov., F4) plus de son pour cette connexion
     crate::log(&format!("studio {origin} disconnected"));
     crate::tray::status::closed(&origin); // (24 oct.) la fenetre d'etat
+    sh.arming.session_closed(); // (9 nov., audit F1) les minutes sans studio comptent a partir d'ici
 }
 
 /// De vraies connexions sur 127.0.0.1 (un port au hasard), le compagnon en mode demo : ce que le studio vivra.
@@ -1141,11 +1256,17 @@ mod tests {
 
     /// (29 oct.) … avec un fichier d'etat d'essai (pairingV2 y est note) et ce qu'il disait au demarrage.
     fn server_full(demo: bool, failures: u32, max: usize, state: Option<std::path::PathBuf>, pairing_v2: bool) -> u16 {
+        // (9 nov.) comme main.rs : --demo est arme (rien de reel n'est filme ni pilote)
+        server_shared(demo, demo, failures, max, state, pairing_v2).0
+    }
+
+    /// (9 nov., audit F1/F2) … arme ou non, et le `Shared` du serveur (pour armer, desarmer, changer de code).
+    fn server_shared(demo: bool, armed: bool, failures: u32, max: usize, state: Option<std::path::PathBuf>, pairing_v2: bool) -> (u16, Arc<Shared>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let sh = Arc::new(Shared {
             port,
-            token: TOKEN.into(),
+            token: std::sync::RwLock::new(TOKEN.into()),
             allow: Allowlist::new(true, &[]),
             guard: Mutex::new(PairingGuard::new(failures, Duration::from_secs(30))),
             capture: None,
@@ -1153,9 +1274,12 @@ mod tests {
             test_window: None,
             pairing_v2: std::sync::atomic::AtomicBool::new(pairing_v2),
             state,
+            arming: crate::arming::Arming::new(armed, !demo),
+            revoked: AtomicU64::new(0),
         });
-        std::thread::spawn(move || serve(l, sh, max));
-        port
+        let s = sh.clone();
+        std::thread::spawn(move || serve(l, s, max));
+        (port, sh)
     }
 
     type Client = WebSocket<TcpStream>;
@@ -1687,6 +1811,128 @@ mod tests {
         let mut ws = good(port);
         ws.send(Message::text(v1)).unwrap();
         assert_eq!(text(&mut ws)["code"], "v1-refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (9 nov.) Un studio qui connait ce jeton-ci (apres un nouveau code) → appaire, ou le code de la fermeture.
+    fn pair_v2_token(port: u16, token: &str) -> Result<(Client, serde_json::Value), Option<u16>> {
+        let k = security::hex32(token).expect("a token of 64 lowercase hex");
+        let (mut ws, nc) = opened(port);
+        let ns = security::new_nonce();
+        let proof = security::studio_proof(&k, port, &nc, &ns);
+        ws.send(Message::text(json!({"type": "hello", "version": 1, "v": 2, "nonce": security::hex(&ns), "proof": security::hex(&proof)}).to_string())).unwrap();
+        let h = text(&mut ws);
+        if h["type"] != "hello" {
+            return Err(close_code(&mut ws));
+        }
+        Ok((ws, h))
+    }
+
+    /// Ce qui arrive pendant `ms` : (des images ou du son, des messages texte).
+    fn drain(ws: &mut Client, ms: u64) -> (usize, Vec<serde_json::Value>) {
+        ws.get_ref().set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let (mut binary, mut texts) = (0, Vec::new());
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(ms) {
+            match ws.read() {
+                Ok(Message::Binary(_)) => binary += 1,
+                Ok(Message::Text(t)) => texts.push(serde_json::from_str(t.as_str()).unwrap()),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        ws.get_ref().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (binary, texts)
+    }
+
+    /// (9 nov., audit F1) Desarme (l'etat de chaque lancement) : un studio appaire ne filme, ne pilote ni n'ecoute rien, et
+    /// ne peut pas armer ; arme dans le compagnon, tout marche ; desarme, la capture et le son s'arretent tout de suite.
+    #[test]
+    fn a_disarmed_companion_captures_injects_and_listens_to_nothing_until_armed_on_the_machine() {
+        let (port, sh) = server_shared(true, false, 50, MAX_CONNECTIONS, None, false);
+        let (mut ws, h) = pair_v2(port);
+        assert_eq!((h["arming"].as_bool(), h["armed"].as_bool(), h["unpair"].as_bool()), (Some(true), Some(false), Some(true)), "{h}");
+        // la liste des fenetres marche (rien n'est filme)
+        ws.send(Message::text(r#"{"type":"list"}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "windows")["windows"][0]["id"], DEMO_ID);
+        ws.send(Message::text(json!({"type": "watch", "id": DEMO_ID, "fps": 30}).to_string())).unwrap();
+        let u = text_of(&mut ws, "unwatched");
+        assert_eq!((u["code"].as_str(), u["reason"].as_str()), (Some(crate::arming::CODE), Some(crate::arming::REFUSAL)), "{u}");
+        ws.send(Message::text(r#"{"type":"input","kind":"pointer","action":"down","x":5,"y":5,"n":1}"#.to_string())).unwrap();
+        let a = text_of(&mut ws, "inputack");
+        assert_eq!((a["ok"].as_bool(), a["error"].as_str()), (Some(false), Some(crate::arming::REFUSAL)), "{a}");
+        ws.send(Message::text(r#"{"type":"audio","action":"start","target":"live","rate":48000,"format":"f32","ms":5}"#.to_string())).unwrap();
+        let au = text_of(&mut ws, "audio");
+        assert_eq!((au["state"].as_str(), au["code"].as_str()), (Some("off"), Some(crate::arming::CODE)), "{au}");
+        assert!(sh.arming.asked_ago().is_some(), "the status window shows that the studio asked");
+        let (binary, _) = drain(&mut ws, 200);
+        assert_eq!(binary, 0, "no image, no sound");
+        // le studio ne peut pas armer : aucun message ne le fait
+        ws.send(Message::text(r#"{"type":"arm","on":true}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "error")["code"], "bad-message");
+        assert!(!sh.arming.armed());
+
+        // arme dans le compagnon : le studio l'apprend ; la capture, les gestes et le son marchent
+        assert!(sh.arming.set(true, "test"));
+        assert_eq!(text_of(&mut ws, "armed")["armed"], true);
+        ws.send(Message::text(json!({"type": "watch", "id": DEMO_ID, "fps": 30}).to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "watching")["id"], DEMO_ID);
+        ws.send(Message::text(r#"{"type":"input","kind":"pointer","action":"down","x":5,"y":5,"n":2}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "inputack")["ok"], true);
+        ws.send(Message::text(r#"{"type":"audio","action":"start","target":"live","rate":48000,"format":"f32","ms":5}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "audio")["state"], "on");
+
+        // desarme : sans que le studio demande rien, la capture et le son s'arretent, et il le sait
+        assert!(sh.arming.set(false, "test"));
+        assert_eq!(text_of(&mut ws, "armed")["armed"], false);
+        let u = text_of(&mut ws, "unwatched");
+        assert_eq!((u["id"].as_u64(), u["code"].as_str()), (Some(DEMO_ID), Some(crate::arming::CODE)), "{u}");
+        let au = text_of(&mut ws, "audio");
+        assert_eq!((au["state"].as_str(), au["code"].as_str()), (Some("off"), Some(crate::arming::CODE)), "{au}");
+        let (binary, _) = drain(&mut ws, 300);
+        assert_eq!(binary, 0, "nothing after the disarming");
+        ws.send(Message::text(r#"{"type":"input","kind":"pointer","action":"up","x":5,"y":5,"n":3}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "inputack")["ok"], false, "no gesture either");
+    }
+
+    /// (9 nov., audit F2) « Unpair » dans le studio change le code du compagnon : l'ancien ne marche plus nulle part, toutes
+    /// les connexions appairees avec lui se ferment (4403), le fichier d'etat garde le nouveau, et le compagnon se
+    /// desarme. Un nouveau code demande sur la machine (la fenetre d'etat, la console) fait de meme.
+    #[test]
+    fn unpair_makes_a_new_code_and_disconnects_every_studio_paired_with_the_old_one() {
+        let dir = std::env::temp_dir().join(format!("uwc-unpair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state.json");
+        crate::state_file::write(&state, &json!({"port": 1, "token": TOKEN, "pid": 1, "pairingV2": true})).unwrap();
+        let (port, sh) = server_shared(true, true, 50, MAX_CONNECTIONS, Some(state.clone()), true);
+        let (mut a, _) = pair_v2(port);
+        let (mut b, _) = pair_v2(port);
+        a.send(Message::text(r#"{"type":"unpair"}"#.to_string())).unwrap();
+        let u = text_of(&mut a, "unpaired");
+        assert_eq!(u["ok"], true, "{u}");
+        assert!(u.get("warning").is_none(), "the new code is saved: {u}");
+        assert_eq!(close_code(&mut a), Some(CLOSE_REVOKED));
+        assert_eq!(close_code(&mut b), Some(CLOSE_REVOKED), "the other studio too");
+        let new = sh.token();
+        assert!(security::token_well_formed(&new) && new != TOKEN, "a fresh code");
+        assert!(!sh.arming.armed(), "a new code disarms");
+        let saved = crate::state_file::read(&state).unwrap();
+        assert_eq!(saved["token"].as_str(), Some(new.as_str()), "the next start keeps the new code");
+        assert!(saved.get("pairingV2").is_none(), "no studio proved the new code yet");
+        // l'ancien code : refuse, en v2 comme en v1
+        assert_eq!(pair_v2_token(port, TOKEN).err(), Some(Some(CLOSE_BAD_TOKEN)));
+        let mut ws = good(port);
+        ws.send(Message::text(json!({"type": "hello", "version": 1, "token": TOKEN}).to_string())).unwrap();
+        assert_eq!(text(&mut ws)["code"], "bad-token");
+        assert_eq!(close_code(&mut ws), Some(CLOSE_BAD_TOKEN));
+        // le nouveau : accepte (desarme)
+        let (mut c, h) = pair_v2_token(port, &new).expect("the new code pairs");
+        assert_eq!(h["armed"], false);
+        // un nouveau code demande sur la machine : pareil
+        sh.new_code("test").unwrap();
+        assert_eq!(close_code(&mut c), Some(CLOSE_REVOKED));
+        assert_ne!(sh.token(), new);
+        assert_eq!(crate::state_file::read(&state).unwrap()["token"].as_str(), Some(sh.token().as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

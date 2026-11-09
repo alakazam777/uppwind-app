@@ -31,6 +31,7 @@
 // hors Windows, une bonne part du code (la capture WGC/DWM, la fenetre d'installation, l'icone) n'est pas appelee
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
+mod arming;
 mod audio;
 mod bench;
 mod capture;
@@ -65,7 +66,8 @@ mod wizard;
 use serde_json::json;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// La ligne de licence (GPL v3 « How to apply ») : la banniere, --help et --license.
@@ -85,7 +87,9 @@ pub const STATE_NAME: &str = ".uppwind-companion.json";
 
 pub struct Shared {
     pub port: u16,
-    pub token: String,
+    /// (9 nov., audit F2) le jeton : il change quand le studio se desappaire (« unpair ») ou quand la personne demande un
+    /// nouveau code (la fenetre d'etat, la console) ; lu par `token()`
+    pub token: RwLock<String>,
     pub allow: security::Allowlist,
     pub guard: Mutex<security::PairingGuard>,
     pub capture: Option<String>,
@@ -96,6 +100,42 @@ pub struct Shared {
     pub pairing_v2: std::sync::atomic::AtomicBool,
     /// le fichier d'etat ou le noter (« pairingV2 ») ; None : les essais
     pub state: Option<PathBuf>,
+    /// (9 nov., audit F1) la capture, les gestes et le son du DAW : seulement si la personne devant l'ordinateur l'a permis
+    pub arming: arming::Arming,
+    /// (9 nov., audit F2) avance a chaque nouveau code : les connexions appairees avec l'ancien se ferment (4403)
+    pub revoked: AtomicU64,
+}
+
+impl Shared {
+    /// Le jeton en cours.
+    pub fn token(&self) -> String {
+        self.token.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// (9 nov., audit F2) Un nouveau code : un jeton neuf, tout de suite le seul accepte ; les studios appaires avec
+    /// l'ancien sont deconnectes (4403) et doivent coller le nouveau ; le compagnon est desarme. Le fichier d'etat le
+    /// garde pour les lancements suivants. Err : le nouveau code sert, mais le fichier n'a pas pu le garder.
+    pub fn new_code(&self, by: &str) -> Result<(), String> {
+        let token = security::new_token();
+        *self.token.write().unwrap_or_else(|e| e.into_inner()) = token.clone();
+        self.pairing_v2.store(false, Ordering::SeqCst);
+        self.revoked.fetch_add(1, Ordering::SeqCst);
+        self.arming.set(false, "new pairing code");
+        log(&format!("pairing: NEW pairing code ({by}): the old one no longer works; every studio paired with it is disconnected"));
+        let Some(path) = &self.state else { return Ok(()) };
+        let saved = state_file::update(path, |v| {
+            v["token"] = json!(token);
+            if let Some(o) = v.as_object_mut() {
+                o.remove("pairingV2");
+            }
+            true
+        });
+        saved.map(|_| ()).map_err(|e| {
+            let msg = format!("the new code works now, but it could not be saved in {} ({e}): the old code would come back at the next start", shown_path(path));
+            log(&format!("warning: {msg}"));
+            msg
+        })
+    }
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -252,24 +292,20 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--license" => {
-                println!("Uppwind Link companion {}", env!("CARGO_PKG_VERSION"));
-                println!("{NOTICE}");
-                println!("Source code: {}", env!("CARGO_PKG_REPOSITORY"));
-                println!();
-                println!("{LICENSE_TEXT}");
-                println!();
-                println!("{EXCEPTION_TEXT}");
-                println!();
-                println!("{SCRIPTS_LICENSE_TEXT}");
-                println!();
-                println!("{NOTICES_TEXT}");
+                // (29 oct.) ecrit sans println! : une sortie fermee en route (`--license | head`) n'est pas une panique
+                use std::io::Write as _;
+                let mut t = format!(
+                    "Uppwind Link companion {}\n{NOTICE}\nSource code: {}\n\n{LICENSE_TEXT}\n\n{EXCEPTION_TEXT}\n\n{SCRIPTS_LICENSE_TEXT}\n\n{NOTICES_TEXT}\n",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("CARGO_PKG_REPOSITORY")
+                );
                 // (29 oct.) les plugins que cet exe embarque et installe : leurs notices voyagent avec eux
                 if !plugin_install::notices().is_empty() {
-                    println!();
-                    println!("{PLUGINS_EXCEPTION_TEXT}");
-                    println!();
-                    println!("{}", plugin_install::notices());
+                    t.push_str(&format!("\n{PLUGINS_EXCEPTION_TEXT}\n\n{}\n", plugin_install::notices()));
                 }
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(t.as_bytes());
+                let _ = out.flush();
                 std::process::exit(0);
             }
             "-h" | "--help" => {
@@ -415,6 +451,44 @@ fn load_token(path: &PathBuf, renew: bool) -> String {
         }
     }
     security::new_token()
+}
+
+/// (9 nov., audit F1/F2) Les commandes de la console, une ligne puis Entree : « arm » (le studio peut filmer et piloter
+/// les fenetres de plugins, et prendre le son du DAW), « disarm », « newcode » (un nouveau code d'appairage : l'ancien ne
+/// marche plus). Sans console (en fond), l'entree est vide : le fil s'arrete aussitot.
+fn console_commands(sh: Arc<Shared>) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            match line.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "arm" => {
+                    if !sh.arming.set(true, "the console") {
+                        println!("Remote control is already on.");
+                    }
+                }
+                "disarm" => {
+                    if !sh.arming.set(false, "the console") {
+                        println!("Remote control is already off.");
+                    }
+                }
+                "newcode" | "new code" => {
+                    let saved = sh.new_code("the console");
+                    println!();
+                    println!("NEW PAIRING CODE (paste it in the studio's Plugin window; the old one no longer works):");
+                    println!();
+                    println!("    {}", security::pairing_code(sh.port, &sh.token()));
+                    println!();
+                    if let Err(e) = saved {
+                        eprintln!("warning: {e}");
+                    }
+                }
+                "help" | "?" => println!("Commands: arm (allow remote control), disarm (stop it), newcode (a new pairing code)."),
+                other => println!("Unknown command {:?}. Commands: arm, disarm, newcode, help.", other.chars().take(20).collect::<String>()),
+            }
+        }
+    });
 }
 
 fn bind(port: Option<u16>) -> std::io::Result<TcpListener> {
@@ -722,6 +796,24 @@ fn main() {
     }
     println!();
     println!("Saved in {} (the same code next time; --new-token makes a new one and unpairs the studio).", shown_path(&state));
+    println!();
+    if args.demo {
+        println!("REMOTE CONTROL: on (demo mode: nothing real is captured or controlled).");
+    } else {
+        // (9 nov., audit F1) le studio ne filme ni ne pilote rien tant que la personne devant l'ordinateur ne l'a pas permis
+        println!("REMOTE CONTROL: off. The studio cannot capture plugin windows, send them gestures or take your DAW's sound");
+        println!("until you allow it here:");
+        let how = if !to_log {
+            "type  arm  and Enter (disarm stops it; newcode makes a new pairing code)"
+        } else if cfg!(windows) {
+            "the status window or the icon's menu (Remote control)"
+        } else {
+            "run the companion in a Terminal and type  arm  (in the background it stays off)"
+        };
+        println!("    {how}");
+        println!("It turns itself off after {} minutes without the studio, and at every start.", arming::IDLE_DISARM.as_secs() / 60);
+    }
+    println!();
     if args.demo {
         println!("DEMO MODE: one fake plugin window, no Live needed.");
     } else {
@@ -768,7 +860,7 @@ fn main() {
 
     let shared = Arc::new(Shared {
         port,
-        token,
+        token: RwLock::new(token),
         allow,
         guard: Mutex::new(security::PairingGuard::new(5, Duration::from_secs(30))),
         capture: args.capture.clone(),
@@ -776,14 +868,21 @@ fn main() {
         test_window,
         pairing_v2: std::sync::atomic::AtomicBool::new(pairing_v2),
         state: Some(state.clone()),
+        // (9 nov., audit F1) desarme a chaque lancement ; --demo : arme (rien de reel n'est filme ni pilote)
+        arming: arming::Arming::new(args.demo, !args.demo),
+        revoked: AtomicU64::new(0),
     });
+    // (9 nov., audit F1/F2) dans une console : « arm », « disarm », « newcode » (sans console, la fenetre d'etat et l'icone)
+    if !to_log {
+        console_commands(shared.clone());
+    }
     // (24 oct.) avec l'icone : l'icone et la fenetre d'etat sur un fil a elles (STA pour WebView2 ; ce fil-ci garde son
     // MTA) ; quand l'icone quitte, tout s'arrete. Le code n'y est que montre (la fenetre, le bouton Copy), jamais ecrit.
     #[cfg(windows)]
     if let (Some(mode), Some(guard)) = (app, guard) {
-        let token = shared.token.clone();
+        let sh = shared.clone();
         std::thread::spawn(move || {
-            let code = tray::run(mode, guard, port, token);
+            let code = tray::run(mode, guard, sh);
             state_file::on_exit();
             std::process::exit(code)
         });

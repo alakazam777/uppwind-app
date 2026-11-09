@@ -331,19 +331,62 @@
 
     // ── l'etat ─────────────────────────────────────────────────────────────────────────────────────────
     let helpOpen = false;
+    // (9 nov., audit F2) « New code… » demande une confirmation sur place (il deconnecte le studio)
+    let confirmNew = false;
+    const ago = (s) => (s < 60 ? 'just now' : `${Math.round(s / 60)} min ago`);
     function status(msg) {
+        // (9 nov., audit F1) arme ou desarme (ici, ou par le menu de l'icone) : tout de suite ; la relecture suit
+        if (msg.type === 'armed') {
+            if (W.last && W.last.status) {
+                const r = W.last.status.remote || {};
+                W.last.status.remote = Object.assign({}, r, { armed: !!msg.armed, asked_ago_s: msg.armed ? null : r.asked_ago_s });
+                status(W.last);
+            }
+            return;
+        }
+        // (9 nov., audit F2) le nouveau code : cache, comme toujours ; la relecture le montre
+        if (msg.type === 'newcode') {
+            W.reveal = false;
+            toast('New pairing code: the old one no longer works. Copy this one and paste it in the studio (Settings › Uppwind Link › Plugin windows).', 'is-neon');
+            return;
+        }
         if (msg.type !== 'status') return;
         W.last = msg;
         const s = msg.status;
         const L = s.live;
+        const R = s.remote || {};
         const cell = (k, ...v) => [h('div', { class: 'uw-cell-k' }, k), h('div', { class: 'uw-cell-v' }, ...v)];
         const when = L.last_paired ? new Date(L.last_paired * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '';
+        // (9 nov., audit F1) l'armement : sans lui, le studio ne filme, ne pilote ni n'ecoute rien. (F4) ce qui se passe.
+        const idle = R.idle_disarm_min || 10;
+        const activity = [];
+        if (L.watching) activity.push(`Capturing ${L.watching}`);
+        if (L.last_input && Date.now() / 1000 - L.last_input < 10) activity.push('gestures just now');
+        if (L.audio_streams > 0) activity.push('sending your DAW’s sound');
+        const remote = !s.port ? [h('div', { class: 'uw-small' }, 'Appears once Uppwind Link runs.')]
+            : R.armed ? [
+                st('is-ok', 'On · the studio can capture plugin windows, send them gestures and take your DAW’s sound'),
+                activity.length ? h('div', { class: 'uw-small' }, activity.join(' · ')) : null,
+                h('div', { class: 'uw-row' }, btn('Turn off', () => send('arm', { on: false }), 'uw-btn-sm'),
+                    h('span', { class: 'uw-small' }, R.idle_left_min != null ? `Turns itself off in ${R.idle_left_min} min if the studio does not come back.` : `Turns itself off after ${idle} min without the studio, and at every start.`)),
+            ] : [
+                st('is-warn', 'Off · the studio cannot capture plugin windows, send them gestures or take your DAW’s sound'),
+                R.asked_ago_s != null ? note('is-warn', `The studio asked for it ${ago(R.asked_ago_s)}.`) : null,
+                h('div', { class: 'uw-row' }, btn('Allow remote control', () => send('arm', { on: true }), 'uw-btn-sm uw-btn-primary'),
+                    h('span', { class: 'uw-small' }, `Until you turn it off, ${idle} min without the studio, or the next start.`)),
+            ];
+        const newCode = !s.code ? null : confirmNew
+            ? note('is-warn', h('p', null, 'A new pairing code disconnects the studio, and the old code stops working everywhere. You then paste the new one in the studio.'),
+                h('div', { class: 'uw-row' }, btn('Make a new code', () => { confirmNew = false; send('newcode'); }, 'uw-btn-sm uw-btn-danger'),
+                    btn('Cancel', () => { confirmNew = false; status(msg); }, 'uw-btn-sm')))
+            : h('button', { type: 'button', class: 'uw-link', onclick: () => { confirmNew = true; status(msg); } }, 'New code…');
         const studio = [
             L.sessions > 0 ? st('is-ok', `Paired · connected now${L.last_origin ? ` (${L.last_origin.replace(/^https?:\/\//, '')})` : ''}`)
                 : L.paired_ever ? st('is-ok', `Paired · last connected ${when}`) : st('is-warn', 'Not paired yet'),
             s.code ? codeBox(s.code) : h('div', { class: 'uw-small' }, 'The pairing code appears once Uppwind Link runs.'),
             h('div', { class: 'uw-row' }, btn('Open the studio', () => send('open', { link: 'studio' }), 'uw-btn-sm'),
                 h('span', { class: 'uw-small' }, 'Paste the code once: Settings › Uppwind Link › Plugin windows › Pair.')),
+            newCode,
         ];
         const daws = s.daws.length ? s.daws.map((d) => h('div', null,
             h('div', { class: 'uw-row' }, h('b', { class: 'uw-grow' }, d.name, d.versions.length ? h('span', { class: 'uw-small' }, ` · ${d.versions.join(', ')}`) : null),
@@ -368,7 +411,7 @@
                 s.audio.trouble ? h('p', null, h('b', null, 'Still silent? '), 'Install VB-CABLE, a virtual audio cable, and pick ', q('Virtual cable'),
                     ' in the studio: Settings › Uppwind Link › Audio return. ', h('button', { type: 'button', class: 'uw-link', onclick: () => send('open', { link: 'vbcable' }) }, 'VB-CABLE’s page')) : null) : null);
         const sb = s.sandbox ? note('is-warn uw-banner', h('b', null, 'Sandbox. '), `This Uppwind Link runs from ${s.sandbox}.`) : null;
-        render([sb, h('div', { class: 'uw-grid' }, cell('Studio', studio), cell('DAWs', daws), cell('MIDI ports', ports), cell('Sound', sound), cell('Help', help))],
+        render([sb, h('div', { class: 'uw-grid' }, cell('Remote control', remote), cell('Studio', studio), cell('DAWs', daws), cell('MIDI ports', ports), cell('Sound', sound), cell('Help', help))],
             [check('Start with Windows', s.autostart, (v) => send('autostart', { on: v })),
                 h('button', { type: 'button', class: 'uw-link', onclick: () => send('setup') }, 'Set up again…'),
                 h('span', { class: 'uw-sp' }), btn('Check again', () => send('recheck'), 'uw-btn-sm'), btn('Close', () => send('close'))],

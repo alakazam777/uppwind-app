@@ -358,6 +358,13 @@ impl Injector {
         self.drag.is_some() || !self.pending.is_empty()
     }
 
+    /// (9 nov., audit F1) Oublier le geste en cours (la fenetre n'est plus suivie, ou le compagnon vient d'etre desarme) :
+    /// rien n'est injecte pour le finir, rien n'est rejoue.
+    pub fn forget(&mut self) {
+        self.drag = None;
+        self.pending.clear();
+    }
+
     /// Le geste, dans la fenetre `top` (deja verifiee par la session).
     #[cfg(windows)]
     pub fn handle(&mut self, top: u64, ev: &InputEvent) -> Result<Outcome, String> {

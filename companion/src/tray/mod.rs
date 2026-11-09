@@ -8,7 +8,7 @@
 pub mod single;
 pub mod status;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Le compagnon avec son icone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,15 +19,46 @@ pub struct AppMode {
     pub replace: bool,
 }
 
-/// Le serveur de ce processus : son port, son jeton (la fenetre d'etat montre le code).
-static SERVER: OnceLock<(u16, String)> = OnceLock::new();
+/// Le serveur de ce processus : son port et son jeton (la fenetre d'etat montre le code), (9 nov.) son armement (la
+/// fenetre et l'icone l'arment) et son nouveau code.
+static SERVER: OnceLock<Arc<crate::Shared>> = OnceLock::new();
+
+/// (9 nov., audit F1) L'armement, tel que la fenetre d'etat le montre (sans serveur : desarme).
+pub fn remote() -> status::Remote {
+    let idle_disarm_min = crate::arming::IDLE_DISARM.as_secs() / 60;
+    match SERVER.get() {
+        Some(sh) => {
+            let armed = sh.arming.armed();
+            status::Remote {
+                armed,
+                idle_left_min: sh.arming.idle_left().map(|d| d.as_secs().div_ceil(60)),
+                asked_ago_s: if armed { None } else { sh.arming.asked_ago().map(|d| d.as_secs()) },
+                idle_disarm_min,
+            }
+        }
+        None => status::Remote { idle_disarm_min, ..Default::default() },
+    }
+}
 
 /// Le modele de la fenetre d'etat, maintenant (un travail de fond : la machine est relue).
 pub fn status_model() -> Result<status::StatusModel, String> {
     let p = crate::wizard::parts()?;
     let r = status::report(&p.probe);
-    let (port, token) = SERVER.get().cloned().unwrap_or((0, String::new()));
-    Ok(status::model(&r, port, &token, status::live(), crate::audio::available(), p.dirs.startup_link().exists(), crate::wizard::sandbox().map(|d| d.display().to_string())))
+    let (port, token) = SERVER.get().map(|s| (s.port, s.token())).unwrap_or((0, String::new()));
+    Ok(status::model(&r, port, &token, remote(), status::live(), crate::audio::available(), p.dirs.startup_link().exists(), crate::wizard::sandbox().map(|d| d.display().to_string())))
+}
+
+/// (9 nov., audit F1) La personne arme ou desarme, dans la fenetre d'etat ou le menu de l'icone → l'etat maintenant.
+pub fn arm(on: bool, by: &str) -> Result<bool, String> {
+    let sh = SERVER.get().ok_or("Uppwind Link is not running.")?;
+    sh.arming.set(on, by);
+    Ok(sh.arming.armed())
+}
+
+/// (9 nov., audit F2) « New code » dans la fenetre d'etat : l'ancien code ne marche plus, le studio est deconnecte.
+pub fn new_code() -> Result<(), String> {
+    let sh = SERVER.get().ok_or("Uppwind Link is not running.")?;
+    sh.new_code("the status window")
 }
 
 #[cfg(windows)]
@@ -63,6 +94,9 @@ mod win {
         crate::install::Dirs::from_env().map(|d| d.startup_link().exists()).unwrap_or(false)
     }
 
+    /// (9 nov., F4) L'infobulle de l'icone et la coche de l'armement sont relues a ce rythme.
+    const TIP_EVERY: Duration = Duration::from_secs(2);
+
     /// La boucle de l'icone (et de la fenetre d'etat) → le code de sortie. `smoke` : l'essai (pas de serveur, la
     /// fenetre se ferme 3 s apres s'etre dessinee).
     fn run_loop(mode: AppMode, guard: Option<&single::Guard>, port: u16, smoke: bool) -> i32 {
@@ -76,12 +110,16 @@ mod win {
         }
         let open = MenuItem::new("Open Uppwind Link", true, None);
         let studio = MenuItem::new("Open the studio", true, None);
+        // (9 nov., audit F1) l'armement : coche = le studio peut filmer et piloter les fenetres de plugins, et prendre le
+        // son du DAW ; il se decoche tout seul (10 min sans studio, nouveau code, relance)
+        let remote = CheckMenuItem::new("Remote control (capture, gestures, sound)", port > 0, super::remote().armed, None);
         let auto = CheckMenuItem::new("Start with Windows", true, autostart_on(), None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
-        if let Err(e) = menu.append_items(&[&open, &studio, &sep1, &auto, &sep2, &quit]) {
+        let sep3 = PredefinedMenuItem::separator();
+        if let Err(e) = menu.append_items(&[&open, &studio, &sep1, &remote, &sep2, &auto, &sep3, &quit]) {
             crate::log(&format!("tray: menu ({e})"));
         }
         let p = proxy.clone();
@@ -106,6 +144,27 @@ mod win {
                 None
             }
         };
+        // (9 nov., audit F4) l'infobulle et la coche suivent l'armement et ce qui se passe (capture, gestes, son), relus
+        // toutes les TIP_EVERY : l'armement change aussi ailleurs (la fenetre, la console, 10 min sans studio)
+        let mut tip = String::new();
+        let sync_tray = |tip: &mut String| {
+            if port == 0 {
+                return;
+            }
+            let armed = super::remote().armed;
+            if remote.is_checked() != armed {
+                remote.set_checked(armed);
+            }
+            let t = status::tooltip(port, armed, &status::live());
+            if *tip != t {
+                if let Some(tr) = tray.as_ref() {
+                    let _ = tr.set_tooltip(Some(&t));
+                }
+                *tip = t;
+            }
+        };
+        sync_tray(&mut tip);
+        let mut tip_tick: Option<Instant> = (port > 0).then(|| Instant::now() + TIP_EVERY);
         let data_dir = crate::install::Dirs::from_env().map(|d| crate::wizard::flow::webview_dir(&d)).unwrap_or_else(|_| crate::ui::setup_data_dir());
         let webview_ok = crate::ui::webview2_version().is_some();
         let mut win: Option<(UiWindow, StatusPage)> = None;
@@ -120,7 +179,8 @@ mod win {
             let mut outs: Vec<Out> = Vec::new();
             match event {
                 Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                    if smoke_end.is_some_and(|d| Instant::now() >= d) {
+                    let now = Instant::now();
+                    if smoke_end.is_some_and(|d| now >= d) {
                         if !rendered {
                             eprintln!("smoke test: the status window did not draw itself within 25 s");
                             code = 1;
@@ -128,10 +188,18 @@ mod win {
                         *cf = ControlFlow::Exit;
                         return;
                     }
-                    if let Some((_, page)) = win.as_mut() {
-                        outs = page.tick();
+                    // (9 nov., F4) l'infobulle et la coche de l'armement
+                    if tip_tick.is_some_and(|t| now >= t) {
+                        sync_tray(&mut tip);
+                        tip_tick = Some(now + TIP_EVERY);
                     }
-                    next_tick = win.as_ref().map(|_| Instant::now() + Duration::from_secs(3));
+                    // la fenetre d'etat, toutes les 3 s (seulement a son heure : l'infobulle a la sienne)
+                    if next_tick.is_some_and(|t| now >= t) {
+                        if let Some((_, page)) = win.as_mut() {
+                            outs = page.tick();
+                        }
+                        next_tick = win.as_ref().map(|_| now + Duration::from_secs(3));
+                    }
                 }
                 Event::UserEvent(UserEvent::Show) => show = true,
                 Event::UserEvent(UserEvent::Quit) => {
@@ -143,6 +211,13 @@ mod win {
                         show = true;
                     } else if id == *studio.id() {
                         crate::ui::open_url(crate::wizard::studio_url());
+                    } else if id == *remote.id() {
+                        // (9 nov., audit F1) la coche a deja bascule au clic : on arme (ou desarme) comme elle dit ; la
+                        // fenetre d'etat, si elle est ouverte, l'apprend tout de suite
+                        let armed = super::arm(remote.is_checked(), "the icon's menu").unwrap_or(false);
+                        remote.set_checked(armed);
+                        sync_tray(&mut tip);
+                        outs.push(Out::Send(serde_json::json!({ "type": "armed", "armed": armed })));
                     } else if id == *auto.id() {
                         // la case s'est deja cochee (ou decochee) au clic : on fait comme elle dit
                         let on = auto.is_checked();
@@ -180,6 +255,10 @@ mod win {
                     }
                     if let crate::ui::pages::Done::Autostart(r) = &d {
                         auto.set_checked(if r.is_ok() { autostart_on() } else { !auto.is_checked() });
+                    }
+                    // (9 nov., audit F1) arme (ou desarme) depuis la fenetre : la coche du menu et l'infobulle suivent
+                    if matches!(&d, crate::ui::pages::Done::Armed(_) | crate::ui::pages::Done::NewCode(_)) {
+                        sync_tray(&mut tip);
                     }
                     if let Some((_, page)) = win.as_mut() {
                         outs = page.on_done(d);
@@ -231,7 +310,7 @@ mod win {
             if win.is_none() {
                 next_tick = None;
             }
-            let wake = [next_tick, smoke_end].into_iter().flatten().min();
+            let wake = [next_tick, smoke_end, tip_tick].into_iter().flatten().min();
             *cf = match wake {
                 Some(t) => ControlFlow::WaitUntil(t),
                 None => ControlFlow::Wait,
@@ -244,8 +323,9 @@ mod win {
 
     /// Le compagnon avec son icone → le code de sortie. Sur un fil a lui (main.rs) : le serveur reste sur le fil
     /// principal, comme dans la console ; quand l'icone quitte, le processus s'arrete.
-    pub fn run(mode: AppMode, guard: single::Guard, port: u16, token: String) -> i32 {
-        let _ = SERVER.set((port, token));
+    pub fn run(mode: AppMode, guard: single::Guard, sh: Arc<crate::Shared>) -> i32 {
+        let port = sh.port;
+        let _ = SERVER.set(sh);
         let c = run_loop(mode, Some(&guard), port, false);
         drop(guard);
         c

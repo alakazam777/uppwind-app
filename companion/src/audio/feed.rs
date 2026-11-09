@@ -315,8 +315,12 @@ fn start_capture(w: &Want) -> Result<Feed, String> {
         (0, "Demo Synth".to_string())
     } else {
         if let Err(e) = super::available() {
-            crate::log(&format!("audio return REFUSED: this Windows cannot capture a single app ({e})"));
-            // (28 oct.) hors de Windows, le Return est le seul chemin : le dire plutot que « Windows »
+            // (28 oct.) hors de Windows, le Return est le seul chemin : le dire plutot que « Windows » (29 oct. : le journal aussi)
+            if cfg!(windows) {
+                crate::log(&format!("audio return REFUSED: this Windows cannot capture a single app ({e})"));
+            } else {
+                crate::log("audio return REFUSED: no Uppwind Link Return plugin is connected (on this system the companion cannot capture an app itself)");
+            }
             return Err(if cfg!(windows) {
                 format!("this Windows cannot capture a single app: {e}")
             } else {

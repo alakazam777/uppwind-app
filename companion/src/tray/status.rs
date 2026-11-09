@@ -24,9 +24,26 @@ pub struct Live {
     pub last_paired: Option<u64>,
     /// la derniere erreur de capture du retour audio (pas « aucun DAW ouvert »)
     pub audio_trouble: Option<String>,
+    /// (9 nov., audit F4) les fenetres de plugins filmees en ce moment (une par studio connecte, au plus) et la derniere
+    pub watches: u32,
+    pub watching: Option<String>,
+    /// (9 nov., audit F4) les connexions qui recoivent le son du DAW en ce moment
+    pub audio_streams: u32,
+    /// (9 nov., audit F4) le dernier geste injecte (secondes depuis 1970)
+    pub last_input: Option<u64>,
 }
 
-static LIVE: Mutex<Live> = Mutex::new(Live { sessions: 0, paired_ever: false, last_origin: None, last_paired: None, audio_trouble: None });
+static LIVE: Mutex<Live> = Mutex::new(Live {
+    sessions: 0,
+    paired_ever: false,
+    last_origin: None,
+    last_paired: None,
+    audio_trouble: None,
+    watches: 0,
+    watching: None,
+    audio_streams: 0,
+    last_input: None,
+});
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -53,10 +70,66 @@ pub fn closed(_origin: &str) {
     }
 }
 
+/// (9 nov., audit F4) session.rs : une fenetre de plugin est filmee (son titre « plugin/piste »).
+pub fn watch_started(title: &str) {
+    if let Ok(mut l) = LIVE.lock() {
+        l.watches += 1;
+        l.watching = Some(origin_text(title));
+    }
+}
+
+/// (9 nov., audit F4) session.rs : une capture s'est arretee.
+pub fn watch_stopped() {
+    if let Ok(mut l) = LIVE.lock() {
+        l.watches = l.watches.saturating_sub(1);
+        if l.watches == 0 {
+            l.watching = None;
+        }
+    }
+}
+
+/// (9 nov., audit F4) session.rs : le son du DAW part (true) ou s'arrete (false) pour une connexion.
+pub fn audio_active(on: bool) {
+    if let Ok(mut l) = LIVE.lock() {
+        l.audio_streams = if on { l.audio_streams + 1 } else { l.audio_streams.saturating_sub(1) };
+    }
+}
+
+/// (9 nov., audit F4) session.rs : un geste vient d'etre injecte.
+pub fn input_now() {
+    if let Ok(mut l) = LIVE.lock() {
+        l.last_input = Some(now());
+    }
+}
+
+/// (9 nov., audit F4) Ce que l'infobulle de l'icone dit : l'armement, puis ce qui se passe en ce moment (l'icone n'existe
+/// que sous Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn tooltip(port: u16, armed: bool, l: &Live) -> String {
+    let mut t = if port > 0 { format!("Uppwind Link · port {port}") } else { "Uppwind Link".to_string() };
+    if port == 0 {
+        return t;
+    }
+    t.push_str(if armed { " · remote control ON" } else { " · remote control off" });
+    if let Some(w) = &l.watching {
+        let w: String = w.chars().take(40).collect();
+        t.push_str(&format!(" · capturing {w}"));
+    }
+    if l.last_input.is_some_and(|s| now().saturating_sub(s) < 5) {
+        t.push_str(" · gestures");
+    }
+    if l.audio_streams > 0 {
+        t.push_str(" · DAW sound");
+    }
+    // l'infobulle d'une icone de Windows : 127 caracteres au plus
+    t.chars().take(120).collect()
+}
+
 /// Une erreur du retour audio qui dit que la capture ne marche pas ici (et pas : aucun DAW ouvert, une demande fausse).
 pub fn is_capture_trouble(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
-    const NOT_TROUBLE: &[&str] = &["not a daw", "no daw", "no process", "test tone", "rate must", "format is", "audio action", "stop"];
+    // (9 nov.) « remote control is off » : le compagnon est desarme (arming.rs), la capture n'y est pour rien
+    const NOT_TROUBLE: &[&str] = &["not a daw", "no daw", "no process", "test tone", "rate must", "format is", "audio action", "stop", "remote control is off"];
     !e.trim().is_empty() && !NOT_TROUBLE.iter().any(|n| e.contains(n))
 }
 
@@ -111,6 +184,19 @@ pub struct Audio {
     pub trouble: Option<String>,
 }
 
+/// (9 nov., audit F1) L'armement, tel que la fenetre d'etat le montre (arming.rs).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Remote {
+    /// la capture, les gestes et le son du DAW sont permis au studio
+    pub armed: bool,
+    /// arme sans studio connecte : desarme dans tant de minutes (None : un studio est la, ou desarme)
+    pub idle_left_min: Option<u64>,
+    /// desarme : un studio a demande une capture, un geste ou le son il y a tant de secondes (None : rien)
+    pub asked_ago_s: Option<u64>,
+    /// apres tant de minutes sans studio, le compagnon se desarme
+    pub idle_disarm_min: u64,
+}
+
 /// Le modele de la fenetre d'etat.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusModel {
@@ -120,6 +206,8 @@ pub struct StatusModel {
     pub port: u16,
     /// (29 oct.) UWC2-<port>-<jeton> : montre dans la fenetre et copie par le bouton, jamais dans une adresse
     pub code: String,
+    /// (9 nov., audit F1) l'armement
+    pub remote: Remote,
     pub live: Live,
     pub daws: Vec<DawLine>,
     pub ports: Ports,
@@ -163,14 +251,16 @@ pub fn daws_of(r: &Report) -> Vec<DawLine> {
     v
 }
 
-/// Le modele complet : le rapport (une simulation de `--setup`), l'etat vivant, le retour audio.
-pub fn model(r: &Report, port: u16, token: &str, live: Live, audio_available: Result<f64, String>, autostart: bool, sandbox: Option<String>) -> StatusModel {
+/// Le modele complet : le rapport (une simulation de `--setup`), l'etat vivant, le retour audio, l'armement.
+#[allow(clippy::too_many_arguments)]
+pub fn model(r: &Report, port: u16, token: &str, remote: Remote, live: Live, audio_available: Result<f64, String>, autostart: bool, sandbox: Option<String>) -> StatusModel {
     let (link, back, near) = ports_of(&r.midi.inputs, &r.midi.outputs);
     StatusModel {
         version: env!("CARGO_PKG_VERSION").into(),
         sandbox,
         port,
         code: if port > 0 && !token.is_empty() { crate::security::pairing_code(port, token) } else { String::new() },
+        remote,
         live,
         daws: daws_of(r),
         ports: Ports { link, back, near, loopmidi_installed: r.midi.loopmidi.is_some(), loopmidi_running: r.midi.loopmidi_running },
@@ -204,6 +294,18 @@ mod tests {
         assert!(!is_capture_trouble("explorer.exe is not a DAW (Ableton Live or FL Studio)"));
         assert!(!is_capture_trouble("the test tone is not running (start the companion with --test-tone)"));
         assert!(!is_capture_trouble(""));
+        assert!(!is_capture_trouble(crate::arming::REFUSAL), "disarmed is not a capture failure");
+    }
+
+    #[test]
+    fn the_tooltip_says_whether_remote_control_is_on_and_what_runs() {
+        let l = Live::default();
+        assert_eq!(tooltip(0, true, &l), "Uppwind Link", "no server: nothing to say");
+        assert_eq!(tooltip(47410, false, &l), "Uppwind Link · port 47410 · remote control off");
+        let l = Live { watching: Some("Diva/2-Lead".into()), watches: 1, audio_streams: 1, last_input: Some(now()), ..Live::default() };
+        assert_eq!(tooltip(47410, true, &l), "Uppwind Link · port 47410 · remote control ON · capturing Diva/2-Lead · gestures · DAW sound");
+        let long = Live { watching: Some("x".repeat(300)), ..Live::default() };
+        assert!(tooltip(47410, true, &long).chars().count() <= 120, "Windows cuts a tooltip at 127 characters");
     }
 
     #[test]
@@ -230,10 +332,13 @@ mod tests {
     fn the_model_never_puts_the_code_without_a_server() {
         let probe = crate::setup::env::Probe::empty(crate::setup::env::Paths::in_root(std::path::Path::new("Z:\\nowhere")));
         let r = report(&probe);
-        let m = model(&r, 0, "abc", Live::default(), Ok(10.0), false, None);
+        let m = model(&r, 0, "abc", Remote::default(), Live::default(), Ok(10.0), false, None);
         assert_eq!(m.code, "", "no server, no code");
-        let m = model(&r, 47410, "abc", Live::default(), Err("build 18363".into()), true, None);
+        assert!(!m.remote.armed);
+        let remote = Remote { armed: true, idle_left_min: Some(9), asked_ago_s: None, idle_disarm_min: 10 };
+        let m = model(&r, 47410, "abc", remote.clone(), Live::default(), Err("build 18363".into()), true, None);
         assert_eq!(m.code, "UWC2-47410-abc");
+        assert_eq!(m.remote, remote);
         assert!(m.audio.trouble.as_deref().is_some_and(|t| t.contains("cannot capture")), "{:?}", m.audio);
         assert!(m.daws.is_empty() && !m.ports.ok());
     }

@@ -68,6 +68,11 @@ pub enum Request {
     SetupAgain,
     Confirm,
     Cancel,
+    /// (9 nov., audit F1) armer (ou desarmer) : le studio peut filmer et piloter les fenetres de plugins, et prendre le
+    /// son du DAW. Seulement depuis la fenetre d'etat (une page locale du compagnon, jamais le studio)
+    Arm(bool),
+    /// (9 nov., audit F2) un nouveau code d'appairage : l'ancien ne marche plus, le studio est deconnecte
+    NewCode,
 }
 
 /// Un message d'une page → une demande permise sur cette page, ou pourquoi elle est refusee.
@@ -96,6 +101,8 @@ pub fn parse(page: Page, raw: &str) -> Result<Request, String> {
             _ => return Err("only the pairing code can be copied".into()),
         },
         "autostart" => Request::Autostart(v["on"].as_bool().ok_or("autostart needs on: true or false")?),
+        "arm" => Request::Arm(v["on"].as_bool().ok_or("arm needs on: true or false")?),
+        "newcode" => Request::NewCode,
         "open" => Request::Open(match v["link"].as_str() {
             Some("studio") => Link::Studio,
             Some("loopmidi") => Link::LoopMidi,
@@ -114,7 +121,7 @@ fn allowed(page: Page, r: &Request) -> bool {
     use Request::*;
     match page {
         Page::Wizard => matches!(r, Ready | Init | Install | Customize | Next | Back | Choose(_) | Recheck | Finish | Open(Link::Studio | Link::LoopMidi) | CopyCode | Close),
-        Page::Status => matches!(r, Ready | Init | Recheck | Open(_) | CopyCode | Close | Autostart(_) | SetupAgain),
+        Page::Status => matches!(r, Ready | Init | Recheck | Open(_) | CopyCode | Close | Autostart(_) | SetupAgain | Arm(_) | NewCode),
         Page::Uninstall => matches!(r, Ready | Init | Confirm | Cancel | Close),
     }
 }
@@ -135,6 +142,15 @@ mod tests {
         assert!(parse(Page::Status, r#"{"cmd":"install"}"#).is_err());
         assert_eq!(parse(Page::Uninstall, r#"{"cmd":"confirm"}"#), Ok(Request::Confirm));
         assert!(parse(Page::Uninstall, r#"{"cmd":"copy","what":"code"}"#).is_err());
+        // (9 nov., audit F1/F2) armer et changer de code : la fenetre d'etat seulement
+        assert_eq!(parse(Page::Status, r#"{"cmd":"arm","on":true}"#), Ok(Request::Arm(true)));
+        assert_eq!(parse(Page::Status, r#"{"cmd":"arm","on":false}"#), Ok(Request::Arm(false)));
+        assert!(parse(Page::Status, r#"{"cmd":"arm","on":"yes"}"#).is_err());
+        assert!(parse(Page::Status, r#"{"cmd":"arm"}"#).is_err());
+        assert!(parse(Page::Wizard, r#"{"cmd":"arm","on":true}"#).is_err(), "only the status window arms");
+        assert!(parse(Page::Uninstall, r#"{"cmd":"arm","on":true}"#).is_err());
+        assert_eq!(parse(Page::Status, r#"{"cmd":"newcode"}"#), Ok(Request::NewCode));
+        assert!(parse(Page::Wizard, r#"{"cmd":"newcode"}"#).is_err());
     }
 
     #[test]

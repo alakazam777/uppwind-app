@@ -130,13 +130,27 @@ fn outcome() -> Outcome {
     }
 }
 
+/// (9 nov., audit F1/F4) La fenetre d'etat armee, pendant que le studio filme Diva, y joue et ecoute le DAW.
+fn status_armed() -> StatusModel {
+    let mut m = status_model(false);
+    m.remote = crate::tray::status::Remote { armed: true, idle_left_min: None, asked_ago_s: None, idle_disarm_min: 10 };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    m.live.watches = 1;
+    m.live.watching = Some("Diva/2-Lead".into());
+    m.live.audio_streams = 1;
+    m.live.last_input = Some(now);
+    m
+}
+
 fn status_model(trouble: bool) -> StatusModel {
     StatusModel {
         version: env!("CARGO_PKG_VERSION").into(),
         sandbox: None,
         port: 47410,
         code: CODE.into(),
-        live: Live { sessions: 1, paired_ever: true, last_origin: Some("https://uppwind.lucasmoreau.fr".into()), last_paired: Some(1_792_852_800), audio_trouble: None },
+        // (9 nov., audit F1) l'apercu : desarme, un studio vient de demander (la vue la plus utile a relire)
+        remote: crate::tray::status::Remote { armed: false, idle_left_min: None, asked_ago_s: Some(20), idle_disarm_min: 10 },
+        live: Live { sessions: 1, paired_ever: true, last_origin: Some("https://uppwind.lucasmoreau.fr".into()), last_paired: Some(1_792_852_800), audio_trouble: None, ..Live::default() },
         daws: vec![
             DawLine {
                 daw: "ableton",
@@ -209,6 +223,10 @@ pub fn pages() -> Vec<(&'static str, Page, Vec<Value>, Option<&'static str>)> {
         ),
         ("wizard-6-done", Page::Wizard, vec![state(wizard_at(model(true, false, false), Step::Done, false, Some(outcome())), &[], Some(CODE))], None),
         ("status", Page::Status, vec![json!({ "type": "status", "status": status_model(false) })], None),
+        // (9 nov., audit F1/F4) arme, et ce qui se passe : une fenetre filmee, des gestes, le son du DAW
+        ("status-armed", Page::Status, vec![json!({ "type": "status", "status": status_armed() })], None),
+        // (9 nov., audit F2) « New code… » demande confirmation (le studio sera deconnecte)
+        ("status-new-code", Page::Status, vec![json!({ "type": "status", "status": status_model(false) })], Some(".uw-cell-v:nth-child(4) .uw-link")),
         ("status-sound-help", Page::Status, vec![json!({ "type": "status", "status": status_model(true) })], Some(".uw-cell-v:last-child .uw-link")),
         ("uninstall-1-confirm", Page::Uninstall, vec![json!({ "type": "uninstall", "plan": plan(), "removal": null, "running": false })], None),
         (
@@ -252,7 +270,7 @@ mod tests {
     #[test]
     fn every_preview_page_is_a_whole_page_with_its_messages() {
         let pages = pages();
-        assert_eq!(pages.len(), 10);
+        assert_eq!(pages.len(), 12);
         for (name, page, msgs, _) in &pages {
             assert!(!msgs.is_empty(), "{name}");
             let h = super::super::html(*page, "n", Some(&bridge(msgs, None)));

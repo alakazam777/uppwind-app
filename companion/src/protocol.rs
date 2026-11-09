@@ -38,8 +38,14 @@
 //!   {"type":"instances"}                                  → instances (25 oct. : les plugins Uppwind Link, plugin_link)
 //!   {"type":"midi","to":"<id>","events":[{"t","d","n"}]}  des notes vers un plugin Uppwind Link Notes (plugin_link)
 //!   {"type":"emitted","id":"<id>"}                        → emitted : ou et quand il les a sorties (la mesure)
+//!   {"type":"unpair"}                                     → unpaired {ok, warning?} : (9 nov., audit F2) le compagnon
+//!                                                           change de code, puis ferme les connexions de l'ancien (4403)
 //! Compagnon → studio (texte) : hello, windows, devices, opened, closed, watching, unwatched, pong, mode, inputack,
 //!   error. inputack : {n, t, recv, inj, ok, error?} (recv / inj : reception / injection, ms depuis 1970).
+//!   (9 nov., audit F1) l'armement : hello porte {"arming": true, "armed": bool, "unpair": true} ; puis
+//!   {"type":"armed","armed":bool} a chaque changement. Desarme, « watch » repond unwatched {code:"disarmed", reason},
+//!   « input » inputack {ok:false, error}, « audio start » audio {state:"off", code:"disarmed", error} ; desarmer
+//!   arrete la capture et le son en cours (les memes messages). Le studio ne peut pas armer : seul le compagnon le fait.
 //! Compagnon → studio (binaire) : une image = « UWF1 » + longueur de l'en-tete (u32 petit-boutiste) + en-tete JSON
 //!   {"seq","id","w","h","t","enc":"jpeg","cap","sw","sh","q","in","near"} + les octets JPEG. `t` : l'instant de la
 //!   capture en ms depuis 1970 (meme horloge que Date.now() du navigateur, meme machine). Une TUILE (partie 2) : en
@@ -92,6 +98,9 @@ pub enum ClientMsg {
     Link { sysex: Option<Vec<String>>, stop: Option<bool> },
     /// (25 oct.) le diagnostic du chemin sans loopMIDI : l'entree de chaque piste de Live et ses Notes (ROUTES) → routes
     Routes,
+    /// (9 nov., audit F2) le studio se desappaire : le compagnon change de code (l'ancien ne marche plus), repond
+    /// « unpaired », puis ferme toutes les connexions appairees avec l'ancien code (4403)
+    Unpair,
 }
 
 /// (25 oct.) Un morceau SysEx du lien, en hexadecimal : F0 7D 55 57 … F7, 210 octets au plus (l'en-tete et 200
