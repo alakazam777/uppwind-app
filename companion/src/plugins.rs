@@ -305,6 +305,33 @@ pub fn enumerate() -> Vec<RawWindow> {
         .collect()
 }
 
+/// (11 nov., 23 h) Les points ou le test « opaque » cherche un bouton : douze, quatre colonnes (20, 40, 60, 80 % de la
+/// largeur) sur trois rangees (20, 50, 80 % de la hauteur sous la barre de Logic, `header` points). Aucun sans place
+/// sous la barre.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn opaque_probe_points(frame: [f64; 4], header: f64) -> Vec<(f64, f64)> {
+    let [x, y, w, h] = frame;
+    let body = h - header;
+    if w <= 0.0 || body <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(12);
+    for fy in [0.2, 0.5, 0.8] {
+        for fx in [0.2, 0.4, 0.6, 0.8] {
+            out.push((x + w * fx, y + header + body * fy));
+        }
+    }
+    out
+}
+
+/// (11 nov., 23 h) Le dessin d'un plugin est-il opaque, d'apres ses points sondes ? `Some(true)` : un bouton a appuyer
+/// ou a tourner y est ; `Some(false)` : le point tombe dans la fenetre, mais rien n'y est ; `None` : le point n'est pas
+/// dans la fenetre (une autre la couvre). Opaque : au moins un point dans la fenetre, et aucun bouton nulle part.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn opaque_of(found: &[Option<bool>]) -> bool {
+    found.iter().any(|f| f.is_some()) && !found.iter().any(|f| *f == Some(true))
+}
+
 /// (11 nov.) Le menu d'affichage d'une fenetre de plugin de Logic (mesure avec PSP VintageWarmer2 : « Controls », le
 /// nom du plugin, puis une ligne vide) : l'element a choisir pour passer a « Controls », ou au dessin du plugin (le
 /// premier element titre qui n'est pas « Controls »).
@@ -487,6 +514,26 @@ mod tests {
         assert_eq!(index_by_frame(&f, [538.6, 251.0, 516.0, 462.0]), Some(1));
         assert_eq!(index_by_frame(&f, [536.0, 251.0, 516.0, 462.0]), None);
         assert_eq!(index_by_frame(&[], [0.0; 4]), None);
+    }
+
+    /// (11 nov., 23 h) Le test « opaque » : douze points sous la barre, et un seul bouton trouve suffit.
+    #[test]
+    fn a_view_is_opaque_only_if_no_probe_finds_a_control() {
+        let pts = opaque_probe_points([100.0, 50.0, 500.0, 500.0], 100.0);
+        assert_eq!(pts.len(), 12);
+        assert_eq!((pts[0], pts[11]), ((200.0, 230.0), (500.0, 470.0)));
+        assert!(pts.iter().all(|&(x, y)| x > 100.0 && x < 600.0 && y > 150.0 && y < 550.0), "under the header, inside");
+        assert!(opaque_probe_points([0.0, 0.0, 500.0, 90.0], 100.0).is_empty(), "no room under the header");
+        // PSP VintageWarmer2 (mesure : la fenetre seule, partout) : opaque
+        assert!(opaque_of(&[Some(false); 12]));
+        // l'E-Piano a 50 % : le centre sur un decor, des boutons ailleurs : pas opaque
+        let mut epiano = [Some(false); 12];
+        epiano[3] = Some(true);
+        assert!(!opaque_of(&epiano));
+        // couvert par une autre fenetre : on ne conclut pas
+        assert!(!opaque_of(&[None; 12]));
+        assert!(opaque_of(&[None, Some(false), None]));
+        assert!(!opaque_of(&[]));
     }
 
     /// (11 nov.) Le menu d'affichage d'une fenetre de Logic, tel que PSP VintageWarmer2 l'a montre.

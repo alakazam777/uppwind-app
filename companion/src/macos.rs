@@ -370,56 +370,66 @@ pub fn ax_target_at(pid: i32, x: f64, y: f64, frame: [f64; 4]) -> Result<Option<
     }
     ax_timeout();
     unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
+        let app = AxElement(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
             return Ok(None);
         }
-        let mut hit: CFTypeRef = std::ptr::null();
-        let err = AXUIElementCopyElementAtPosition(app, x as f32, y as f32, &mut hit);
-        CFRelease(app);
-        if err != 0 || hit.is_null() {
-            return Ok(None);
-        }
-        let mut cur = AxElement(hit);
         // l'element est-il dans la fenetre du plugin (son cadre) ?
-        let win = AxElement(ax_attr(cur.0, c"AXWindow"));
-        match ax_frame(win.0) {
-            Some(f) if f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0) => {}
-            _ => return Ok(None),
-        }
+        let Some((cur, win)) = hit_in_window(app.0, x, y, frame) else { return Ok(None) };
         // (11 nov., relecture M1) et cette fenetre est-elle une fenetre de plugin (le bouton de menu de l'affichage) ?
         // Sinon, rien : un studio ne presse rien dans une autre fenetre de Logic, meme si on la lui montrait
         if !plugin_window_sign(pid, frame, &win) {
             return Ok(None);
         }
-        for _ in 0..5 {
-            let role = AxElement(ax_attr(cur.0, c"AXRole"));
-            let role = if !role.0.is_null() && CFGetTypeID(role.0) == CFStringGetTypeID() { cf_string(role.0) } else { String::new() };
-            let value = ax_number(cur.0, c"AXValue");
-            let settable = value.is_some() && ax_settable(cur.0, c"AXValue");
-            match crate::input::ax_step_of(&role, settable) {
-                crate::input::AxStep::Press => return Ok(Some(AxTarget::Press(cur))),
-                crate::input::AxStep::Knob => {
-                    let range = match (ax_number(cur.0, c"AXMinValue"), ax_number(cur.0, c"AXMaxValue")) {
-                        (Some(lo), Some(hi)) if hi > lo => Some((lo, hi)),
-                        _ => None,
-                    };
-                    let orient = AxElement(ax_attr(cur.0, c"AXOrientation"));
-                    let horizontal = !orient.0.is_null() && CFGetTypeID(orient.0) == CFStringGetTypeID() && cf_string(orient.0) == "AXHorizontalOrientation";
-                    let width = ax_frame(cur.0).map(|f| f[2]).unwrap_or(0.0);
-                    return Ok(Some(AxTarget::Knob { value: value.unwrap_or(0.0), range, horizontal, width, el: cur }));
-                }
-                crate::input::AxStep::Stop => return Ok(None),
-                crate::input::AxStep::Up => {}
-            }
-            let parent = ax_attr(cur.0, c"AXParent");
-            if parent.is_null() {
-                break;
-            }
-            cur = AxElement(parent);
-        }
-        Ok(None)
+        Ok(gesture_target(cur))
     }
+}
+
+/// L'element sous le point (x, y) de l'ecran, s'il est dans la fenetre au cadre `frame` (a 2 points pres), et cette
+/// fenetre. None : rien, ou l'element d'une autre fenetre (une fenetre de Logic couvre celle du plugin a cet endroit).
+unsafe fn hit_in_window(app: CFTypeRef, x: f64, y: f64, frame: [f64; 4]) -> Option<(AxElement, AxElement)> {
+    let mut hit: CFTypeRef = std::ptr::null();
+    if AXUIElementCopyElementAtPosition(app, x as f32, y as f32, &mut hit) != 0 || hit.is_null() {
+        return None;
+    }
+    let cur = AxElement(hit);
+    let win = AxElement(ax_attr(cur.0, c"AXWindow"));
+    match ax_frame(win.0) {
+        Some(f) if f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0) => Some((cur, win)),
+        _ => None,
+    }
+}
+
+/// Ce qu'un geste du studio ferait de l'element `cur` (ou de l'un de ses cinq premiers parents) : un bouton a
+/// appuyer, un bouton rotatif a tourner, ou rien (input::ax_step_of dit quoi faire de chacun).
+unsafe fn gesture_target(mut cur: AxElement) -> Option<AxTarget> {
+    for _ in 0..5 {
+        let role = AxElement(ax_attr(cur.0, c"AXRole"));
+        let role = if !role.0.is_null() && CFGetTypeID(role.0) == CFStringGetTypeID() { cf_string(role.0) } else { String::new() };
+        let value = ax_number(cur.0, c"AXValue");
+        let settable = value.is_some() && ax_settable(cur.0, c"AXValue");
+        match crate::input::ax_step_of(&role, settable) {
+            crate::input::AxStep::Press => return Some(AxTarget::Press(cur)),
+            crate::input::AxStep::Knob => {
+                let range = match (ax_number(cur.0, c"AXMinValue"), ax_number(cur.0, c"AXMaxValue")) {
+                    (Some(lo), Some(hi)) if hi > lo => Some((lo, hi)),
+                    _ => None,
+                };
+                let orient = AxElement(ax_attr(cur.0, c"AXOrientation"));
+                let horizontal = !orient.0.is_null() && CFGetTypeID(orient.0) == CFStringGetTypeID() && cf_string(orient.0) == "AXHorizontalOrientation";
+                let width = ax_frame(cur.0).map(|f| f[2]).unwrap_or(0.0);
+                return Some(AxTarget::Knob { value: value.unwrap_or(0.0), range, horizontal, width, el: cur });
+            }
+            crate::input::AxStep::Stop => return None,
+            crate::input::AxStep::Up => {}
+        }
+        let parent = ax_attr(cur.0, c"AXParent");
+        if parent.is_null() {
+            break;
+        }
+        cur = AxElement(parent);
+    }
+    None
 }
 
 /// L'appui (AXPress) d'un bouton.
@@ -590,20 +600,25 @@ unsafe fn ax_text(e: CFTypeRef, name: &std::ffi::CStr) -> String {
     }
 }
 
-/// L'affichage de la fenetre `win` : son bouton de menu, et ce qui est sous le centre du plugin (sous la barre de
-/// Logic, 100 points) : la fenetre elle-meme, le dessin est opaque.
+/// L'affichage de la fenetre `win` : son bouton de menu, et si le dessin du plugin est opaque. (11 nov., 23 h) Avant,
+/// un seul point, le centre sous la barre de Logic : sur l'E-Piano a 50 %, il tombe sur un decor sans element, et le
+/// studio disait a tort que ses clics n'y passaient pas. Maintenant, douze points sous la barre
+/// (`plugins::opaque_probe_points`) : opaque seulement si aucun ne trouve un bouton a appuyer ou a tourner, comme un
+/// geste du studio le chercherait (`gesture_target`), parmi ceux qui tombent bien dans cette fenetre
+/// (`plugins::opaque_of`).
 unsafe fn ax_logic_view_of(app: CFTypeRef, win: &AxElement) -> Option<LogicView> {
     let button = ax_view_button(win)?;
     let controls = ax_text(button.0, c"AXTitle") == "Controls";
     let f = ax_frame(win.0)?;
-    let (cx, cy) = (f[0] + f[2] / 2.0, f[1] + 100.0 + (f[3] - 100.0).max(0.0) / 2.0);
-    let mut hit: CFTypeRef = std::ptr::null();
-    let opaque = AXUIElementCopyElementAtPosition(app, cx as f32, cy as f32, &mut hit) == 0 && !hit.is_null() && {
-        let h = AxElement(hit);
-        ax_text(h.0, c"AXRole") == "AXWindow"
-    };
-    Some(LogicView { controls, opaque })
+    let found: Vec<Option<bool>> = crate::plugins::opaque_probe_points(f, LOGIC_HEADER)
+        .into_iter()
+        .map(|(x, y)| hit_in_window(app, x, y, f).map(|(cur, _)| gesture_target(cur).is_some()))
+        .collect();
+    Some(LogicView { controls, opaque: crate::plugins::opaque_of(&found) })
 }
+
+/// La hauteur de la barre de Logic au-dessus du dessin d'un plugin (points), que le test « opaque » laisse de cote.
+const LOGIC_HEADER: f64 = 100.0;
 
 /// (11 nov.) L'affichage de la fenetre de plugin de Logic Pro au cadre `frame`. None : pas d'Accessibilite, ou pas de
 /// fenetre de plugin de Logic la.
