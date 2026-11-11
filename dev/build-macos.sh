@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Uppwind
 #
-# Uppwind Link -- the macOS build: the plugins FIRST (Uppwind Link.vst3 / .clap: arm64 + x86_64 joined with lipo,
-# bundled by uwl-bundle, then signed), THEN the companion (arm64 + x86_64, lipo), which embeds that signed
-# Uppwind Link.vst3 byte for byte (UWL_PLUGIN_BUNDLE, see companion/build.rs) and installs it itself
-# (--install-plugins, --setup --apply). By default everything is signed ad hoc (codesign -s -), so a DAW loads the
+# Uppwind Link -- the macOS build: the plugins FIRST (Uppwind Link.vst3 / .clap / .component: arm64 + x86_64 joined
+# with lipo, bundled by uwl-bundle, then signed), THEN the companion (arm64 + x86_64, lipo), which embeds the signed
+# Uppwind Link.vst3 and Uppwind Link.component byte for byte (UWL_PLUGIN_BUNDLE, UWL_PLUGIN_COMPONENT, see
+# companion/build.rs) and installs them itself (--install-plugins, --setup --apply). By default everything is signed ad hoc (codesign -s -), so a DAW loads the
 # plugins on THIS Mac; a release signs the plugins with a Developer ID here and the companion in GitHub Actions
 # (.github/workflows/macos-build.yml), which also notarizes the .dmg.
 #
@@ -17,6 +17,10 @@
 #                                                        Application" name, or its SHA-1 hash), with the hardened
 #                                                        runtime and Apple's timestamp, instead of ad hoc
 #   UWL_SIGN_KEYCHAIN=<keychain> …                       the keychain that holds that identity (CI: the job's own)
+#   UWL_AUV2=0 …                                         leaves out the Audio Units: by default (10 Nov) the plugins
+#                                                        are built with the "auv2" feature, and Uppwind Link.component,
+#                                                        the Audio Units for Logic Pro, is bundled and signed like the
+#                                                        others, then carried and installed by the companion
 #
 # Without plugin/plugins/ in this folder, the companion alone (it then carries no plugins).
 #
@@ -39,31 +43,48 @@ REPO=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || (cd "$HERE/../.."
 CHOME=${CARGO_HOME:-"$HOME/.cargo"}
 RHOME=${RUSTUP_HOME:-"$HOME/.rustup"}
 
-# build <target> <manifest>: --locked, and with UWL_RELEASE=1 the paths of this Mac remapped (never RUSTFLAGS)
+# build <target> <manifest> [cargo options]: --locked, and with UWL_RELEASE=1 the paths of this Mac remapped (never
+# RUSTFLAGS)
 build() {
+  t=$1
+  m=$2
+  shift 2
   if [ "${UWL_RELEASE:-0}" = "1" ]; then
-    "$CARGO" --config "target.$1.rustflags=['--remap-path-prefix=$CHOME=/cargo','--remap-path-prefix=$RHOME=/rustup','--remap-path-prefix=$REPO=/src']" \
-      build --release --locked --target "$1" --manifest-path "$2"
+    "$CARGO" --config "target.$t.rustflags=['--remap-path-prefix=$CHOME=/cargo','--remap-path-prefix=$RHOME=/rustup','--remap-path-prefix=$REPO=/src']" \
+      build --release --locked --target "$t" --manifest-path "$m" "$@"
   else
-    "$CARGO" build --release --locked --target "$1" --manifest-path "$2"
+    "$CARGO" build --release --locked --target "$t" --manifest-path "$m" "$@"
   fi
 }
+
+# the Audio Units too (Logic Pro), unless UWL_AUV2=0 (9 Nov: a trial; 10 Nov: the default)
+PLUGIN_FEATURES=""
+BUNDLE_AUV2=""
+if [ "${UWL_AUV2:-1}" = "1" ]; then
+  PLUGIN_FEATURES="--features uppwind-link/auv2"
+  BUNDLE_AUV2="--auv2"
+fi
 
 # 1. the plugins, bundled and signed, before the companion that embeds them
 if [ "$PLUGINS" = "1" ]; then
   for t in $ARCHS; do
-    build "$t" "$HERE/plugin/Cargo.toml"
+    # (PLUGIN_FEATURES: empty, or two words, so unquoted)
+    build "$t" "$HERE/plugin/Cargo.toml" $PLUGIN_FEATURES
   done
   lipo -create -output "$OUT/libuppwind_link.dylib" \
     "$HERE/plugin/target/aarch64-apple-darwin/release/libuppwind_link.dylib" \
     "$HERE/plugin/target/x86_64-apple-darwin/release/libuppwind_link.dylib"
-  rm -rf "$OUT/Uppwind Link.vst3" "$OUT/Uppwind Link.clap"
-  # the bundler of the host's own arch writes Uppwind Link.vst3 and Uppwind Link.clap (Info.plist, PkgInfo, MacOS/)
-  "$HERE/plugin/target/aarch64-apple-darwin/release/uwl-bundle" --dll "$OUT/libuppwind_link.dylib" --out "$OUT" \
-    || "$HERE/plugin/target/x86_64-apple-darwin/release/uwl-bundle" --dll "$OUT/libuppwind_link.dylib" --out "$OUT"
+  rm -rf "$OUT/Uppwind Link.vst3" "$OUT/Uppwind Link.clap" "$OUT/Uppwind Link.component"
+  # the bundler of the host's own arch writes Uppwind Link.vst3 and Uppwind Link.clap (Info.plist, PkgInfo, MacOS/),
+  # and with UWL_AUV2=1 Uppwind Link.component
+  "$HERE/plugin/target/aarch64-apple-darwin/release/uwl-bundle" --dll "$OUT/libuppwind_link.dylib" --out "$OUT" $BUNDLE_AUV2 \
+    || "$HERE/plugin/target/x86_64-apple-darwin/release/uwl-bundle" --dll "$OUT/libuppwind_link.dylib" --out "$OUT" $BUNDLE_AUV2
   rm -f "$OUT/libuppwind_link.dylib"
   ID=${UWL_PLUGIN_SIGN_IDENTITY:--}
-  for b in "$OUT/Uppwind Link.vst3" "$OUT/Uppwind Link.clap"; do
+  BUNDLES="vst3 clap"
+  [ -n "$BUNDLE_AUV2" ] && BUNDLES="vst3 clap component"
+  for k in $BUNDLES; do
+    b="$OUT/Uppwind Link.$k"
     if [ "$ID" = "-" ]; then
       codesign --force --sign - "$b"
     elif [ -n "${UWL_SIGN_KEYCHAIN:-}" ]; then
@@ -75,9 +96,15 @@ if [ "$PLUGINS" = "1" ]; then
   done
   lipo -info "$OUT/Uppwind Link.vst3/Contents/MacOS/Uppwind Link"
   if [ "$ID" = "-" ]; then echo "plugins signed ad hoc"; else echo "plugins signed with the given identity (hardened runtime, timestamp)"; fi
-  # the companion below embeds exactly this signed bundle
+  # the companion below embeds exactly these signed bundles
   UWL_PLUGIN_BUNDLE="$OUT/Uppwind Link.vst3"
   export UWL_PLUGIN_BUNDLE
+  if [ -n "$BUNDLE_AUV2" ]; then
+    UWL_PLUGIN_COMPONENT="$OUT/Uppwind Link.component"
+    export UWL_PLUGIN_COMPONENT
+  else
+    unset UWL_PLUGIN_COMPONENT
+  fi
 else
   echo "plugin/plugins is not in this folder: the companion alone, without the plugins"
 fi

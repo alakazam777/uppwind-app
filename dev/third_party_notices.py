@@ -11,7 +11,8 @@ installs). Asks cargo which crates end up in each Windows binary (`cargo tree --
 -e normal`, proc macros and their build-only dependencies left out, our own path crates left out), and also in the
 macOS ones (aarch64-apple-darwin and x86_64-apple-darwin: the crates only the Mac build links get a list of their
 own), then reads each crate's licence files from the local cargo registry (CARGO_HOME, %USERPROFILE%\\.cargo by
-default). Run it after any dependency change; --check only says whether the files are up to date (for CI). Nothing
+default). The macOS plugins are listed with their Audio Units (the auv2 feature): the clap-wrapper crate, a patched
+copy in plugin/vendor/ (listed like the crates from crates.io), and the C++ code it compiles (AU_CPP). Run it after any dependency change; --check only says whether the files are up to date (for CI). Nothing
 is downloaded: `cargo fetch --locked --manifest-path companion/Cargo.toml` and `cargo fetch --locked
 --manifest-path plugin/Cargo.toml` once first (they fetch the crates of every target, the macOS ones included).
 """
@@ -19,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINK = os.path.dirname(HERE)
@@ -26,13 +28,20 @@ OUT = os.path.join(LINK, "THIRD-PARTY-NOTICES.txt")
 PLUGIN_OUT = os.path.join(LINK, "plugin", "THIRD-PARTY-NOTICES.txt")
 TARGET = "x86_64-pc-windows-msvc"
 MAC_TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
+# (10 Nov 2026) the macOS plugins as released: with their Audio Units (Logic Pro), RELEASING.md
+PLUGIN_MAC_FEATURES = "auv2"
+# third-party crates kept in this repository (plugin/vendor/: a patched copy, [patch.crates-io]) → their folder
+VENDORED = {}
 
 
-def linked_and_build_only(manifest, package=None, target=TARGET):
-    """(linked, build_only) : [(name, version)] from cargo tree. Path crates (ours: uwl-proto…) are left out."""
+def linked_and_build_only(manifest, package=None, target=TARGET, features=None):
+    """(linked, build_only) : [(name, version)] from cargo tree. Path crates (ours: uwl-proto…) are left out, except
+    the third-party ones under a vendor/ folder (VENDORED)."""
     cmd = ["cargo", "tree", "--offline", "--locked", "--manifest-path", manifest]
     if package:
         cmd += ["-p", package]
+    if features:
+        cmd += ["--features", features]
     cmd += ["--target", target, "-e", "normal", "--prefix", "depth", "--format", "{p}"]
     out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
     linked, build, macro_depth = {}, set(), None
@@ -51,7 +60,10 @@ def linked_and_build_only(manifest, package=None, target=TARGET):
             build.add(name)
             macro_depth = depth
             continue
-        if re.search(r"\((?![^)]*proc-macro)[^)]*[\\/][^)]*\)", rest):
+        local = re.search(r"\(((?![^)]*proc-macro)[^)]*[\\/][^)]*)\)", rest)
+        if local and re.search(r"[\\/]vendor[\\/]", local.group(1)):
+            VENDORED[name] = local.group(1)  # a third-party crate kept in this repository: listed like the others
+        elif local:
             continue  # a local path crate of this repository (GPL-3.0-or-later, like the rest)
         linked[name] = ver
     return sorted(linked.items()), sorted(build - set(linked))
@@ -64,6 +76,8 @@ def registry_dirs():
 
 
 def crate_dir(name, ver):
+    if name in VENDORED:
+        return VENDORED[name]
     for r in registry_dirs():
         d = os.path.join(r, "%s-%s" % (name, ver))
         if os.path.isdir(d):
@@ -226,17 +240,23 @@ COMPANION_HEAD = [
 
 PLUGIN_HEAD = [
     "Uppwind Link plugins -- third-party notices", "=" * 43, "",
-    "The Uppwind Link plugins (Uppwind Link Return and Uppwind Link Notes, the \"Uppwind Link.vst3\" bundle) are free",
-    "software under the GNU General Public License, version 3 or (at your option) any later version: see ../LICENSE.",
-    "The Uppwind Link companion carries the bundle inside its program and installs it (uppwind-companion",
-    "--license prints these notices too). They are built with the Rust crates listed below, downloaded from crates.io",
-    "when you build them (none of their source is in this repository): a first list for Windows, then the crates that",
-    "only the macOS bundle links.", "",
+    "The Uppwind Link plugins (Uppwind Link Return and Uppwind Link Notes: the \"Uppwind Link.vst3\" bundle, and on",
+    "macOS the \"Uppwind Link.component\" bundle, their Audio Units for Logic Pro) are free software under the GNU",
+    "General Public License, version 3 or (at your option) any later version: see ../LICENSE. The Uppwind Link",
+    "companion carries the bundles inside its program and installs them (uppwind-companion --license prints these",
+    "notices too). They are built with the Rust crates listed below, downloaded from crates.io when you build them",
+    "(none of their source is in this repository, except clap-wrapper: see below): a first list for Windows, then the",
+    "crates that only the macOS bundles link.", "",
     "Crates offered under several licences (\"MIT OR Apache-2.0\", \"BlueOak-1.0.0 OR MIT OR Apache-2.0\",",
     "\"Apache-2.0 OR MIT OR Unlicense\"…) are used under the MIT option; nice-plug, nice-plug-core and nice-log under",
     "the ISC licence; all compatible with the GPL version 3. The VST3 interfaces come from the vst3 crate (bindings",
     "generated from Steinberg's VST 3 SDK headers, MIT OR Apache-2.0). VST is a registered trademark of Steinberg",
     "Media Technologies GmbH.", "",
+    "The Audio Units (macOS) are made by the clap-wrapper crate (blepfx/clap-wrapper-rs, MIT OR Apache-2.0, used under",
+    "the MIT option), from a patched copy in plugin/vendor/clap-wrapper (its UPPWIND.md says what changed and why). It",
+    "wraps the plugins' CLAP entry point as Audio Units and compiles into the macOS bundles the C++ code listed after",
+    "the crates: free-audio's clap-wrapper and the CLAP headers (MIT), Apple's AudioUnitSDK (Apache-2.0, unmodified),",
+    "ghc::filesystem and {fmt} (MIT). Audio Unit is a plug-in interface of Apple Inc.", "",
     "The test host and the bundler (testhost/: uwl-host, uwl-bundle) are development tools: they are not part of the",
     "bundle.", "",
     "The VST 3 interfaces that the vst3 crate's bindings are generated from (the pluginterfaces headers of Steinberg's",
@@ -257,14 +277,54 @@ PLUGIN_HEAD = [
     "    DEALINGS IN THE SOFTWARE.", ""]
 
 
-def render(head, title, manifest, package=None, mac_title=None):
+# (10 Nov 2026) The C++ code that the clap-wrapper crate compiles into the macOS Audio Units (its build.rs, auv2 feature):
+# each part's version, copyright and licence are read from the copy in plugin/vendor/clap-wrapper/external
+AU_CPP_TITLE = "C++ code compiled into the macOS Audio Units by clap-wrapper (plugin/vendor/clap-wrapper/external)"
+
+
+def _found(path, pattern, flags=0):
+    m = re.search(pattern, open(path, encoding="utf-8").read().replace("\r\n", "\n"), flags)
+    if not m:
+        raise SystemExit("%s: %r not found (clap-wrapper updated? see plugin/vendor/clap-wrapper/UPPWIND.md)" % (path, pattern))
+    return m
+
+
+def au_cpp(d):
+    """[(name, version, licence, holder, repository, [(kind, text)])] for the C++ parts of the clap-wrapper crate in d."""
+    x = lambda *p: os.path.join(d, "external", *p)  # noqa: E731
+    lic = lambda *p: open(x(*p), encoding="utf-8").read().replace("\r\n", "\n").strip("\n")  # noqa: E731
+    ver3 = lambda n: "%d.%d.%d" % (n // 10000, n // 100 % 100, n % 100)  # noqa: E731 (10515 → 1.5.15)
+    wrapper = _found(os.path.join(d, "build.rs"), r'"CLAP_WRAPPER_VERSION", Some\("\\"([\d.]+)\\""\)').group(1)
+    clap = _found(x("clap", "include", "clap", "version.h"),
+                  r"CLAP_VERSION_MAJOR (\d+).*?CLAP_VERSION_MINOR (\d+).*?CLAP_VERSION_REVISION (\d+)", re.S).groups()
+    ausdk = _found(x("AudioUnitSDK", "include", "AudioUnitSDK", "AUUtility.h"),
+                   r"AUSDK_VERSION_MAJOR (\d+).*?AUSDK_VERSION_MINOR (\d+).*?AUSDK_VERSION_PATCH (\d+)", re.S).groups()
+    apple = _found(x("AudioUnitSDK", "src", "AudioUnitSDK", "AUBase.cpp"), r"@copyright\s+(.+)").group(1).strip()
+    ghc = int(_found(x("filesystem", "include", "ghc", "filesystem.hpp"), r"define GHC_FILESYSTEM_VERSION (\d+)L").group(1))
+    fmt = int(_found(x("clap-wrapper", "libs", "fmt", "fmt", "base.h"), r"define FMT_VERSION (\d+)").group(1))
+    # {fmt} keeps its licence in the comment that opens format.h (MIT, and an optional exception)
+    fmt_text = textwrap.dedent(_found(x("clap-wrapper", "libs", "fmt", "fmt", "format.h"),
+                                      r"Formatting library for C\+\+\n\n(.*?)\n \*/", re.S).group(1)).strip("\n")
+    holder = lambda t: next((l.strip() for l in t.splitlines() if l.strip().lower().startswith("copyright")), "")  # noqa: E731
+    parts = [
+        ("clap-wrapper (C++)", wrapper, "MIT", lic("clap-wrapper", "LICENSE"), "https://github.com/free-audio/clap-wrapper", ""),
+        ("CLAP", ".".join(clap), "MIT", lic("clap", "LICENSE"), "https://github.com/free-audio/clap", ""),
+        ("AudioUnitSDK", ".".join(ausdk), "Apache-2.0", lic("AudioUnitSDK", "LICENSE.txt"), "https://github.com/apple/AudioUnitSDK",
+         "Copyright " + apple),
+        ("ghc::filesystem", ver3(ghc), "MIT", lic("filesystem", "LICENSE"), "https://github.com/gulrak/filesystem", ""),
+        ("{fmt}", ver3(fmt), "MIT", fmt_text, "https://github.com/fmtlib/fmt", ""),
+    ]
+    return [(name, ver, kind, who or holder(text), repo, [(kind, text)]) for name, ver, kind, text, repo, who in parts]
+
+
+def render(head, title, manifest, package=None, mac_title=None, mac_features=None):
     """The notices of one program: its Windows crates, then (mac_title given) the crates only its macOS build links."""
     linked, build_only = linked_and_build_only(manifest, package)
     lists = [(title, linked)]
     if mac_title:
         mac, mac_build = set(), set(build_only)
         for t in MAC_TARGETS:
-            l, b = linked_and_build_only(manifest, package, t)
+            l, b = linked_and_build_only(manifest, package, t, mac_features)
             mac.update(l)
             mac_build.update(b)
         lists.append((mac_title, sorted(mac - set(linked))))
@@ -290,6 +350,14 @@ def render(head, title, manifest, package=None, mac_title=None):
             if "IJG" in lic:
                 ijg = open(os.path.join(d, "LICENSE-IJG"), encoding="utf-8").read().replace("\r\n", "\n").strip("\n")
         sections.append((list_title, rows))
+    # the macOS Audio Units: the C++ code that clap-wrapper compiles, after the crates
+    if "clap-wrapper" in VENDORED and mac_title and "clap-wrapper" in {n for n, _ in lists[-1][1]}:
+        rows = []
+        for name, ver, kind, who, repo, texts in au_cpp(VENDORED["clap-wrapper"]):
+            for k, t in texts:
+                groups.setdefault((k, t), []).append("%s %s" % (name, ver))
+            rows.append((name, ver, kind, [who] if who else [], "", repo))
+        sections.append((AU_CPP_TITLE, rows))
     no_mail = lambda s: re.sub(r"\s*<[^>]*@[^>]*>", "", s)  # noqa: E731 (the licence texts below keep them verbatim)
     w = list(head)
     for i, (list_title, rows) in enumerate(sections):
@@ -321,7 +389,8 @@ def main():
     if os.path.isfile(os.path.join(LINK, "plugin", "plugins", "Cargo.toml")):
         files.append((PLUGIN_OUT, render(PLUGIN_HEAD, "Crates linked into the plugins' DLL (Windows, %s)" % TARGET,
                                          os.path.join(LINK, "plugin", "Cargo.toml"), "uppwind-link",
-                                         mac_title="Crates linked only into the macOS plugins (%s)" % ", ".join(MAC_TARGETS))))
+                                         mac_title="Crates linked only into the macOS plugins, the Audio Units included (%s)"
+                                         % ", ".join(MAC_TARGETS), mac_features=PLUGIN_MAC_FEATURES)))
     stale = 0
     for path, text in files:
         old = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""

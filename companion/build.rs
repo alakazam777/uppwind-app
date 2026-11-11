@@ -16,6 +16,8 @@
 //! un dossier vide arretent la construction. Sans la variable : aucun plugin (une construction de developpement ; la
 //! fenetre d'installation et --setup disent « not in this build »). Ni le chemin du bundle ni l'heure n'entrent dans
 //! l'exe : la construction reste reproductible (dev/release_check.py).
+//! (10 nov.) Et sous macOS, quand UWL_PLUGIN_COMPONENT nomme un « Uppwind Link.component » deja construit et signe
+//! (uwl-bundle --auv2) : les Audio Units des memes plugins (Logic Pro), avec les memes regles.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -79,6 +81,10 @@ fn emit(out: &mut String, name: &str, files: &[(String, PathBuf)]) {
 const PLUGIN_ENV: &str = "UWL_PLUGIN_BUNDLE";
 /// Le nom du dossier du bundle (celui que uwl-bundle ecrit, celui qu'on installe).
 const PLUGIN_BUNDLE: &str = "Uppwind Link.vst3";
+/// (10 nov.) La variable qui nomme le paquet des Audio Units a embarquer (macOS : « Uppwind Link.component », le meme
+/// binaire que le VST3, dans son propre paquet signe), et le nom de ce dossier.
+const COMPONENT_ENV: &str = "UWL_PLUGIN_COMPONENT";
+const COMPONENT_BUNDLE: &str = "Uppwind Link.component";
 /// Plus gros que ca, ce n'est pas notre plugin (la DLL fait ~1 Mo, la dylib universelle ~3 Mo).
 const PLUGIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -93,71 +99,77 @@ fn plugin_layout(os: &str, arch: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// (10 nov.) Les fichiers du paquet des Audio Units : macOS seulement, la disposition du VST3 de macOS.
+fn component_layout(os: &str, arch: &str) -> Option<&'static [&'static str]> {
+    if os == "macos" { plugin_layout(os, arch) } else { None }
+}
+
 /// Tout ce qui est sous `dir` : les fichiers (chemin relatif avec des « / ») ; un lien, un dossier vide ou autre chose
 /// qu'un fichier ordinaire arrete la construction.
-fn walk_bundle(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let rd = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{PLUGIN_ENV}: cannot read {} ({e})", dir.display()));
+fn walk_bundle(env: &str, root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let rd = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{env}: cannot read {} ({e})", dir.display()));
     let mut empty = true;
     for e in rd {
-        let e = e.unwrap_or_else(|e| panic!("{PLUGIN_ENV}: cannot read {} ({e})", dir.display()));
+        let e = e.unwrap_or_else(|e| panic!("{env}: cannot read {} ({e})", dir.display()));
         empty = false;
         let p = e.path();
-        let m = std::fs::symlink_metadata(&p).unwrap_or_else(|e| panic!("{PLUGIN_ENV}: {} ({e})", p.display()));
+        let m = std::fs::symlink_metadata(&p).unwrap_or_else(|e| panic!("{env}: {} ({e})", p.display()));
         if m.file_type().is_symlink() {
-            panic!("{PLUGIN_ENV}: {} is a link: refused (the bundle must hold its own files)", p.display());
+            panic!("{env}: {} is a link: refused (the bundle must hold its own files)", p.display());
         }
         if m.is_dir() {
-            walk_bundle(root, &p, out);
+            walk_bundle(env, root, &p, out);
         } else if m.is_file() {
             let rel: Vec<String> = p.strip_prefix(root).unwrap().components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
             out.push((rel.join("/"), p));
         } else {
-            panic!("{PLUGIN_ENV}: {} is not a regular file: refused", p.display());
+            panic!("{env}: {} is not a regular file: refused", p.display());
         }
     }
     if empty && dir != root {
-        panic!("{PLUGIN_ENV}: {} is an empty folder, which no bundle has: refused", dir.display());
+        panic!("{env}: {} is an empty folder, which no bundle has: refused", dir.display());
     }
 }
 
-/// Le bundle des plugins → (chemin relatif, fichier, executable), tries, verifies ; None : pas de variable.
-fn plugin_files() -> Option<Vec<(String, PathBuf, bool)>> {
-    println!("cargo:rerun-if-env-changed={PLUGIN_ENV}");
-    let raw = std::env::var_os(PLUGIN_ENV).filter(|v| !v.is_empty())?;
+/// Le bundle nomme par `env` (son dossier s'appelle `bundle`, ses fichiers sont ceux de `layout` pour la cible ; `only` :
+/// les systemes ou il a un sens) → (chemin relatif, fichier, executable), tries, verifies ; None : pas de variable.
+fn bundle_files(env: &str, bundle: &str, layout: Layout, only: &str) -> Files {
+    println!("cargo:rerun-if-env-changed={env}");
+    let raw = std::env::var_os(env).filter(|v| !v.is_empty())?;
     let root = PathBuf::from(raw);
     // (cargo lance build.rs depuis companion/ : un chemin relatif ne dirait pas de quel dossier il part)
     if !root.is_absolute() {
-        panic!("{PLUGIN_ENV} must be an absolute path (got {})", root.display());
+        panic!("{env} must be an absolute path (got {})", root.display());
     }
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let want = plugin_layout(&os, &arch).unwrap_or_else(|| panic!("{PLUGIN_ENV} is set, but the companion installs the Uppwind Link plugins on Windows (x86_64) and macOS only, not on {os} {arch}: unset it"));
-    if root.file_name().and_then(|n| n.to_str()) != Some(PLUGIN_BUNDLE) {
-        panic!("{PLUGIN_ENV} must name a folder called \"{PLUGIN_BUNDLE}\" (got {})", root.display());
+    let want = layout(&os, &arch).unwrap_or_else(|| panic!("{env} is set, but the companion installs {bundle} on {only} only, not on {os} {arch}: unset it"));
+    if root.file_name().and_then(|n| n.to_str()) != Some(bundle) {
+        panic!("{env} must name a folder called \"{bundle}\" (got {})", root.display());
     }
-    let m = std::fs::symlink_metadata(&root).unwrap_or_else(|e| panic!("{PLUGIN_ENV}: {} is missing ({e}): build the plugins and bundle them first (uwl-bundle)", root.display()));
+    let m = std::fs::symlink_metadata(&root).unwrap_or_else(|e| panic!("{env}: {} is missing ({e}): build the plugins and bundle them first (uwl-bundle)", root.display()));
     if !m.is_dir() || m.file_type().is_symlink() {
-        panic!("{PLUGIN_ENV}: {} is not a plain folder: refused", root.display());
+        panic!("{env}: {} is not a plain folder: refused", root.display());
     }
     let mut found = Vec::new();
-    walk_bundle(&root, &root, &mut found);
+    walk_bundle(env, &root, &root, &mut found);
     found.sort();
     let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
     for n in &names {
         if !want.contains(n) {
-            panic!("{PLUGIN_ENV}: the bundle holds {n:?}, which the {os} layout of build.rs does not have (expected exactly {want:?}): it would ship to every user, so it is refused");
+            panic!("{env}: the bundle holds {n:?}, which the {os} layout of build.rs does not have (expected exactly {want:?}): it would ship to every user, so it is refused");
         }
     }
     for w in want {
         if !names.contains(w) {
-            panic!("{PLUGIN_ENV}: the bundle has no {w:?} (expected exactly {want:?}){}", if w.contains("_CodeSignature") { ": sign it first (codesign)" } else { "" });
+            panic!("{env}: the bundle has no {w:?} (expected exactly {want:?}){}", if w.contains("_CodeSignature") { ": sign it first (codesign)" } else { "" });
         }
     }
     let mut total = 0u64;
     let mut out = Vec::new();
     for (rel, p) in found {
         let p = checked(&root, p);
-        let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("{PLUGIN_ENV}: cannot read {} ({e})", p.display()));
+        let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("{env}: cannot read {} ({e})", p.display()));
         total += bytes.len() as u64;
         // le binaire du plugin : le bon format, pour la bonne cible (une erreur de chemin se voit ici, pas chez l'utilisateur)
         if rel.ends_with("/x86_64-win/Uppwind Link.vst3") {
@@ -166,7 +178,7 @@ fn plugin_files() -> Option<Vec<(String, PathBuf, bool)>> {
                 .filter(|o| bytes.len() > o + 24 && &bytes[*o..o + 4] == b"PE\0\0");
             let ok = pe.is_some_and(|o| u16::from_le_bytes([bytes[o + 4], bytes[o + 5]]) == 0x8664 && u16::from_le_bytes([bytes[o + 22], bytes[o + 23]]) & 0x2000 != 0);
             if !ok {
-                panic!("{PLUGIN_ENV}: {} is not an x86_64 Windows DLL", p.display());
+                panic!("{env}: {} is not an x86_64 Windows DLL", p.display());
             }
         }
         let exec = rel.starts_with("Contents/MacOS/");
@@ -174,34 +186,45 @@ fn plugin_files() -> Option<Vec<(String, PathBuf, bool)>> {
             let magic = bytes.get(..4).map(|m| [m[0], m[1], m[2], m[3]]);
             // CA FE BA BE : universel (lipo) ; CF FA ED FE : Mach-O 64 bits
             if !matches!(magic, Some([0xca, 0xfe, 0xba, 0xbe]) | Some([0xcf, 0xfa, 0xed, 0xfe])) {
-                panic!("{PLUGIN_ENV}: {} is not a Mach-O binary", p.display());
+                panic!("{env}: {} is not a Mach-O binary", p.display());
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 if std::fs::metadata(&p).map(|m| m.permissions().mode() & 0o111 == 0).unwrap_or(true) {
-                    panic!("{PLUGIN_ENV}: {} is not executable", p.display());
+                    panic!("{env}: {} is not executable", p.display());
                 }
             }
         }
         out.push((rel, p, exec));
     }
     if total > PLUGIN_MAX_BYTES {
-        panic!("{PLUGIN_ENV}: the bundle weighs {total} bytes, more than {PLUGIN_MAX_BYTES}: not the Uppwind Link plugins");
+        panic!("{env}: the bundle weighs {total} bytes, more than {PLUGIN_MAX_BYTES}: not the Uppwind Link plugins");
     }
     println!("cargo:rerun-if-changed={}", root.display());
     Some(out)
 }
 
-fn emit_plugins(out: &mut String, link: &Path, files: Option<Vec<(String, PathBuf, bool)>>) {
-    writeln!(out, "/// (chemin dans le bundle, octets, executable) ; vide : une construction sans plugins").unwrap();
-    writeln!(out, "pub static PLUGIN_FILES: &[(&str, &[u8], bool)] = &[").unwrap();
-    let embedded = files.is_some();
+/// Les fichiers d'un paquet : (chemin relatif, fichier, executable) ; None : pas de variable.
+type Files = Option<Vec<(String, PathBuf, bool)>>;
+/// Les fichiers qu'un paquet doit avoir pour une cible (systeme, architecture) ; None : pas sur cette cible.
+type Layout = fn(&str, &str) -> Option<&'static [&'static str]>;
+
+fn emit_files(out: &mut String, name: &str, files: Files) {
+    writeln!(out, "pub static {name}: &[(&str, &[u8], bool)] = &[").unwrap();
     for (rel, p, exec) in files.unwrap_or_default() {
         writeln!(out, "    ({rel:?}, include_bytes!({:?}), {exec}),", p.to_string_lossy()).unwrap();
         println!("cargo:rerun-if-changed={}", p.display());
     }
     writeln!(out, "];").unwrap();
+}
+
+fn emit_plugins(out: &mut String, link: &Path, files: Files, component: Files) {
+    let embedded = files.is_some() || component.is_some();
+    writeln!(out, "/// (chemin dans le bundle, octets, executable) ; vide : une construction sans plugins").unwrap();
+    emit_files(out, "PLUGIN_FILES", files);
+    writeln!(out, "/// (10 nov.) les Audio Units (macOS), « Uppwind Link.component » ; vide : une construction sans eux").unwrap();
+    emit_files(out, "COMPONENT_FILES", component);
     // les notices des crates des plugins : avec les plugins seulement (elles accompagnent leur binaire)
     if embedded {
         let n = checked(link, link.join("plugin").join("THIRD-PARTY-NOTICES.txt"));
@@ -238,7 +261,12 @@ fn main() {
     std::fs::write(dst, out).unwrap();
     // (29 oct.) les plugins Uppwind Link, si UWL_PLUGIN_BUNDLE est donne
     let mut plugins = String::from("// genere par build.rs : ne pas modifier\n");
-    emit_plugins(&mut plugins, &link, plugin_files());
+    emit_plugins(
+        &mut plugins,
+        &link,
+        bundle_files(PLUGIN_ENV, PLUGIN_BUNDLE, plugin_layout, "Windows (x86_64) and macOS"),
+        bundle_files(COMPONENT_ENV, COMPONENT_BUNDLE, component_layout, "macOS"),
+    );
     std::fs::write(PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("embedded_plugins.rs"), plugins).unwrap();
     println!("cargo:rerun-if-changed=build/winres.rs");
     // la meme regle pour les fichiers de l'interface : la liste, des fichiers ordinaires sous ce dossier

@@ -13,7 +13,11 @@
 //! Studio → compagnon (texte) :
 //!   {"type":"hello","version":1,"token":"<64 hex>"}      (v1, le jeton en clair) accepte tant qu'aucun studio n'a
 //!                                                         fait la v2 avec ce jeton (un studio d'avant le 29 oct.)
-//!   {"type":"list"}                                       → windows
+//!   {"type":"list"}                                       → windows {windows, live, logic?, titles?} : live, Live
+//!                                                           tourne-t-il ; (10 nov.) sous macOS seulement, logic (Logic
+//!                                                           Pro tourne-t-il) et titles (« Enregistrement de l'ecran » :
+//!                                                           sans lui, aucun titre, donc aucune fenetre reconnue) ;
+//!                                                           hello porte les memes champs
 //!   {"type":"devices"}                                    → devices (les plugins du set, par le script UppwindLink)
 //!   {"type":"live"}                                       → live {channel, answers, ms?, error?, script?, live?} : le
 //!                                                           script de Live repond-il MAINTENANT ? (le studio le
@@ -40,6 +44,21 @@
 //!   {"type":"emitted","id":"<id>"}                        → emitted : ou et quand il les a sorties (la mesure)
 //!   {"type":"unpair"}                                     → unpaired {ok, warning?} : (9 nov., audit F2) le compagnon
 //!                                                           change de code, puis ferme les connexions de l'ancien (4403)
+//!   {"type":"view","view":"controls|editor"}              → view {ok, view?, opaque?, error?} : (11 nov., macOS) la
+//!                                                           fenetre de Logic Pro montree passe a son affichage
+//!                                                           « Controls » (ses reglages en curseurs, accessibles) ou au
+//!                                                           dessin du plugin ; arme seulement. watching porte alors
+//!                                                           logicView (controls|editor) et opaque (le dessin ne montre
+//!                                                           rien a l'Accessibilite : les gestes n'y passent pas)
+//!   {"type":"presence","action":"set","track":{title, artist?, album?, cover?, url?, duration?, position?}}
+//!   {"type":"presence","action":"clear"} · {"type":"presence","action":"state"}
+//!                                                         → presence {allowed, discord: unknown|ok|absent, shown, error?,
+//!                                                           code?} : (11 nov.) ce qu'on ecoute dans Music, sur le profil
+//!                                                           Discord (discord.rs) ; seulement si la personne l'a permis dans
+//!                                                           le compagnon ; « presence » suit chaque changement ; hello porte
+//!                                                           {"presence": {allowed, discord, shown}}
+//!   (11 nov.) hello {…, "role":"presence"} : la page Music ; tout message autre que presence et ping y est refuse
+//!   (error {code:"presence-only"}) ; son hello en retour ne porte que version, companion, la preuve et presence.
 //! Compagnon → studio (texte) : hello, windows, devices, opened, closed, watching, unwatched, pong, mode, inputack,
 //!   error. inputack : {n, t, recv, inj, ok, error?} (recv / inj : reception / injection, ms depuis 1970).
 //!   (9 nov., audit F1) l'armement : hello porte {"arming": true, "armed": bool, "unpair": true} ; puis
@@ -69,7 +88,9 @@ pub const COORD_MAX: f64 = 16384.0;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMsg {
     /// v1 : `token` (en clair) ; v2 (29 oct.) : `v` = 2, `nonce` (Ns) et `proof` (la preuve du studio), jamais le jeton
-    Hello { version: Option<u32>, token: Option<String>, v: Option<u32>, nonce: Option<String>, proof: Option<String> },
+    /// (11 nov.) `role` : "presence" (la page Music, discord.rs) : une connexion qui ne peut QUE poser la presence
+    /// Discord (et « ping ») ; elle ne compte pas comme un studio (l'armement, la fenetre d'etat). Absent : le studio.
+    Hello { version: Option<u32>, token: Option<String>, v: Option<u32>, nonce: Option<String>, proof: Option<String>, role: Option<String> },
     List,
     Devices,
     /// Le script de dev de Live repond-il maintenant ? → live {channel, answers, ms?, error?} (23 oct.)
@@ -101,6 +122,10 @@ pub enum ClientMsg {
     /// (9 nov., audit F2) le studio se desappaire : le compagnon change de code (l'ancien ne marche plus), repond
     /// « unpaired », puis ferme toutes les connexions appairees avec l'ancien code (4403)
     Unpair,
+    /// (11 nov.) macOS, Logic Pro : l'affichage de la fenetre montree, « controls » ou « editor » → view
+    View { view: String },
+    /// (11 nov., discord.rs) set : montrer ce titre sur Discord ; clear : l'effacer ; state : l'etat seulement
+    Presence { action: String, track: Option<crate::discord::RawTrack> },
 }
 
 /// (25 oct.) Un morceau SysEx du lien, en hexadecimal : F0 7D 55 57 … F7, 210 octets au plus (l'en-tete et 200
@@ -358,12 +383,12 @@ mod tests {
 
     #[test]
     fn parses_the_messages() {
-        assert_eq!(parse(r#"{"type":"hello","version":1,"token":"ab"}"#), Ok(ClientMsg::Hello { version: Some(1), token: Some("ab".into()), v: None, nonce: None, proof: None }));
-        assert_eq!(parse(r#"{"type":"hello"}"#), Ok(ClientMsg::Hello { version: None, token: None, v: None, nonce: None, proof: None }));
+        assert_eq!(parse(r#"{"type":"hello","version":1,"token":"ab"}"#), Ok(ClientMsg::Hello { version: Some(1), token: Some("ab".into()), v: None, nonce: None, proof: None, role: None }));
+        assert_eq!(parse(r#"{"type":"hello"}"#), Ok(ClientMsg::Hello { version: None, token: None, v: None, nonce: None, proof: None, role: None }));
         // (29 oct.) la v2 : un nonce et une preuve, jamais le jeton
         assert_eq!(
             parse(r#"{"type":"hello","version":1,"v":2,"nonce":"aa","proof":"bb"}"#),
-            Ok(ClientMsg::Hello { version: Some(1), token: None, v: Some(2), nonce: Some("aa".into()), proof: Some("bb".into()) })
+            Ok(ClientMsg::Hello { version: Some(1), token: None, v: Some(2), nonce: Some("aa".into()), proof: Some("bb".into()), role: None })
         );
         assert_eq!(parse(r#"{"type":"list"}"#), Ok(ClientMsg::List));
         assert_eq!(parse(r#"{"type":"live"}"#), Ok(ClientMsg::Live));
@@ -390,6 +415,9 @@ mod tests {
         assert_eq!(parse(r#"{"type":"link","sysex":["f07d5557"]}"#), Ok(ClientMsg::Link { sysex: Some(vec!["f07d5557".into()]), stop: None }));
         assert_eq!(parse(r#"{"type":"link","stop":true}"#), Ok(ClientMsg::Link { sysex: None, stop: Some(true) }));
         assert_eq!(parse(r#"{"type":"routes"}"#), Ok(ClientMsg::Routes));
+        // (11 nov.) l'affichage d'une fenetre de Logic Pro
+        assert_eq!(parse(r#"{"type":"view","view":"controls"}"#), Ok(ClientMsg::View { view: "controls".into() }));
+        assert!(parse(r#"{"type":"view"}"#).is_err());
         assert!(parse(r#"{"type":"link","sysex":[1,2]}"#).is_err());
         assert!(!link_chunk_ok("f07d55570101010001"), "too short");
         assert!(link_chunk_ok("F07D555701010100017b7df7"));

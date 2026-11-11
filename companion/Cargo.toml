@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Uppwind
 [package]
 name = "uppwind-companion"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Uppwind Link companion: shows the windows of the plugins hosted in Ableton Live inside Uppwind Studio, plays them, and brings the DAW's sound back."
 license = "GPL-3.0-or-later"
@@ -44,6 +44,8 @@ features = [
     "Win32_Security",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Media_Audio",
+    # (11 nov.) la mise a jour depuis la fenetre d'etat (update.rs) : WinHTTP, vers les releases GitHub seulement
+    "Win32_Networking_WinHttp",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Registry",
@@ -58,6 +60,8 @@ features = [
     "Win32_System_LibraryLoader",
     # le retour audio sans cable (audio/wasapi.rs) : les instants de capture (QPC), les evenements (CreateEventW)
     "Win32_System_Performance",
+    # (11 nov.) la presence Discord (discord.rs) : PeekNamedPipe, lire le tube de Discord sans bloquer
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",

@@ -23,12 +23,21 @@ pub const STATE_NAME: &str = ".uppwind-companion.json";
 /// Une trame AUDIO porte au plus ca de trames (un bloc plus grand part en plusieurs trames).
 pub const AUDIO_CHUNK: usize = 4096;
 
-/// Le fichier d'etat du compagnon : UWL_STATE_FILE (les essais), sinon %USERPROFILE%\.uppwind-companion.json.
+/// Le fichier d'etat du compagnon : UWL_STATE_FILE (les essais), sinon %USERPROFILE%\.uppwind-companion.json
+/// (~/.uppwind-companion.json sur Mac).
 pub fn state_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("UWL_STATE_FILE") {
+    state_path_from(std::env::var_os("UWL_STATE_FILE"), std::env::var_os("USERPROFILE"), std::env::home_dir())
+}
+
+/// Le choix de state_path, sans lire l'environnement (les essais). `home` : std::env::home_dir(), soit HOME, soit, sans
+/// HOME, le dossier du compte (getpwuid_r). (9 nov.) Logic Pro fait tourner les Audio Units hors de son processus, dans
+/// un service XPC d'Apple (AUHostingServiceXPC_arrow) dont l'environnement n'a pas HOME et dont le dossier courant est
+/// « / » : le plugin y cherchait « ./.uppwind-companion.json » et ne trouvait jamais le compagnon.
+pub fn state_path_from(state_file: Option<std::ffi::OsString>, profile: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = state_file {
         return PathBuf::from(p);
     }
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = profile.map(PathBuf::from).or(home).unwrap_or_else(|| PathBuf::from("."));
     home.join(STATE_NAME)
 }
 
@@ -433,6 +442,8 @@ fn run(sh: Arc<Shared>, mut io: Io) {
     let mut sent_format = (0u32, 0u32);
     // (25 oct., Notes) le dernier numero « Link tag » annonce sur cette connexion (None : pas encore)
     let mut sent_tag: Option<u32> = None;
+    // (10 nov.) l'identite annoncee dans le HELLO de cette connexion
+    let mut sent_id: u64 = 0;
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut scratch: Vec<f32> = Vec::with_capacity(AUDIO_CHUNK * 2);
     let mut events: Vec<p::Event> = Vec::with_capacity(p::MAX_EVENTS);
@@ -468,9 +479,11 @@ fn run(sh: Arc<Shared>, mut io: Io) {
             continue;
         }
         if conn.is_none() && Instant::now() >= next_try {
+            let announced = sh.instance_id();
             match connect(&sh) {
                 Ok(c) => {
                     conn = Some(c);
+                    sent_id = announced;
                     backoff = Duration::from_millis(250);
                     sent_format = (0, 0);
                     sent_tag = None;
@@ -488,6 +501,24 @@ fn run(sh: Arc<Shared>, mut io: Io) {
                     }
                 }
             }
+        }
+        // (10 nov.) L'hote a rendu l'etat du plugin APRES l'avoir active (Logic Pro le fait) : son identite, gardee dans le
+        // projet, a remplace celle tiree au hasard qu'annoncait la connexion. On le dit (BYE) et on se reconnecte tout de
+        // suite avec la bonne ; sinon le compagnon et le studio verraient une identite neuve a chaque ouverture du projet.
+        if conn.is_some() && sh.instance_id() != sent_id {
+            if let Some(mut c) = conn.take() {
+                p::encode_text(p::ty::BYE, "identity restored by the DAW", &mut out);
+                let _ = send(&mut c, &mut out);
+            }
+            out.clear();
+            sh.connected.store(false, Ordering::SeqCst);
+            sh.set_status("the DAW restored this plugin's identity: reconnecting".into());
+            next_try = Instant::now();
+            if let Io::Notes { events: ev, .. } = &mut io {
+                // les notes tenues sont relachees par le fil audio, comme a toute deconnexion
+                let _ = ev.push(Wire { len: 0, ..Default::default() });
+            }
+            continue;
         }
         let mut alive = true;
         match (&mut io, conn.as_mut()) {
@@ -643,6 +674,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (9 nov.) Le fichier d'etat sans HOME ni USERPROFILE (le service XPC qui fait tourner les AU de Logic) : dans le
+    /// dossier du compte que donne le systeme, jamais dans le dossier courant. UWL_STATE_FILE passe avant tout.
+    #[test]
+    fn the_state_file_is_in_the_account_folder_even_without_home() {
+        let home = PathBuf::from("/Users/someone");
+        assert_eq!(state_path_from(None, None, Some(home.clone())), home.join(STATE_NAME));
+        assert_eq!(state_path_from(Some("/tmp/test-state.json".into()), Some("C:\\Users\\a".into()), Some(home.clone())), PathBuf::from("/tmp/test-state.json"));
+        assert_eq!(state_path_from(None, Some("C:\\Users\\a".into()), Some(home)), PathBuf::from("C:\\Users\\a").join(STATE_NAME), "Windows: USERPROFILE first, as before");
+        assert_eq!(state_path_from(None, None, None), PathBuf::from(".").join(STATE_NAME), "no account folder at all: as before");
+        // ce que state_path() donne a home : un chemin absolu, avec ou sans HOME (getpwuid_r sinon)
+        #[cfg(unix)]
+        assert!(std::env::home_dir().is_some_and(|h| h.is_absolute()));
+    }
+
     /// (25 oct.) un essai reel : un Return charge AVANT le compagnon : pas de fichier d'etat, puis un port mort (un
     /// compagnon d'avant), puis le bon : le plugin se connecte tout seul, en relisant le fichier a chaque essai.
     #[test]
@@ -783,6 +828,45 @@ mod tests {
         let net = NetThread::start(ns.clone(), Io::Notes { events: evp, reports: rc });
         let tags = srv.join().unwrap();
         assert_eq!(tags, vec![0, 17], "the tag at connect, then its change");
+        drop(net);
+
+        // (10 nov.) Logic Pro rend l'etat du plugin APRES l'avoir active : l'identite change alors que le plugin est deja
+        // connecte. Il dit BYE et se reconnecte aussitot avec l'identite rendue (sinon une identite neuve a chaque
+        // ouverture du projet, pour le compagnon et le studio).
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::fs::write(&state, format!(r#"{{"pluginPort":{port},"pluginSecret":"{}"}}"#, p::secret_hex(&secret))).unwrap();
+        let rs = Arc::new(Shared::new(p::Kind::Notes, Arc::new(AtomicU64::new(0x4a4d))));
+        let (evp, _evc) = crate::ring::ring::<Wire>(64);
+        let (_rp, rc) = crate::ring::ring::<Report>(64);
+        let rs2 = rs.clone();
+        let srv = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for k in 0..2 {
+                let (mut s, _) = l.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut rd = p::FrameReader::new(p::MAX_FRAME);
+                let hello = v2_handshake(&mut s, &mut rd, &secret, port, p::status::OK);
+                seen.push(hello.instance);
+                if k == 0 {
+                    // l'hote rend l'etat enregistre dans le projet
+                    rs2.instance.store(0x5e50_39c9, Ordering::Relaxed);
+                    let mut bye = false;
+                    while let Some((t, _)) = next_frame(&mut s, &mut rd) {
+                        if t == p::ty::BYE {
+                            bye = true;
+                            break;
+                        }
+                    }
+                    seen.push(u64::from(bye));
+                }
+            }
+            seen
+        });
+        rs.active.store(true, Ordering::SeqCst);
+        let net = NetThread::start(rs.clone(), Io::Notes { events: evp, reports: rc });
+        let seen = srv.join().unwrap();
+        assert_eq!(seen, vec![0x4a4d, 1, 0x5e50_39c9], "the random identity, a BYE, then the restored identity");
         drop(net);
         std::env::remove_var("UWL_STATE_FILE");
         let _ = std::fs::remove_dir_all(&dir);

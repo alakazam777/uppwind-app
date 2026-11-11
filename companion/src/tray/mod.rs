@@ -45,7 +45,42 @@ pub fn status_model() -> Result<status::StatusModel, String> {
     let p = crate::wizard::parts()?;
     let r = status::report(&p.probe);
     let (port, token) = SERVER.get().map(|s| (s.port, s.token())).unwrap_or((0, String::new()));
-    Ok(status::model(&r, port, &token, remote(), status::live(), crate::audio::available(), p.dirs.startup_link().exists(), crate::wizard::sandbox().map(|d| d.display().to_string())))
+    let mut m = status::model(&r, port, &token, remote(), status::live(), crate::audio::available(), p.dirs.startup_link().exists(), crate::wizard::sandbox().map(|d| d.display().to_string()));
+    m.discord = presence();
+    m.update = crate::update::view(state_path().as_deref(), Some(&crate::update::updates_dir(&p.dirs.app_dir())));
+    Ok(m)
+}
+
+/// (11 nov.) Le fichier d'etat du compagnon qui tourne (None : pas de serveur, l'essai de la fenetre).
+fn state_path() -> Option<std::path::PathBuf> {
+    SERVER.get().and_then(|s| s.state.clone())
+}
+
+/// (11 nov., update.rs) La case « Update automatically » de la fenetre d'etat → cochee ou non maintenant.
+pub fn set_auto_update(on: bool) -> Result<bool, String> {
+    let path = state_path().ok_or("Uppwind Link is not running.")?;
+    let r = crate::update::set_auto(&path, on);
+    crate::log(&format!("update: automatic updates {} (the status window)", if on { "ON" } else { "off" }));
+    r
+}
+
+/// (11 nov., update.rs) Telecharger, verifier et lancer la version trouvee, qui remplace ce compagnon. `auto` (la case
+/// automatique) : rien n'est lance si un studio s'est connecte pendant le telechargement (`update::WAIT_BUSY`).
+pub fn start_update(show: bool, auto: bool) -> Result<String, String> {
+    SERVER.get().ok_or("Uppwind Link is not running.")?;
+    let dirs = crate::install::Dirs::from_env()?;
+    let busy = || status::live().sessions > 0;
+    crate::update::download_and_start(&crate::update::updates_dir(&dirs.app_dir()), show, &crate::wizard::extra_args(), if auto { Some(&busy) } else { None })
+}
+
+/// (11 nov.) La mise a jour automatique passe-t-elle cette version ? (son dernier `--self-update` a echoue)
+pub fn auto_skips(version: &str) -> bool {
+    crate::install::Dirs::from_env().is_ok_and(|d| crate::update::auto_skips_in(&crate::update::updates_dir(&d.app_dir()), version))
+}
+
+/// (11 nov.) La case automatique est-elle cochee ? (relu a chaque heure de verification)
+pub fn auto_update_on() -> bool {
+    state_path().is_some_and(|p| crate::update::auto_on(&p))
 }
 
 /// (9 nov., audit F1) La personne arme ou desarme, dans la fenetre d'etat ou le menu de l'icone → l'etat maintenant.
@@ -53,6 +88,23 @@ pub fn arm(on: bool, by: &str) -> Result<bool, String> {
     let sh = SERVER.get().ok_or("Uppwind Link is not running.")?;
     sh.arming.set(on, by);
     Ok(sh.arming.armed())
+}
+
+/// (11 nov.) La presence Discord, telle que la fenetre d'etat la montre (sans serveur : off).
+pub fn presence() -> status::Discord {
+    match SERVER.get() {
+        Some(sh) => {
+            let s = sh.presence.snapshot();
+            status::Discord { allowed: s.allowed, discord: s.link.name(), shown: s.shown }
+        }
+        None => status::Discord::default(),
+    }
+}
+
+/// (11 nov.) « Show on Discord » dans la fenetre d'etat → permise ou non maintenant.
+pub fn set_presence(on: bool) -> Result<bool, String> {
+    let sh = SERVER.get().ok_or("Uppwind Link is not running.")?;
+    sh.set_presence(on, "the status window")
 }
 
 /// (9 nov., audit F2) « New code » dans la fenetre d'etat : l'ancien code ne marche plus, le studio est deconnecte.
@@ -165,6 +217,8 @@ mod win {
         };
         sync_tray(&mut tip);
         let mut tip_tick: Option<Instant> = (port > 0).then(|| Instant::now() + TIP_EVERY);
+        // (11 nov., update.rs) la case « Update automatically » : relue a chaque heure ; rien ne part si elle est off
+        let mut update_tick: Option<Instant> = (port > 0).then(|| Instant::now() + crate::update::AUTO_FIRST);
         let data_dir = crate::install::Dirs::from_env().map(|d| crate::wizard::flow::webview_dir(&d)).unwrap_or_else(|_| crate::ui::setup_data_dir());
         let webview_ok = crate::ui::webview2_version().is_some();
         let mut win: Option<(UiWindow, StatusPage)> = None;
@@ -192,6 +246,16 @@ mod win {
                     if tip_tick.is_some_and(|t| now >= t) {
                         sync_tray(&mut tip);
                         tip_tick = Some(now + TIP_EVERY);
+                    }
+                    if update_tick.is_some_and(|t| now >= t) {
+                        update_tick = Some(now + crate::update::AUTO_EVERY);
+                        if super::auto_update_on() {
+                            let p = proxy.clone();
+                            std::thread::spawn(move || {
+                                let result = crate::update::check_now();
+                                let _ = p.send_event(UserEvent::Done(crate::ui::pages::Done::UpdateChecked { auto: true, result }));
+                            });
+                        }
                     }
                     // la fenetre d'etat, toutes les 3 s (seulement a son heure : l'infobulle a la sienne)
                     if next_tick.is_some_and(|t| now >= t) {
@@ -260,6 +324,33 @@ mod win {
                     if matches!(&d, crate::ui::pages::Done::Armed(_) | crate::ui::pages::Done::NewCode(_)) {
                         sync_tray(&mut tip);
                     }
+                    // (11 nov.) la case automatique a trouve une version plus recente : installee, sauf si un studio est
+                    // connecte (elle couperait sa session) : on reessaie plus tard
+                    if let crate::ui::pages::Done::UpdateChecked { auto: true, result: Ok(c) } = &d {
+                        if c.newer && super::auto_update_on() {
+                            if super::auto_skips(&c.release.version) {
+                                // (11 nov.) son dernier --self-update a echoue : pas d'essai automatique avant une plus recente
+                                crate::log(&format!("update: {} is available but its last update failed: only a click on Update tries it again", c.release.version));
+                            } else if status::live().sessions > 0 {
+                                crate::log(&format!("update: {} is available; a studio is connected, the automatic update waits", c.release.version));
+                                update_tick = Some(Instant::now() + crate::update::AUTO_RETRY);
+                            } else {
+                                crate::log(&format!("update: installing {} (automatic updates are on)", c.release.version));
+                                let p = proxy.clone();
+                                std::thread::spawn(move || {
+                                    let r = super::start_update(false, true);
+                                    let _ = p.send_event(UserEvent::Done(crate::ui::pages::Done::Updating(r)));
+                                });
+                            }
+                        }
+                    }
+                    // (11 nov.) un studio s'est connecte pendant le telechargement : on reessaie plus tard, comme plus haut
+                    if let crate::ui::pages::Done::Updating(Err(e)) = &d {
+                        if e == crate::update::WAIT_BUSY {
+                            crate::log("update: a studio connected during the download, the automatic update waits");
+                            update_tick = Some(Instant::now() + crate::update::AUTO_RETRY);
+                        }
+                    }
                     if let Some((_, page)) = win.as_mut() {
                         outs = page.on_done(d);
                     }
@@ -310,7 +401,7 @@ mod win {
             if win.is_none() {
                 next_tick = None;
             }
-            let wake = [next_tick, smoke_end, tip_tick].into_iter().flatten().min();
+            let wake = [next_tick, smoke_end, tip_tick, update_tick].into_iter().flatten().min();
             *cf = match wake {
                 Some(t) => ControlFlow::WaitUntil(t),
                 None => ControlFlow::Wait,

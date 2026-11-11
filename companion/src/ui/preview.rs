@@ -7,7 +7,7 @@
 use super::ipc::Page;
 use crate::tray::status::{Audio, DawLine, Live, ScriptLine, StatusModel};
 use crate::wizard::flow::{Removal, UninstallPlan};
-use crate::wizard::steps::{Choices, DawItem, FlItem, Model, Outcome, PluginItem, Ports, Step, Todo, Wizard};
+use crate::wizard::steps::{AuItem, Choices, DawItem, FlItem, Model, Outcome, PluginItem, Ports, Step, Todo, Wizard};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -76,6 +76,7 @@ fn model(ports_ok: bool, fl_running: bool, live_running: bool) -> Model {
             admin: true,
             selectable: true,
             held: false,
+            au: None,
         },
     }
 }
@@ -170,7 +171,25 @@ fn status_model(trouble: bool) -> StatusModel {
         ports: Ports { link: Some("Uppwind Link".into()), back: if trouble { None } else { Some("Uppwind Link Back".into()) }, near: vec![], loopmidi_installed: true, loopmidi_running: true },
         audio: Audio { available: true, error: None, trouble: trouble.then(|| "cannot capture Ableton Live 12 Suite.exe: the audio engine refused the process loopback (0x88890008)".into()) },
         autostart: true,
+        // (11 nov.) la presence Discord : off (la vue d'un premier lancement)
+        discord: crate::tray::status::Discord::default(),
+        update: crate::update::View { supported: true, ..Default::default() },
     }
+}
+
+/// (11 nov., update.rs) Une version plus recente vient d'etre lue sur GitHub.
+fn status_update_found() -> StatusModel {
+    let mut m = status_model(false);
+    m.update = crate::update::View { supported: true, latest: Some("0.4.0".into()), newer: true, checked_ago_s: Some(4), ..Default::default() };
+    m
+}
+
+/// (11 nov.) Le panneau Settings : a jour, la case automatique cochee, Discord permis.
+fn status_settings() -> StatusModel {
+    let mut m = status_model(false);
+    m.update = crate::update::View { supported: true, auto: true, latest: Some(env!("CARGO_PKG_VERSION").into()), checked_ago_s: Some(7200), ..Default::default() };
+    m.discord = crate::tray::status::Discord { allowed: true, discord: "connected", shown: true };
+    m
 }
 
 fn plan() -> UninstallPlan {
@@ -204,15 +223,41 @@ fn bridge(msgs: &[Value], click: Option<&str>) -> String {
 }
 
 /// Les pages d'exemple : (nom du fichier, page, messages, clic).
+/// (10 nov.) Les plugins sur un Mac : le VST3 deja a jour, leurs Audio Units (Logic Pro) pas encore la.
+fn mac_plugins() -> PluginItem {
+    PluginItem {
+        available: true,
+        not_in_build: false,
+        status: "up-to-date".into(),
+        action: "none".into(),
+        reason: String::new(),
+        folder: "~/Library/Audio/Plug-Ins/VST3/Uppwind Link.vst3".into(),
+        admin: false,
+        selectable: true,
+        held: false,
+        au: Some(AuItem {
+            status: "missing".into(),
+            action: "install".into(),
+            reason: "install them".into(),
+            folder: "~/Library/Audio/Plug-Ins/Components/Uppwind Link.component".into(),
+        }),
+    }
+}
+
 pub fn pages() -> Vec<(&'static str, Page, Vec<Value>, Option<&'static str>)> {
     let c = |m: &Model| Choices::defaults(m);
     let mut daws_w = Wizard::new(model(false, true, true));
     daws_w.step = Step::Daws;
     daws_w.choices = c(&daws_w.model);
     let ports_w = wizard_at(model(false, false, false), Step::Ports, false, None);
+    // (10 nov.) macOS : le VST3 a jour, leurs Audio Units (Logic Pro) a poser — la meme case dit les deux
+    let mut daws_mac = Wizard::new(Model { plugins: mac_plugins(), ..model(false, false, false) });
+    daws_mac.step = Step::Daws;
+    daws_mac.choices = c(&daws_mac.model);
     vec![
         ("wizard-1-welcome", Page::Wizard, vec![state(wizard_at(model(false, false, false), Step::Welcome, false, None), &[], None)], None),
         ("wizard-2-daws", Page::Wizard, vec![state(serde_json::to_value(&daws_w).unwrap(), &[], None)], None),
+        ("wizard-2-daws-mac", Page::Wizard, vec![state(serde_json::to_value(&daws_mac).unwrap(), &[], None)], None),
         ("wizard-3-ports", Page::Wizard, vec![state(ports_w, &[], None)], None),
         ("wizard-4-options", Page::Wizard, vec![state(wizard_at(model(true, false, false), Step::Options, false, None), &[], None)], None),
         (
@@ -228,6 +273,9 @@ pub fn pages() -> Vec<(&'static str, Page, Vec<Value>, Option<&'static str>)> {
         // (9 nov., audit F2) « New code… » demande confirmation (le studio sera deconnecte)
         ("status-new-code", Page::Status, vec![json!({ "type": "status", "status": status_model(false) })], Some(".uw-cell-v:nth-child(4) .uw-link")),
         ("status-sound-help", Page::Status, vec![json!({ "type": "status", "status": status_model(true) })], Some(".uw-cell-v:last-child .uw-link")),
+        // (11 nov.) une mise a jour trouvee ; le panneau Settings (le bouton de la barre de titre)
+        ("status-update", Page::Status, vec![json!({ "type": "status", "status": status_update_found() })], None),
+        ("status-settings", Page::Status, vec![json!({ "type": "status", "status": status_settings() })], Some(".uw-settings-btn")),
         ("uninstall-1-confirm", Page::Uninstall, vec![json!({ "type": "uninstall", "plan": plan(), "removal": null, "running": false })], None),
         (
             "uninstall-2-done",
@@ -270,7 +318,7 @@ mod tests {
     #[test]
     fn every_preview_page_is_a_whole_page_with_its_messages() {
         let pages = pages();
-        assert_eq!(pages.len(), 12);
+        assert_eq!(pages.len(), 15);
         for (name, page, msgs, _) in &pages {
             assert!(!msgs.is_empty(), "{name}");
             let h = super::super::html(*page, "n", Some(&bridge(msgs, None)));

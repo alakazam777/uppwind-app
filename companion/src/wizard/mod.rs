@@ -53,8 +53,8 @@ pub fn trial() -> bool {
 /// Les options lues ici : main.rs (parse_args) les saute ; Some(true) : suivie d'une valeur.
 pub fn is_flag(a: &str) -> Option<bool> {
     match a {
-        "--sandbox" | "--ui-preview" | "--shot" => Some(true),
-        "--app" | "--replace" | "--quiet" | "--wizard" | "--version" | "--smoke-test" => Some(false),
+        "--sandbox" | "--ui-preview" | "--shot" | "--download" => Some(true),
+        "--app" | "--replace" | "--quiet" | "--wizard" | "--version" | "--smoke-test" | "--self-update" | "--show" | "--check-update" => Some(false),
         _ => None,
     }
 }
@@ -136,6 +136,13 @@ pub fn early(raw: &[String]) -> Early {
     }
     if has("--uninstall") {
         return Early::Exit(uninstall_main(has("--quiet")));
+    }
+    // (11 nov., update.rs) l'exe telecharge et verifie par la fenetre d'etat d'une version d'avant : il s'installe
+    if has("--check-update") {
+        return Early::Exit(crate::update::console(value_of("--download").as_deref().map(Path::new)));
+    }
+    if has(crate::update::SELF_UPDATE_FLAG) {
+        return Early::Exit(self_update(has("--show")));
     }
     if has("--wizard") {
         if has("--quiet") {
@@ -272,6 +279,7 @@ impl Parts {
             stamp: crate::setup::scripts::now_stamp(),
             plugins: self.plugins.clone(),
             plugin_bundle: crate::plugin_install::Bundle::embedded(),
+            component_bundle: crate::plugin_install::Bundle::component(),
         }
     }
 }
@@ -392,6 +400,158 @@ fn run_wizard(installed: Option<String>) -> i32 {
     crate::ui::run_page(Box::new(crate::ui::pages::WizardPage::new(steps::Wizard::new(model))))
 }
 
+/// (11 nov.) Les choix d'une mise a jour faite depuis la fenetre d'etat : seulement ce qui est deja pose (les scripts
+/// des DAW a mettre a jour, les plugins deja installes), le demarrage avec Windows comme il est, rien de nouveau (ni
+/// les reglages de FL, ni un DAW que la personne n'avait pas coche). `admin_ok` : l'invite d'administrateur des
+/// plugins est permise (un clic sur « Update » ; jamais la mise a jour automatique).
+pub fn update_choices(m: &steps::Model, autostart: bool, admin_ok: bool) -> steps::Choices {
+    let mut daws: Vec<String> = m.daws.iter().filter(|d| d.selectable && d.action == "update").map(|d| d.id.clone()).collect();
+    let au_update = m.plugins.au.as_ref().is_some_and(|a| a.action == "update");
+    if m.plugins.selectable && (m.plugins.action == "update" || au_update) && (admin_ok || !m.plugins.admin) {
+        daws.push(steps::PLUGINS.into());
+    }
+    steps::Choices { daws, fl_settings: false, autostart, open_studio: false }
+}
+
+/// (11 nov.) `--self-update [--show]` : cet exe vient d'etre telecharge et verifie (update.rs) ; il s'installe a la
+/// place de la copie installee, comme l'installation, avec les choix de `update_choices`, arrete celui qui tourne et se
+/// lance (`--background --replace`). `show` : sa fenetre d'etat s'ouvre ensuite. Le compte rendu va dans
+/// `updates\last-update.json`, que la fenetre d'etat montre. Puis l'exe telecharge s'efface (apres la sortie).
+fn self_update(show: bool) -> i32 {
+    // (11 nov., relecture du Mac) seulement sous Windows : ailleurs le fichier n'a pas de version lisible (file_version),
+    // donc rien ne refuserait une version plus ancienne, et il n'y a pas de mise a jour depuis l'app
+    if !cfg!(windows) {
+        eprintln!("--self-update is for Windows. On this computer, run --install from the new version instead.");
+        return 1;
+    }
+    let p = match parts() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let updates = crate::update::updates_dir(&p.dirs.app_dir());
+    let from = installed_version_now().filter(|v| !v.is_empty());
+    let dst = p.dirs.exe();
+    // (11 nov.) `failed` : cette version n'a pas pris la place (la mise a jour automatique ne la reessaie pas)
+    let report = |ok: bool, failed: bool, errors: &[String], done: &[String]| {
+        let _ = crate::update::write_last(&updates, VERSION, from.as_deref(), ok, failed, errors, done);
+    };
+    // (11 nov.) seulement plus recente que la copie installee (la version de son fichier ; pas de copie, ou pas de
+    // version lisible : permis, c'est une reparation)
+    let installed_file = if dst.is_file() { firstrun::file_version(&dst) } else { None };
+    if let Err(e) = self_update_allowed(VERSION, installed_file.as_deref()) {
+        report(false, true, std::slice::from_ref(&e), &[]);
+        return 1;
+    }
+    let m = match detect(from.clone()) {
+        Ok(m) => m,
+        Err(e) => {
+            report(false, true, std::slice::from_ref(&e), &[]);
+            return 1;
+        }
+    };
+    let c = update_choices(&m, p.dirs.startup_link().exists(), show);
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            report(false, true, &[format!("cannot find this program's own file ({e})")], &[]);
+            return 1;
+        }
+    };
+    // (11 nov.) la copie d'avant, gardee le temps de la mise a jour : elle revient si la nouvelle ne demarre pas
+    let backup = updates.join("uppwind-companion-previous.exe");
+    let had_previous = dst.is_file() && !firstrun::same_file(&exe, &dst);
+    let have_backup = had_previous && std::fs::create_dir_all(&updates).is_ok() && std::fs::copy(&dst, &backup).is_ok();
+    let reg = arp::ArpRegistry;
+    let env = p.env(&reg);
+    let hooks = RealHooks { progress: |l: &str| println!("... {l}"), state_file: p.state_file.clone() };
+    let o = flow::install(&env, &exe, &c, &hooks);
+    let mut done = o.done.clone();
+    done.extend(o.scripts.iter().cloned());
+    done.extend(o.plugin_lines.iter().cloned());
+    let mut errors = o.errors.clone();
+    // (11 nov.) l'installation ou le lancement a echoue : la copie d'avant est relancee comme son raccourci de
+    // demarrage (`--background`), remise d'abord si l'installation l'avait deja remplacee
+    // (ailleurs que sous Windows, flow::install ne lance rien : seul compte ce qui a echoue)
+    let new_running = if cfg!(windows) { o.port.is_some() || crate::tray::single::running() } else { o.ok };
+    if cfg!(windows) {
+        let installed_is_previous = dst.is_file() && std::fs::read(&dst).ok() != std::fs::read(&exe).ok();
+        match restore_plan(new_running, had_previous, installed_is_previous, have_backup) {
+            Restore::Nothing => {}
+            Restore::Lost => errors.push("The previous Uppwind Link could not be put back: install it again from the release page.".into()),
+            plan => {
+                let back = if plan == Restore::PutBackThenStart { install::replace_exe(&backup, &dst).map(|_| ()) } else { Ok(()) };
+                let mut args = vec!["--background".to_string()];
+                args.extend(p.extra_args.iter().cloned());
+                match back.and_then(|_| spawn_detached(&dst, &args)) {
+                    Ok(_) => done.push(format!("Started the previous Uppwind Link{} again.", from.as_deref().map(|v| format!(" ({v})")).unwrap_or_default())),
+                    Err(e) => errors.push(format!("The previous Uppwind Link could not be started again ({e}).")),
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&backup);
+    report(errors.is_empty(), !new_running, &errors, &done);
+    #[cfg(windows)]
+    if show && o.port.is_some() {
+        // le nouveau compagnon a pris la place : sa fenetre
+        for _ in 0..20 {
+            if crate::tray::single::signal_show() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    // l'exe telecharge (dans updates\) n'est plus utile : efface apres la sortie, s'il n'est pas la copie installee
+    if !firstrun::same_file(&exe, &p.dirs.exe()) && exe.starts_with(&updates) {
+        cleanup_after_exit(std::slice::from_ref(&exe), &[], &[]);
+    }
+    if o.ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// (11 nov., pure) `--self-update` : cette version (`this`) peut-elle remplacer la copie installee, dont `installed` est
+/// la version lue dans son fichier ? Seulement si elle est plus recente ; pas de copie, ou pas de version lisible :
+/// permis (une reparation).
+pub fn self_update_allowed(this: &str, installed: Option<&str>) -> Result<(), String> {
+    match installed {
+        Some(v) if crate::update::parse_version(v).is_some() && !crate::update::is_newer(this, v) => Err(format!("Uppwind Link {v} is installed: {this} is not newer, nothing was changed.")),
+        _ => Ok(()),
+    }
+}
+
+/// (11 nov.) Apres un `--self-update` : que faire de la copie d'avant ?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restore {
+    /// la nouvelle tourne, ou il n'y avait rien avant
+    Nothing,
+    /// la copie installee est encore celle d'avant : la relancer
+    Start,
+    /// l'installation l'a remplacee : la remettre (depuis sa copie de cote), puis la relancer
+    PutBackThenStart,
+    /// remplacee, et pas de copie de cote : on le dit
+    Lost,
+}
+
+/// (pure) `new_running` : la nouvelle version tourne ; `had_previous` : une copie etait installee ; `installed_is_previous`
+/// : le fichier installe est encore celui d'avant ; `have_backup` : sa copie de cote existe.
+pub fn restore_plan(new_running: bool, had_previous: bool, installed_is_previous: bool, have_backup: bool) -> Restore {
+    if new_running || !had_previous {
+        Restore::Nothing
+    } else if installed_is_previous {
+        Restore::Start
+    } else if have_backup {
+        Restore::PutBackThenStart
+    } else {
+        Restore::Lost
+    }
+}
+
 fn ask(q: &str, default: bool) -> bool {
     use std::io::Write;
     print!("{q} [{}] ", if default { "Y/n" } else { "y/N" });
@@ -414,16 +574,39 @@ fn pause() {
     let _ = std::io::stdin().read_line(&mut s);
 }
 
-/// Sans WebView2 : l'installation dans la console (les memes etapes, deux questions). `--wizard --quiet` : la meme,
-/// sans question, avec les choix par defaut (tout ce qui a un sens, et Start with Windows) — une installation
-/// silencieuse, et l'essai de bout en bout dans un bac a sable.
+/// (10 nov.) Ce que dit la console avant la premiere question : sous Windows, il manque WebView2 a la fenetre ; sous
+/// macOS, il n'y a pas encore de fenetre d'installation.
+fn console_intro() -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        vec!["There is no setup window on macOS yet: the setup goes on here, in Terminal.".into()]
+    } else {
+        vec![
+            "The setup window needs Microsoft Edge WebView2 Runtime, which is missing on this computer.".into(),
+            format!("It is free, from Microsoft: {WEBVIEW2_URL}"),
+            "Without it, the setup goes on here, in this window.".into(),
+        ]
+    }
+}
+
+/// (10 nov.) La question du demarrage automatique. Windows : le raccourci du dossier Demarrage (l'icone). macOS : un
+/// LaunchAgent, une copie sans Terminal, donc sans `arm` (la reponse par defaut y est non : `Choices::for_console`).
+const AUTOSTART_QUESTION: &str = if cfg!(target_os = "macos") {
+    "Start Uppwind Link when you log in? That copy runs without Terminal, so remote control stays off in it."
+} else {
+    "Start Uppwind Link with Windows?"
+};
+
+/// Sans WebView2 (et sous macOS) : l'installation dans la console (les memes etapes, deux ou trois questions).
+/// `--wizard --quiet` : la meme, sans question, avec les choix de `Choices::for_console` (tout ce qui a un sens, et
+/// Start with Windows ; sous macOS, ni les reglages de FL ni le LaunchAgent) — une installation silencieuse, et
+/// l'essai de bout en bout dans un bac a sable.
 fn console_install(installed: Option<String>, interactive: bool) -> i32 {
     println!("Uppwind Link {VERSION}{}", if installed.is_some() { " (update)" } else { "" });
     if interactive {
         println!();
-        println!("The setup window needs Microsoft Edge WebView2 Runtime, which is missing on this computer.");
-        println!("It is free, from Microsoft: {WEBVIEW2_URL}");
-        println!("Without it, the setup goes on here, in this window.");
+        for l in console_intro() {
+            println!("{l}");
+        }
         println!();
         if !ask("Install Uppwind Link now?", true) {
             return 1;
@@ -443,24 +626,37 @@ fn console_install(installed: Option<String>, interactive: bool) -> i32 {
             return 1;
         }
     };
-    let mut c = steps::Choices::defaults(&m);
-    c.open_studio = false;
+    let mut c = steps::Choices::for_console(&m);
     if interactive {
         if m.daws.iter().any(|d| d.daw == "fl" && d.fl_settings.as_ref().is_some_and(|f| f.changes > 0)) {
             c.fl_settings = ask("Apply FL Studio's MIDI settings for you? (FL Studio closed; a backup is kept; uninstalling puts them back)", true);
         }
-        // (29 oct.) les plugins Uppwind Link (VST3)
-        if m.plugins.selectable && matches!(m.plugins.action.as_str(), "install" | "update") {
-            let q = format!(
-                "Install the Uppwind Link plugins (VST3, needed for FL Studio) in {}?{}",
-                m.plugins.folder,
-                if m.plugins.admin { " Windows asks for administrator rights once." } else { "" }
-            );
+        // (29 oct.) les plugins Uppwind Link (VST3) ; (10 nov.) sous macOS, leurs Audio Units (Logic Pro) avec eux : la
+        // question dit ce qui serait pose
+        if m.plugins.changes() {
+            let ch = |a: &str| matches!(a, "install" | "update");
+            let q = match m.plugins.au.as_ref() {
+                Some(au) => {
+                    let mut what = Vec::new();
+                    if ch(&m.plugins.action) {
+                        what.push(format!("VST3, for FL Studio, in {}", m.plugins.folder));
+                    }
+                    if ch(&au.action) {
+                        what.push(format!("Audio Units, for Logic Pro, in {}", au.folder));
+                    }
+                    format!("Install the Uppwind Link plugins ({})?", what.join("; "))
+                }
+                None => format!(
+                    "Install the Uppwind Link plugins (VST3, needed for FL Studio) in {}?{}",
+                    m.plugins.folder,
+                    if m.plugins.admin { " Windows asks for administrator rights once." } else { "" }
+                ),
+            };
             if !ask(&q, true) {
                 c.daws.retain(|d| d != steps::PLUGINS);
             }
         }
-        c.autostart = ask("Start Uppwind Link with Windows?", true);
+        c.autostart = ask(AUTOSTART_QUESTION, c.autostart);
     }
     // (29 oct.) --wizard --quiet promet « sans question » : pas d'invite d'administrateur de Windows non plus — des
     // plugins qui la demanderaient attendent `--install-plugins`
@@ -499,7 +695,8 @@ fn console_install(installed: Option<String>, interactive: bool) -> i32 {
         println!();
         println!("    {code}");
     }
-    if interactive {
+    // (10 nov.) Windows : la console d'un double-clic se ferme a la fin, d'ou la pause ; sous macOS, on est dans Terminal
+    if interactive && !cfg!(target_os = "macos") {
         println!();
         pause();
     }
@@ -564,5 +761,35 @@ mod tests {
         let c = super::system_cmd();
         assert!(c.is_absolute() && c.is_file(), "{}", c.display());
         assert!(c.ends_with(r"System32\cmd.exe"), "{}", c.display());
+    }
+}
+
+#[cfg(test)]
+mod self_update_tests {
+    use super::*;
+
+    #[test]
+    fn self_update_only_replaces_an_older_copy() {
+        assert!(self_update_allowed("0.4.0", Some("0.3.0")).is_ok());
+        assert!(self_update_allowed("0.10.0", Some("0.9.9")).is_ok(), "numbers, not text");
+        let e = self_update_allowed("0.4.0", Some("0.4.0")).unwrap_err();
+        assert!(e.contains("0.4.0 is installed") && e.contains("not newer"), "{e}");
+        assert!(self_update_allowed("0.4.0", Some("0.5.0")).is_err(), "a downgrade");
+        assert!(self_update_allowed("0.4.0", Some("0.10.0")).is_err(), "a downgrade (numbers, not text)");
+        // pas de copie installee, ou pas de version lisible : une reparation reste permise
+        assert!(self_update_allowed("0.4.0", None).is_ok());
+        assert!(self_update_allowed("0.4.0", Some("")).is_ok());
+        assert!(self_update_allowed("0.4.0", Some("junk")).is_ok());
+    }
+
+    #[test]
+    fn a_failed_self_update_starts_the_previous_copy_again() {
+        assert_eq!(restore_plan(true, true, false, true), Restore::Nothing, "the new one runs");
+        assert_eq!(restore_plan(true, true, true, true), Restore::Nothing);
+        assert_eq!(restore_plan(false, false, false, false), Restore::Nothing, "nothing was installed before");
+        assert_eq!(restore_plan(false, true, true, true), Restore::Start, "the install failed: the old file is still there");
+        assert_eq!(restore_plan(false, true, true, false), Restore::Start);
+        assert_eq!(restore_plan(false, true, false, true), Restore::PutBackThenStart, "installed but did not start");
+        assert_eq!(restore_plan(false, true, false, false), Restore::Lost);
     }
 }

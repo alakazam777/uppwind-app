@@ -19,6 +19,14 @@
 //! ses sous-fenetres ; en FOCUS, il verifie avant chaque clic que la fenetre sous le point est bien celle-la, et un
 //! glisser ou un relachement ne sort jamais de la zone du plugin (keep_inside).
 //! Le journal ne contient jamais ce qui est tape.
+//!
+//! (11 nov.) macOS, Logic Pro : un clic poste a Logic en arriere-plan (CGEventPostToPid) est ignore, meme avec le
+//! numero de la fenetre (mesure). Ses gestes passent donc par l'Accessibilite (macos::ax_target_at) : un clic devient
+//! l'appui (AXPress) du bouton sous le pointeur ; tirer un bouton rotatif regle sa valeur (AXValue, toute sa course en
+//! KNOB_TRAVEL points vers le haut) ; la molette le tourne de 5 % de sa course par cran (AXValue ; sans bornes connues,
+//! d'un AXIncrement / AXDecrement, 10 % sur l'E-Piano). Seulement dans la
+//! fenetre suivie : un element d'une autre fenetre de Logic n'est jamais touche. Pas de menu (il s'ouvrirait par-dessus
+//! tout), pas de clavier pour l'instant.
 
 use crate::protocol::{InputEvent, PointerAction, Pt};
 
@@ -337,24 +345,144 @@ pub struct Injector {
     /// macOS : le nombre de clics du dernier appui (2 apres un double clic), repris par le relachement
     #[allow(dead_code)]
     mac_clicks: i64,
+    /// (11 nov.) macOS, Logic Pro : le geste en cours par l'Accessibilite (un bouton appuye, un bouton rotatif tire)
+    #[cfg(target_os = "macos")]
+    ax: Option<AxGesture>,
+    /// (11 nov.) macOS, Logic Pro : la molette pas encore tournee en crans (pixels du studio)
+    #[cfg(target_os = "macos")]
+    wheel_acc: f64,
+}
+
+/// (11 nov.) macOS, Logic Pro : un geste par l'Accessibilite, de l'appui au relachement.
+#[cfg(target_os = "macos")]
+enum AxGesture {
+    /// un bouton : appuye au relachement, si le pointeur n'a presque pas bouge (un clic)
+    Press { el: crate::macos::AxElement, at: (f64, f64) },
+    /// un bouton rotatif tire : sa valeur au depart, ses bornes, le point de depart, la derniere valeur donnee (ou les
+    /// crans deja donnes, sans bornes)
+    /// `axis` : le sens du geste, fige des AXIS_LOCK points (Some(true) : de gauche a droite)
+    Knob { el: crate::macos::AxElement, start: f64, range: Option<(f64, f64)>, x0: f64, y0: f64, horizontal: bool, width: f64, axis: Option<bool>, last: f64, steps: i64 },
 }
 
 impl Default for Injector {
     fn default() -> Self {
-        Injector { mode: Mode::Direct, drag: None, key_target: 0, pending: Vec::new(), mac_clicks: 1 }
+        Injector {
+            mode: Mode::Direct,
+            drag: None,
+            key_target: 0,
+            pending: Vec::new(),
+            mac_clicks: 1,
+            #[cfg(target_os = "macos")]
+            ax: None,
+            #[cfg(target_os = "macos")]
+            wheel_acc: 0.0,
+        }
     }
+}
+
+/// (11 nov.) Logic Pro : que faire d'un element de l'Accessibilite trouve sous le pointeur (role, valeur reglable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxStep {
+    /// un bouton : l'appuyer
+    Press,
+    /// un bouton rotatif ou un curseur : regler sa valeur
+    Knob,
+    /// du decor (un groupe, une image, le curseur decoratif d'un bouton rotatif) : voir son parent
+    Up,
+    /// rien a faire ici (un menu, un champ de texte, la fenetre)
+    Stop,
+}
+
+pub fn ax_step_of(role: &str, settable_value: bool) -> AxStep {
+    match role {
+        "AXSlider" | "AXIncrementor" if settable_value => AxStep::Knob,
+        "AXButton" | "AXCheckBox" | "AXRadioButton" | "AXDisclosureTriangle" => AxStep::Press,
+        // un menu s'ouvrirait par-dessus tout, Logic en arriere-plan ; un champ de texte veut le clavier
+        "AXPopUpButton" | "AXMenuButton" | "AXComboBox" | "AXTextField" | "AXTextArea" | "AXWindow" | "AXSheet" | "AXApplication" => AxStep::Stop,
+        _ => AxStep::Up,
+    }
+}
+
+/// Toute la course d'un bouton rotatif, en points tires vers le haut (dix fois plus avec Maj).
+pub const KNOB_TRAVEL: f64 = 200.0;
+/// Sans bornes connues : un cran (AXIncrement) tous les KNOB_STEP points.
+pub const KNOB_STEP: f64 = 8.0;
+/// La molette sur un bouton rotatif aux bornes connues : WHEEL_POINTS points tires par pixel du studio (une molette
+/// donne 100 pixels par cran : 10 points, 5 % de la course ; un trackpad, peu a la fois, qui s'accumulent).
+pub const WHEEL_POINTS: f64 = 0.1;
+/// Sans bornes : un cran (AXIncrement, 10 % de la course sur l'E-Piano, mesure) tous les WHEEL_STEP pixels.
+pub const WHEEL_STEP: f64 = 100.0;
+/// Un appui et un relachement a moins de CLICK_SLOP points : un clic.
+pub const CLICK_SLOP: f64 = 6.0;
+
+/// La valeur d'un bouton rotatif tire de `dy_up` points vers le haut depuis `start` : bornee ; entiere quand ses valeurs
+/// le sont (l'E-Piano : VOLUME 0..80, BASS BOOST 0..100).
+pub fn knob_value(start: f64, min: f64, max: f64, dy_up: f64, fine: bool) -> f64 {
+    knob_value_over(start, min, max, dy_up, KNOB_TRAVEL, fine)
+}
+
+/// Pareil, toute la course en `travel` points (un curseur couche : sa largeur, la poignee suit le pointeur).
+pub fn knob_value_over(start: f64, min: f64, max: f64, moved: f64, travel: f64, fine: bool) -> f64 {
+    let span = max - min;
+    if !span.is_finite() || span <= 0.0 || !start.is_finite() || !moved.is_finite() || !(travel > 0.0) {
+        return start;
+    }
+    let v = (start + moved / travel * span / if fine { 10.0 } else { 1.0 }).clamp(min, max);
+    if start.fract() == 0.0 && min.fract() == 0.0 && max.fract() == 0.0 {
+        v.round()
+    } else {
+        v
+    }
+}
+
+/// (11 nov.) La course d'un geste sur un bouton : un curseur couche (l'affichage « Controls » de Logic, 89 points de
+/// large) se tire de gauche a droite, toute sa course sur sa largeur ; un bouton rotatif, vers le haut, sur KNOB_TRAVEL.
+pub fn knob_travel(horizontal: bool, width: f64) -> f64 {
+    if horizontal && width.is_finite() && width >= 20.0 {
+        width
+    } else {
+        KNOB_TRAVEL
+    }
+}
+
+/// (11 nov.) Le sens d'un geste sur un bouton, fige des qu'il a parcouru AXIS_LOCK points : l'axe le plus parcouru
+/// (Some(true) : de gauche a droite). Mesure : la case de valeur de l'affichage « Controls » de Logic se dit couchee a
+/// l'Accessibilite mais se tire de bas en haut ; c'est donc le geste qui decide, pas l'element.
+pub const AXIS_LOCK: f64 = 4.0;
+pub fn knob_axis(dx: f64, dy: f64) -> Option<bool> {
+    if dx.abs().max(dy.abs()) < AXIS_LOCK {
+        None
+    } else {
+        Some(dx.abs() > dy.abs())
+    }
+}
+
+pub fn is_click(down: (f64, f64), up: (f64, f64)) -> bool {
+    (down.0 - up.0).hypot(down.1 - up.1) <= CLICK_SLOP
+}
+
+/// La molette accumulee → (crans a donner, vers le haut ?, le reste). Molette vers le haut (dy negatif) : plus.
+pub fn wheel_steps(acc: f64) -> (u32, bool, f64) {
+    let n = (acc.abs() / WHEEL_STEP).floor();
+    if n < 1.0 {
+        return (0, false, acc);
+    }
+    (n.min(20.0) as u32, acc < 0.0, acc - acc.signum() * n * WHEEL_STEP)
 }
 
 impl Injector {
     pub fn set_mode(&mut self, m: Mode) {
         if m != self.mode {
             self.mode = m;
-            self.drag = None;
-            self.pending.clear();
+            self.forget();
         }
     }
 
     pub fn dragging(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.ax.is_some() {
+            return true;
+        }
         self.drag.is_some() || !self.pending.is_empty()
     }
 
@@ -363,6 +491,11 @@ impl Injector {
     pub fn forget(&mut self) {
         self.drag = None;
         self.pending.clear();
+        #[cfg(target_os = "macos")]
+        {
+            self.ax = None;
+            self.wheel_acc = 0.0;
+        }
     }
 
     /// Le geste, dans la fenetre `top` (deja verifiee par la session).
@@ -470,6 +603,10 @@ impl Injector {
     #[cfg(target_os = "macos")]
     pub fn handle(&mut self, top: u64, ev: &InputEvent) -> Result<Outcome, String> {
         let w = crate::macos::window(top).ok_or("the plugin window is gone")?;
+        // (11 nov.) Logic Pro : par l'Accessibilite (un clic qui lui est poste en arriere-plan est ignore)
+        if crate::plugins::is_logic_app(&w.owner) {
+            return self.handle_logic(&w, ev);
+        }
         let (pid, b) = (w.pid.max(0) as u32, w.bounds);
         let (cw, ch) = (b.size.width.round() as i32, b.size.height.round() as i32);
         let screen = |p: (i32, i32)| (b.origin.x + p.0 as f64, b.origin.y + p.1 as f64);
@@ -512,6 +649,120 @@ impl Injector {
                 }
                 Ok(Outcome { applied: true, pointer: None })
             }
+        }
+    }
+
+    /// (11 nov.) Logic Pro : les gestes par l'Accessibilite, dans la fenetre suivie `w` (voir l'en-tete du module).
+    #[cfg(target_os = "macos")]
+    fn handle_logic(&mut self, w: &crate::macos::MacWindow, ev: &InputEvent) -> Result<Outcome, String> {
+        use crate::macos::{ax_press, ax_reach_value, ax_step, ax_target_at, AxTarget};
+        let (pid, b) = (w.pid, w.bounds);
+        let frame = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+        let (cw, ch) = (b.size.width.round() as i32, b.size.height.round() as i32);
+        let screen = |p: (i32, i32)| (b.origin.x + p.0 as f64, b.origin.y + p.1 as f64);
+        match ev {
+            InputEvent::Pointer { action, pt, buttons, mods, .. } => {
+                let p = map_point(pt, cw, ch);
+                let at = screen(p);
+                let mut applied = false;
+                match action {
+                    PointerAction::Down | PointerAction::DblClick => {
+                        self.wheel_acc = 0.0;
+                        self.ax = match ax_target_at(pid, at.0, at.1, frame)? {
+                            Some(AxTarget::Press(el)) => Some(AxGesture::Press { el, at }),
+                            Some(AxTarget::Knob { el, value, range, horizontal, width }) => Some(AxGesture::Knob {
+                                el,
+                                start: value,
+                                range,
+                                x0: at.0,
+                                y0: at.1,
+                                horizontal,
+                                width,
+                                axis: None,
+                                last: value,
+                                steps: 0,
+                            }),
+                            None => None,
+                        };
+                    }
+                    PointerAction::Move => {
+                        if let Some(AxGesture::Knob { el, start, range, x0, y0, horizontal, width, axis, last, steps }) = self.ax.as_mut().filter(|_| *buttons & 1 != 0) {
+                            // le sens du geste, fige des AXIS_LOCK points : de gauche a droite, un curseur couche suit le
+                            // pointeur sur sa largeur ; de bas en haut, toute la course en KNOB_TRAVEL points
+                            let (dx, dy_up) = (at.0 - *x0, *y0 - at.1);
+                            if axis.is_none() {
+                                *axis = knob_axis(dx, dy_up);
+                            }
+                            let (up, travel) = match *axis {
+                                None => (0.0, KNOB_TRAVEL),
+                                Some(true) => (dx, knob_travel(*horizontal, *width)),
+                                Some(false) => (dy_up, KNOB_TRAVEL),
+                            };
+                            match *range {
+                                Some((lo, hi)) => {
+                                    let v = knob_value_over(*start, lo, hi, up, travel, *mods & 1 != 0);
+                                    if v != *last {
+                                        ax_reach_value(el, v, (hi - lo) / 200.0)?;
+                                        *last = v;
+                                        applied = true;
+                                    }
+                                }
+                                None => {
+                                    let want = (up / KNOB_STEP).trunc() as i64;
+                                    while *steps != want {
+                                        let inc = want > *steps;
+                                        ax_step(el, inc)?;
+                                        *steps += if inc { 1 } else { -1 };
+                                        applied = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    PointerAction::Up => {
+                        if let Some(AxGesture::Press { el, at: down }) = self.ax.take() {
+                            if is_click(down, at) {
+                                ax_press(&el)?;
+                                applied = true;
+                            }
+                        }
+                        self.ax = None;
+                    }
+                }
+                Ok(Outcome { applied, pointer: Some(p) })
+            }
+            InputEvent::Wheel { pt, dy, mods, .. } => {
+                let p = map_point(pt, cw, ch);
+                let at = screen(p);
+                self.wheel_acc += *dy;
+                let mut applied = false;
+                match ax_target_at(pid, at.0, at.1, frame)? {
+                    // la molette vers le haut (dy negatif) : plus ; les petits pas d'un trackpad s'accumulent jusqu'a
+                    // changer la valeur (entiere sur l'E-Piano)
+                    Some(AxTarget::Knob { el, value, range: Some((lo, hi)), .. }) => {
+                        let v = knob_value(value, lo, hi, -self.wheel_acc * WHEEL_POINTS, *mods & 1 != 0);
+                        if v != value {
+                            ax_reach_value(&el, v, (hi - lo) / 200.0)?;
+                            self.wheel_acc = 0.0;
+                            applied = true;
+                        } else if v <= lo || v >= hi {
+                            self.wheel_acc = 0.0; // en butee : rien ne s'accumule au-dela
+                        }
+                    }
+                    Some(AxTarget::Knob { el, range: None, .. }) => {
+                        let (n, up, rest) = wheel_steps(self.wheel_acc);
+                        self.wheel_acc = rest;
+                        for _ in 0..n {
+                            ax_step(&el, up)?;
+                        }
+                        applied = n > 0;
+                    }
+                    _ => self.wheel_acc = 0.0,
+                }
+                Ok(Outcome { applied, pointer: Some(p) })
+            }
+            // le clavier n'atteint pas Logic en arriere-plan, et l'Accessibilite ne tape pas dans un plugin : rien
+            InputEvent::Key { .. } | InputEvent::Text { .. } => Ok(Outcome { applied: false, pointer: None }),
         }
     }
 
@@ -1400,5 +1651,59 @@ mod mac_tests {
         for c in ["Enter", "Escape", "Backspace", "Tab", "Semicolon", "Quote", "Backquote", "IntlBackslash", "NumpadDivide", "Delete", "Home"] {
             assert!(vk_of_code(c).is_some() && mac_keycode_of_code(c).is_some(), "{c}");
         }
+    }
+
+    /// (11 nov.) Logic Pro par l'Accessibilite : ce que devient chaque element (mesure sur l'E-Piano : sous un bouton
+    /// rotatif, un AXSlider sans valeur reglable dont le parent est le vrai ; les onglets EFFECTS et DETAILS, des AXButton).
+    #[test]
+    fn logic_gestures_by_accessibility_what_each_element_becomes() {
+        assert_eq!(ax_step_of("AXButton", false), AxStep::Press);
+        assert_eq!(ax_step_of("AXRadioButton", false), AxStep::Press);
+        assert_eq!(ax_step_of("AXCheckBox", false), AxStep::Press);
+        assert_eq!(ax_step_of("AXSlider", true), AxStep::Knob);
+        assert_eq!(ax_step_of("AXSlider", false), AxStep::Up, "the knob's decoration: its parent is the knob");
+        assert_eq!(ax_step_of("AXRadioGroup", false), AxStep::Up);
+        assert_eq!(ax_step_of("AXGroup", false), AxStep::Up);
+        assert_eq!(ax_step_of("AXPopUpButton", false), AxStep::Stop, "a menu would open over everything");
+        assert_eq!(ax_step_of("AXMenuButton", false), AxStep::Stop);
+        assert_eq!(ax_step_of("AXTextField", true), AxStep::Stop);
+        assert_eq!(ax_step_of("AXWindow", false), AxStep::Stop);
+    }
+
+    #[test]
+    fn logic_gestures_by_accessibility_knob_click_and_wheel() {
+        // VOLUME de l'E-Piano : 36 sur 0..80 ; toute la course en KNOB_TRAVEL points vers le haut, des valeurs entieres
+        assert_eq!(knob_value(36.0, 0.0, 80.0, 0.0, false), 36.0);
+        assert_eq!(knob_value(36.0, 0.0, 80.0, 20.0, false), 44.0);
+        assert_eq!(knob_value(36.0, 0.0, 80.0, -20.0, false), 28.0);
+        assert_eq!(knob_value(36.0, 0.0, 80.0, 1000.0, false), 80.0, "bounded");
+        assert_eq!(knob_value(36.0, 0.0, 80.0, -1000.0, false), 0.0);
+        assert_eq!(knob_value(36.0, 0.0, 80.0, 20.0, true), 37.0, "Shift: ten times finer");
+        assert!((knob_value(0.5, 0.0, 1.0, 50.0, false) - 0.75).abs() < 1e-9, "a fractional knob stays fractional");
+        assert_eq!(knob_value(3.0, 5.0, 5.0, 10.0, false), 3.0, "no range: unchanged");
+        assert_eq!(knob_value(3.0, 0.0, 10.0, f64::NAN, false), 3.0);
+        assert!(is_click((100.0, 50.0), (104.0, 53.0)));
+        assert!(!is_click((100.0, 50.0), (100.0, 60.0)), "a drag is not a click");
+        // sans bornes : un cran d'Accessibilite (10 % sur l'E-Piano) par cran de molette (100 pixels vers le bas : moins)
+        assert_eq!(wheel_steps(100.0), (1, false, 0.0));
+        assert_eq!(wheel_steps(-15.0), (0, false, -15.0));
+        assert_eq!(wheel_steps(-145.0), (1, true, -45.0));
+        assert_eq!(wheel_steps(-10_000.0).0, 20, "at most 20 steps at once");
+        // avec bornes : un cran de molette (100 pixels vers le haut) = 10 points tires = 5 % de la course : VOLUME 36 → 40
+        assert_eq!(knob_value(36.0, 0.0, 80.0, 100.0 * WHEEL_POINTS, false), 40.0);
+        // (11 nov.) l'affichage « Controls » de Logic : des curseurs couches de 89 points, valeur 0..100 (Drive de PSP
+        // VintageWarmer2 a 50) ; tire de 89 points vers la droite, toute la course
+        assert_eq!(knob_travel(true, 89.0), 89.0);
+        assert_eq!(knob_travel(false, 89.0), KNOB_TRAVEL, "a knob: upwards, over KNOB_TRAVEL");
+        assert_eq!(knob_travel(true, 4.0), KNOB_TRAVEL, "a sliver: the usual travel");
+        assert!((knob_value_over(50.0, 0.0, 100.0, 89.0 * 0.25, 89.0, false) - 75.0).abs() < 1e-9);
+        assert_eq!(knob_value_over(50.0, 0.0, 100.0, -89.0, 89.0, false), 0.0);
+        assert_eq!(knob_value_over(50.0, 0.0, 100.0, 10.0, 0.0, false), 50.0, "no travel: unchanged");
+        // le sens du geste, fige des AXIS_LOCK points
+        assert_eq!(knob_axis(2.0, 1.0), None);
+        assert_eq!(knob_axis(10.0, 3.0), Some(true));
+        assert_eq!(knob_axis(3.0, -10.0), Some(false));
+        assert_eq!(knob_axis(0.0, 20.0), Some(false), "the Drive value box, dragged upwards");
+        assert_eq!(knob_value(36.0, 0.0, 80.0, 4.0 * WHEEL_POINTS, false), 36.0, "a small trackpad step alone: not yet a change");
     }
 }

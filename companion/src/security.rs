@@ -22,6 +22,10 @@ use uwl_proto::auth;
 
 /// L'origine du studio en ligne (/atelier) : la seule que le compagnon accepte par defaut.
 pub const PROD_ORIGIN: &str = "https://uppwind.lucasmoreau.fr";
+/// (11 nov. 2026) Le meme site sous un autre nom : beta.uppwind.com (le meme serveur, qui suit le nom principal en cas
+/// de bascule). Acceptee avec le studio en ligne, seulement quand ce compagnon est celui du site (pas un studio a
+/// part, `UPPWIND_STUDIO_ORIGIN` ou --studio-origin). Le localStorage est par origine : on s'appaire sur chacune.
+pub const PROD_ALIASES: &[&str] = &["https://beta.uppwind.com"];
 /// Les ports des serveurs de dev du studio : 5174 (un serveur de dev local), 5747 (les essais et tests du compagnon).
 /// Acceptes seulement avec --dev-origins (audit de publication : jamais par defaut dans un exe public).
 pub const DEV_PORTS: &[u16] = &[5174, 5747];
@@ -80,7 +84,16 @@ impl Allowlist {
     /// La liste par defaut : le studio (default_studio_origin), plus `http://localhost:<p>` et `http://127.0.0.1:<p>`
     /// pour les ports de dev si `dev` est vrai. `extra` : des origines exactes en plus (option --allow-origin).
     pub fn new(dev: bool, extra: &[String]) -> Self {
-        Self::with_studio(Some(default_studio_origin()), dev, extra)
+        let mut a = Self::with_studio(Some(default_studio_origin()), dev, extra);
+        if default_studio_origin() == PROD_ORIGIN {
+            for o in PROD_ALIASES {
+                let o = o.to_string();
+                if !a.origins.contains(&o) {
+                    a.origins.insert(1, o);
+                }
+            }
+        }
+        a
     }
 
     /// `studio` : l'origine du studio (None : aucune — seulement `extra` et, avec `dev`, les adresses de dev).
@@ -341,7 +354,8 @@ mod tests {
         assert_eq!(other.origins().len(), 1);
         let none = Allowlist::with_studio(None, false, &[]);
         assert!(none.origins().is_empty() && !none.allows(Some(PROD_ORIGIN)));
-        assert_eq!(Allowlist::new(false, &[]).origins(), &[default_studio_origin().to_string()], "by default: the studio, nothing else");
+        assert_eq!(Allowlist::new(false, &[]).origins(), &[PROD_ORIGIN.to_string(), "https://beta.uppwind.com".to_string()], "by default: the studio and its beta name, nothing else");
+        assert!(prod.allows(Some("https://beta.uppwind.com")) && !prod.allows(Some("https://uppwind.com")) && !prod.allows(Some("http://beta.uppwind.com")));
     }
 
     #[test]

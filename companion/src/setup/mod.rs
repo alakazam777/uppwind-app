@@ -24,7 +24,8 @@
 //! `--uninstall` (main.rs) remet d'abord les reglages de FL que le compagnon a ecrits.
 //! (29 oct.) Les plugins Uppwind Link (VST3) aussi, sauf --skip-plugins (src/plugin_install/) : sous Windows, dans
 //! C:\Program Files\Common Files\VST3, la SEULE ecriture qui demande l'administrateur (une invite, pour la copie
-//! seulement) ; sous macOS, dans ~/Library/Audio/Plug-Ins/VST3.
+//! seulement) ; sous macOS, dans ~/Library/Audio/Plug-Ins/VST3, et (10 nov.) leurs Audio Units (Logic Pro) dans
+//! ~/Library/Audio/Plug-Ins/Components.
 
 pub mod ableton;
 pub mod env;
@@ -133,7 +134,8 @@ pub const HELP: &str = "uppwind-companion --setup [--apply] [--remove] [--json] 
   Without --apply nothing is changed: it says what it would do.\n\
   --fl-settings also writes FL Studio's MIDI and audio settings (FL closed, a backup first); with --remove it puts\n\
   them back. --fl-free-midi disables a USB MIDI device in FL, so the browser can open it.\n\
-  It also installs (or with --remove, removes) the Uppwind Link plugins (VST3); --skip-plugins leaves them out.\n\
+  It also installs (or with --remove, removes) the Uppwind Link plugins (VST3; on macOS also their Audio Units, for\n\
+  Logic Pro); --skip-plugins leaves them out.\n\
   On Windows they go in C:\\Program Files\\Common Files\\VST3: Windows asks for administrator rights once.\n\
 uppwind-companion --install-plugins [--dry-run] [--remove] [--force]   the Uppwind Link plugins only";
 
@@ -218,6 +220,10 @@ pub struct Report {
     /// leur dossier (None : introuvable, rien n'y sera fait)
     #[serde(skip)]
     pub plugin_target: Option<crate::plugin_install::Target>,
+    /// (10 nov.) macOS : leurs Audio Units (Logic Pro), « Uppwind Link.component » dans Components ; None ailleurs
+    pub component: Option<crate::plugin_install::Report>,
+    #[serde(skip)]
+    pub component_target: Option<crate::plugin_install::Target>,
     pub checks: Vec<Check>,
     pub done: Vec<String>,
     pub errors: Vec<String>,
@@ -271,7 +277,7 @@ fn machine_checks(r: &Report) -> Vec<Check> {
         // le son revient par le plugin
         c.push(Check::info(
             "audio.return",
-            "Audio return on macOS: put the \"Uppwind Link Return\" plugin (VST3, ~/Library/Audio/Plug-Ins/VST3) on your DAW's master; it sends the sound to the companion. No virtual cable needed.",
+            "Audio return on macOS: put the \"Uppwind Link Return\" plugin on your DAW's master (the VST3, in ~/Library/Audio/Plug-Ins/VST3; in Logic Pro, its Audio Unit, in an Audio FX slot of the Stereo Out); it sends the sound to the companion. No virtual cable needed.",
         ));
     }
     if cfg!(windows) {
@@ -406,6 +412,7 @@ pub fn gather(probe: &Probe, o: &Opts, stamp: &str) -> Report {
     }
     let fls = fl_settings::prepare(reg, fl::IL, &flx, probe, o, &backups, stamp);
     let (plugins, plugin_target) = plugins_of(probe, o);
+    let (component, component_target) = component_of(o, plugin_target.as_ref());
     let mut r = Report {
         companion: env!("CARGO_PKG_VERSION"),
         mode: if o.apply { "apply" } else { "dry-run" },
@@ -420,6 +427,8 @@ pub fn gather(probe: &Probe, o: &Opts, stamp: &str) -> Report {
         fl_settings: fls,
         plugins,
         plugin_target,
+        component,
+        component_target,
         checks: vec![],
         done: vec![],
         errors: vec![],
@@ -448,6 +457,23 @@ fn plugins_of(probe: &Probe, o: &Opts) -> (crate::plugin_install::Report, Option
     (r, Some(t))
 }
 
+/// (10 nov.) macOS : les Audio Units des plugins (Logic Pro), a cote du dossier VST3 (Target::component), avec les memes
+/// regles ; ailleurs, ou sans dossier VST3 : rien.
+fn component_of(o: &Opts, vst3: Option<&crate::plugin_install::Target>) -> (Option<crate::plugin_install::Report>, Option<crate::plugin_install::Target>) {
+    use crate::plugin_install as pi;
+    let Some(t) = vst3.filter(|_| cfg!(target_os = "macos")).map(|t| t.component()) else {
+        return (None, None);
+    };
+    let mut r = pi::inspect(&pi::Bundle::component(), &t);
+    if o.plugins {
+        pi::plan(&mut r, o.mode == Mode::Remove, o.force);
+    } else {
+        r.action = pi::Action::None;
+        r.reason = format!("left out ({})", pi::SKIP_FLAG);
+    }
+    (Some(r), Some(t))
+}
+
 fn plugin_checks(r: &Report) -> Vec<Check> {
     use crate::plugin_install::{Action as A, Status as S};
     let p = &r.plugins;
@@ -469,6 +495,20 @@ fn plugin_checks(r: &Report) -> Vec<Check> {
     }];
     if !p.held.is_empty() {
         c.push(Check::info("plugins.held", "A DAW still has older Uppwind Link plugins loaded: restart it; the old file goes once it is free."));
+    }
+    // (10 nov.) macOS : leurs Audio Units, pour Logic Pro
+    if let Some(au) = r.component.as_ref().filter(|au| au.supported) {
+        let what = format!("Uppwind Link Audio Units (for Logic Pro) in {}", au.folder.display());
+        let st = au.after.unwrap_or(au.status);
+        c.push(match st {
+            S::UpToDate => Check::ok("plugins.au", &format!("{what}: up to date.")),
+            S::Missing if r.intent == "remove" => Check::ok("plugins.au", &format!("{what}: not installed.")),
+            _ if !au.embedded && r.intent == "install" => Check::info("plugins.au", &format!("{what}: this build of the companion does not carry them (a development build): the released one installs them.")),
+            S::Missing => Check::todo("plugins.au", &format!("{what}: not installed (Logic Pro loads only Audio Units); --setup --apply installs them.")),
+            S::Newer => Check::info("plugins.au", &format!("{what}: installed by a newer companion ({}).", au.installed_by.as_deref().unwrap_or("?"))),
+            _ if r.intent == "remove" && au.action == A::Skip => Check::info("plugins.au", &format!("{what}: not installed by Uppwind Link, left alone.")),
+            _ => Check::todo("plugins.au", &format!("{what}: {} installed; --setup --apply replaces them.", if st == S::Outdated { "an older version is" } else { "different files are" })),
+        });
     }
     c
 }
@@ -531,6 +571,12 @@ pub fn apply(r: &mut Report) {
     // (29 oct.) les plugins : sous Windows, l'invite d'administrateur (dite sur stderr : la sortie --json reste du JSON)
     if let Some(t) = r.plugin_target.clone() {
         let a = crate::plugin_install::apply(&mut r.plugins, &crate::plugin_install::Bundle::embedded(), &t, &|l| eprintln!("{l}…"));
+        r.done.extend(a.done);
+        r.errors.extend(a.errors);
+    }
+    // (10 nov.) macOS : leurs Audio Units (Logic Pro)
+    if let (Some(t), Some(p)) = (r.component_target.clone(), r.component.as_mut()) {
+        let a = crate::plugin_install::apply(p, &crate::plugin_install::Bundle::component(), &t, &|l| eprintln!("{l}…"));
         r.done.extend(a.done);
         r.errors.extend(a.errors);
     }
@@ -723,7 +769,8 @@ fn print_text(r: &Report) {
         }
     }
     let fla = r.fl_settings.action.as_str();
-    let plugins_change = matches!(r.plugins.action, crate::plugin_install::Action::Install | crate::plugin_install::Action::Update | crate::plugin_install::Action::Remove);
+    let changes = |a: crate::plugin_install::Action| matches!(a, crate::plugin_install::Action::Install | crate::plugin_install::Action::Update | crate::plugin_install::Action::Remove);
+    let plugins_change = changes(r.plugins.action) || r.component.as_ref().is_some_and(|c| changes(c.action));
     if r.mode != "apply" && (r.scripts.iter().any(|t| matches!(t.action, Action::Install | Action::Update | Action::Remove)) || fla == "write" || fla == "restore" || plugins_change) {
         println!();
         println!("Run again with --apply to do it.");
@@ -736,15 +783,21 @@ fn print_text(r: &Report) {
     }
 }
 
-/// (29 oct.) La partie « plugins » du rapport texte.
+/// (29 oct.) La partie « plugins » du rapport texte ; (10 nov.) et celle de leurs Audio Units (macOS).
 fn print_plugins(r: &Report) {
+    print_bundle(r, &r.plugins, "Uppwind Link plugins (VST3: Uppwind Link Return, Uppwind Link Notes)");
+    if let Some(au) = &r.component {
+        print_bundle(r, au, "Uppwind Link Audio Units (for Logic Pro: Uppwind Link Return, Uppwind Link Notes)");
+    }
+}
+
+fn print_bundle(r: &Report, p: &crate::plugin_install::Report, title: &str) {
     use crate::plugin_install::Action as A;
-    let p = &r.plugins;
     if !p.supported {
         return;
     }
     println!();
-    println!("Uppwind Link plugins (VST3: Uppwind Link Return, Uppwind Link Notes) → {}", p.folder.display());
+    println!("{title} → {}", p.folder.display());
     let changed: Vec<String> = p.files.iter().filter(|f| f.state != "same").map(|f| format!("{} {}", f.name, f.state)).collect();
     println!(
         "  now: {:?}{}{}{}",

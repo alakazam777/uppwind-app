@@ -197,6 +197,23 @@ pub struct Remote {
     pub idle_disarm_min: u64,
 }
 
+/// (11 nov., discord.rs) La presence Discord, telle que la fenetre d'etat la montre.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Discord {
+    /// la personne l'a permise ici
+    pub allowed: bool,
+    /// unknown | ok | absent (le client Discord de bureau ne tourne pas)
+    pub discord: &'static str,
+    /// un titre est affiche sur Discord maintenant
+    pub shown: bool,
+}
+
+impl Default for Discord {
+    fn default() -> Discord {
+        Discord { allowed: false, discord: "unknown", shown: false }
+    }
+}
+
 /// Le modele de la fenetre d'etat.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusModel {
@@ -213,6 +230,10 @@ pub struct StatusModel {
     pub ports: Ports,
     pub audio: Audio,
     pub autostart: bool,
+    /// (11 nov.) la presence Discord (remplie par tray::status_model)
+    pub discord: Discord,
+    /// (11 nov., update.rs) la mise a jour : la case automatique, la derniere version lue (remplie par tray::status_model)
+    pub update: crate::update::View,
 }
 
 /// Les DAW et leurs scripts, d'un rapport de `--setup` (une simulation).
@@ -266,6 +287,8 @@ pub fn model(r: &Report, port: u16, token: &str, remote: Remote, live: Live, aud
         ports: Ports { link, back, near, loopmidi_installed: r.midi.loopmidi.is_some(), loopmidi_running: r.midi.loopmidi_running },
         audio: Audio { available: audio_available.is_ok(), error: audio_available.err(), trouble: None },
         autostart,
+        discord: Discord::default(),
+        update: Default::default(),
     }
     .with_trouble()
 }

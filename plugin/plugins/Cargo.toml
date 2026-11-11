@@ -22,3 +22,16 @@ serde_json = "1"
 # (29 oct., protocole v2) le nonce de chaque connexion, du generateur du systeme (ProcessPrng sous Windows, deja la par
 # std ; getentropy sous macOS) : MIT OR Apache-2.0, la meme version que tungstenite (testhost)
 getrandom = "0.4"
+
+# (9 nov.) Logic Pro ne charge que des Audio Units : l'option « auv2 » (macOS) ajoute les points d'entree AUv2 du crate
+# clap-wrapper (MIT OR Apache-2.0 ; il compile avec `cc` une copie de free-audio/clap-wrapper (MIT) et du SDK Audio Unit
+# d'Apple (Apache-2.0)), qui enveloppent l'export CLAP de nice-plug. Pas une option par defaut de cargo (Windows n'en a
+# que faire) ; (10 nov.) le build macOS l'active (dev/build-macos.sh, UWL_AUV2=0 pour s'en passer, et `uwl-bundle
+# --auv2`, le .component), et le compagnon de macOS l'embarque et l'installe.
+# (10 nov.) Le crate vient de la copie corrigee ../vendor/clap-wrapper ([patch.crates-io] de ../Cargo.toml) : l'heure des
+# notes MIDI, un build reproductible, ni journal ni assert en release (../vendor/clap-wrapper/UPPWIND.md).
+[features]
+auv2 = ["dep:clap-wrapper"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+clap-wrapper = { version = "=0.3.1", default-features = false, features = ["auv2"], optional = true }

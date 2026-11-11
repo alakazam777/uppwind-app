@@ -12,6 +12,10 @@
 //!   macOS   : ~/Library/Audio/Plug-Ins/VST3/Uppwind Link.vst3, sans administrateur. Les fichiers sont ceux du bundle
 //!             signe, octet pour octet (sa signature reste valide : `codesign --verify` sur le resultat), le binaire en
 //!             0755, le reste en 0644. Sur un Mac, Return est le seul chemin du son du DAW vers le studio sans cable.
+//!   macOS, (10 nov.) les Audio Units : « Uppwind Link.component » (Logic Pro ne charge qu'eux) dans
+//!             ~/Library/Audio/Plug-Ins/Components, quand l'exe le porte (UWL_PLUGIN_COMPONENT a la construction) : le
+//!             meme binaire que le VST3, dans son propre paquet signe, avec son propre releve (component-installed.json).
+//!             Chaque commande qui pose ou retire le VST3 sous macOS le fait aussi pour lui (Target::component).
 //!   Linux   : pas de plugins (le compagnon s'y construit, c'est tout).
 //!
 //! Un DAW garde la DLL chargee : sous Windows, elle ne peut ni etre ecrasee ni effacee, mais elle peut etre renommee.
@@ -50,6 +54,12 @@ mod embedded {
 pub const BUNDLE_NAME: &str = "Uppwind Link.vst3";
 /// Le releve de ce que le compagnon a installe (dans son dossier).
 pub const MARKER_NAME: &str = "plugins-installed.json";
+/// (10 nov.) macOS : le paquet des Audio Units (Logic Pro), dans le dossier Components, et son releve.
+pub const COMPONENT_NAME: &str = "Uppwind Link.component";
+pub const COMPONENT_MARKER: &str = "component-installed.json";
+/// Ce que chaque paquet est, en mots.
+pub const PLUGINS_WHAT: &str = "Uppwind Link plugins";
+pub const COMPONENT_WHAT: &str = "Uppwind Link Audio Units";
 pub const INSTALL_FLAG: &str = "--install-plugins";
 /// Cache, pour les essais : le dossier VST3 a utiliser (jamais celui du systeme, jamais d'elevation).
 pub const DIR_FLAG: &str = "--plugins-dir";
@@ -61,8 +71,9 @@ pub const CHOICE_ID: &str = "plugins";
 pub const HELP: &str = "uppwind-companion --install-plugins [--dry-run] [--remove] [--force]\n\
   the Uppwind Link plugins (VST3: Uppwind Link Return, Uppwind Link Notes) that this program carries. Windows: into\n\
   C:\\Program Files\\Common Files\\VST3, where FL Studio and Live look for them (Windows asks for administrator rights\n\
-  once, for the copy only); macOS: into ~/Library/Audio/Plug-Ins/VST3. --dry-run says what it would do; --remove\n\
-  takes them out again (only plugins the companion installed); --force replaces plugins of a newer companion.";
+  once, for the copy only); macOS: into ~/Library/Audio/Plug-Ins/VST3, and their Audio Units (for Logic Pro) into\n\
+  ~/Library/Audio/Plug-Ins/Components. --dry-run says what it would do; --remove takes them out again (only plugins\n\
+  the companion installed); --force replaces plugins of a newer companion.";
 
 /// Le bundle a installer : (chemin dans le bundle avec des « / », octets, executable sous macOS), tries.
 #[derive(Clone, Copy)]
@@ -74,6 +85,10 @@ impl Bundle {
     /// Celui de cet exe (vide : une construction sans UWL_PLUGIN_BUNDLE).
     pub fn embedded() -> Bundle {
         Bundle { files: embedded::PLUGIN_FILES }
+    }
+    /// (10 nov.) Les Audio Units de cet exe (macOS ; vide : une construction sans UWL_PLUGIN_COMPONENT).
+    pub fn component() -> Bundle {
+        Bundle { files: embedded::COMPONENT_FILES }
     }
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
@@ -110,8 +125,11 @@ pub fn dir_override() -> Option<&'static Path> {
 /// Ou vont les plugins.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Target {
-    /// le dossier VST3 : le bundle y va, sous le nom « Uppwind Link.vst3 »
+    /// le dossier VST3 : le bundle y va, sous le nom « Uppwind Link.vst3 » ; (10 nov.) pour les Audio Units, le dossier
+    /// Components (Target::component)
     pub vst3: PathBuf,
+    /// le nom du paquet dans ce dossier : BUNDLE_NAME, ou COMPONENT_NAME
+    pub name: &'static str,
     /// le releve de ce que le compagnon y a installe
     pub marker: PathBuf,
     /// Windows : le vrai dossier du systeme (y ecrire demande l'administrateur)
@@ -122,11 +140,33 @@ pub struct Target {
 
 impl Target {
     pub fn bundle(&self) -> PathBuf {
-        self.vst3.join(BUNDLE_NAME)
+        self.vst3.join(self.name)
     }
     /// Un dossier d'essai (--plugins-dir, les tests) : ni le systeme, ni une simulation ; le releve a cote du bundle.
     pub fn in_dir(vst3: &Path) -> Target {
-        Target { vst3: vst3.to_path_buf(), marker: vst3.join(MARKER_NAME), system: false, simulate: false }
+        Target { vst3: vst3.to_path_buf(), name: BUNDLE_NAME, marker: vst3.join(MARKER_NAME), system: false, simulate: false }
+    }
+    /// (10 nov.) Ou vont les Audio Units (macOS) quand le VST3 va ici : le dossier Components a cote du dossier VST3
+    /// (~/Library/Audio/Plug-Ins/Components, celui du systeme ou de la fausse machine) ; un dossier d'essai qui ne
+    /// s'appelle pas « VST3 » (--plugins-dir) les garde avec lui. Leur releve a cote de celui du VST3. Jamais le
+    /// dossier du systeme de Windows : ils n'y vont pas.
+    pub fn component(&self) -> Target {
+        let dir = match (self.vst3.file_name(), self.vst3.parent()) {
+            (Some(n), Some(up)) if n == "VST3" => up.join("Components"),
+            _ => self.vst3.clone(),
+        };
+        Target { vst3: dir, name: COMPONENT_NAME, marker: self.marker.with_file_name(COMPONENT_MARKER), system: false, simulate: self.simulate }
+    }
+    pub fn is_component(&self) -> bool {
+        self.name == COMPONENT_NAME
+    }
+    /// Ce qu'il y a dans ce paquet, en mots (les lignes de l'installation).
+    pub fn what(&self) -> &'static str {
+        if self.is_component() { COMPONENT_WHAT } else { PLUGINS_WHAT }
+    }
+    /// Ses plugins, en mots.
+    fn names(&self) -> &'static str {
+        if self.is_component() { "Uppwind Link Return, Uppwind Link Notes, for Logic Pro" } else { "Uppwind Link Return, Uppwind Link Notes" }
     }
 }
 
@@ -157,9 +197,9 @@ pub fn target_for(paths: &Paths, fake: bool, simulate: bool) -> Result<Target, S
     let marker = paths.local.join(crate::install::APP_DIR).join(MARKER_NAME);
     if fake {
         let vst3 = if cfg!(target_os = "macos") { mac_vst3(&paths.home) } else { paths.home.join("Program Files").join("Common Files").join("VST3") };
-        return Ok(Target { vst3, marker, system: false, simulate: false });
+        return Ok(Target { vst3, name: BUNDLE_NAME, marker, system: false, simulate: false });
     }
-    Ok(Target { vst3: system_vst3(&paths.home)?, marker, system: cfg!(windows), simulate })
+    Ok(Target { vst3: system_vst3(&paths.home)?, name: BUNDLE_NAME, marker, system: cfg!(windows), simulate })
 }
 
 /// Les dossiers de cette machine, ou ceux de la fausse de UWC_SETUP_ROOT (true), sans lire le reste de la machine.
@@ -209,7 +249,9 @@ pub struct FileState {
 /// Les plugins : ce qui est la, ce que l'on y ferait.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
-    /// Windows ou macOS
+    /// (10 nov.) PLUGINS_WHAT (le VST3) ou COMPONENT_WHAT (les Audio Units, macOS)
+    pub what: &'static str,
+    /// Windows ou macOS (les Audio Units : macOS)
     pub supported: bool,
     /// cet exe porte les plugins (UWL_PLUGIN_BUNDLE a la construction)
     pub embedded: bool,
@@ -346,7 +388,8 @@ fn exec_ok(p: &Path, exec: bool) -> bool {
 pub fn inspect(b: &Bundle, t: &Target) -> Report {
     let dir = t.bundle();
     let mut r = Report {
-        supported: supported(),
+        what: t.what(),
+        supported: supported() && (!t.is_component() || cfg!(target_os = "macos")),
         embedded: !b.is_empty(),
         folder: dir.clone(),
         status: Status::Missing,
@@ -421,6 +464,7 @@ pub fn inspect(b: &Bundle, t: &Target) -> Report {
 /// Pas de dossier VST3 (Windows n'a pas donne le sien) : rien a regarder, rien a faire, et pourquoi.
 pub fn unavailable(b: &Bundle, why: String) -> Report {
     Report {
+        what: PLUGINS_WHAT,
         supported: false,
         embedded: !b.is_empty(),
         folder: PathBuf::new(),
@@ -441,7 +485,7 @@ pub fn plan(r: &mut Report, remove: bool, force: bool) {
     let v = env!("CARGO_PKG_VERSION");
     let by = r.installed_by.clone().unwrap_or_else(|| "?".into());
     let (a, why): (Action, String) = if !r.supported {
-        (Action::Skip, "the Uppwind Link plugins are for Windows and macOS".into())
+        (Action::Skip, if r.what == COMPONENT_WHAT { "the Audio Units are for macOS (Logic Pro)" } else { "the Uppwind Link plugins are for Windows and macOS" }.into())
     } else if remove {
         match r.status {
             Status::Missing => (Action::None, "not installed".into()),
@@ -494,6 +538,7 @@ pub fn apply(r: &mut Report, b: &Bundle, t: &Target, progress: &dyn Fn(&str)) ->
 pub(crate) fn apply_with(r: &mut Report, b: &Bundle, t: &Target, progress: &dyn Fn(&str), elevated: &dyn Fn(&str) -> elevate::Outcome) -> Applied {
     let mut a = Applied::default();
     let dir = t.bundle();
+    let what = t.what();
     let shown = crate::shown_path(&dir);
     let remove = match r.action {
         Action::None if !r.held.is_empty() && !t.simulate => {
@@ -511,7 +556,7 @@ pub(crate) fn apply_with(r: &mut Report, b: &Bundle, t: &Target, progress: &dyn 
         Action::Install | Action::Update => false,
     };
     if t.simulate {
-        a.done.push(format!("Uppwind Link plugins: {} in {shown} (simulated: nothing written).", r.reason));
+        a.done.push(format!("{what}: {} in {shown} (simulated: nothing written).", r.reason));
         return a;
     }
     let local = if remove { remove_bundle(&dir).map(|x| x.held) } else { write_bundle(b, &dir).map(|x| x.held) };
@@ -546,19 +591,19 @@ pub(crate) fn apply_with(r: &mut Report, b: &Bundle, t: &Target, progress: &dyn 
         } else {
             format!("The administrator prompt was refused: the Uppwind Link plugins were not installed ({shown}).")
         }),
-        Err(e) => a.errors.push(format!("Uppwind Link plugins: {e}")),
+        Err(e) => a.errors.push(format!("{what}: {e}")),
         Ok(held) if !remove => {
             if again.status != Status::UpToDate {
-                a.errors.push(format!("Uppwind Link plugins: {shown} does not hold this companion's plugins after the copy ({:?})", again.status));
+                a.errors.push(format!("{what}: {shown} does not hold this companion's plugins after the copy ({:?})", again.status));
             } else {
                 let verb = if r.action == Action::Install { "installed" } else { "updated" };
-                a.done.push(format!("Uppwind Link plugins (Uppwind Link Return, Uppwind Link Notes) {verb} in {shown}{}.", if a.elevated { " (with administrator rights)" } else { "" }));
+                a.done.push(format!("{what} ({}) {verb} in {shown}{}.", t.names(), if a.elevated { " (with administrator rights)" } else { "" }));
                 if let Err(e) = write_marker(t, b) {
-                    a.errors.push(format!("Uppwind Link plugins: {e}"));
+                    a.errors.push(format!("{what}: {e}"));
                 }
                 if held {
                     a.restart = true;
-                    a.done.push("A DAW still has the previous Uppwind Link plugins loaded: restart it to use the new ones (the old file goes once it is free).".into());
+                    a.done.push(format!("A DAW still has the previous {what} loaded: restart it to use the new ones (the old file goes once it is free)."));
                 }
             }
         }
@@ -566,15 +611,15 @@ pub(crate) fn apply_with(r: &mut Report, b: &Bundle, t: &Target, progress: &dyn 
             let gone = std::fs::symlink_metadata(&dir).is_err();
             if gone {
                 remove_marker(t);
-                a.done.push(format!("Removed the Uppwind Link plugins from {shown}{}.", if a.elevated { " (with administrator rights)" } else { "" }));
+                a.done.push(format!("Removed the {what} from {shown}{}.", if a.elevated { " (with administrator rights)" } else { "" }));
             } else if held || !again.held.is_empty() {
                 a.restart = true;
                 a.done.push(format!(
-                    "Removed the Uppwind Link plugins from {shown}, except a file a DAW still has loaded: close the DAW{}.",
+                    "Removed the {what} from {shown}, except a file a DAW still has loaded: close the DAW{}.",
                     if a.elevated { "; it goes at the next restart of Windows" } else { ", then delete the folder" }
                 ));
             } else {
-                a.errors.push(format!("Uppwind Link plugins: {shown} is still there"));
+                a.errors.push(format!("{what}: {shown} is still there"));
             }
         }
     }
@@ -728,7 +773,8 @@ fn remove_entry(p: &Path) -> std::io::Result<()> {
 /// (macOS : un fichier de plus casserait la signature), les restes d'avant effaces s'ils sont libres, puis relu.
 pub fn write_bundle(b: &Bundle, dir: &Path) -> Result<Written, WriteError> {
     if b.is_empty() {
-        return Err(WriteError::Failed("this companion carries no plugins (a build without UWL_PLUGIN_BUNDLE)".into()));
+        let au = dir.file_name().is_some_and(|n| n == COMPONENT_NAME);
+        return Err(WriteError::Failed(format!("this companion carries no {} (a build without {})", if au { "Audio Units" } else { "plugins" }, if au { "UWL_PLUGIN_COMPONENT" } else { "UWL_PLUGIN_BUNDLE" })));
     }
     let vst3 = dir.parent().ok_or_else(|| WriteError::Failed(format!("{}: no parent folder", dir.display())))?;
     std::fs::create_dir_all(vst3).map_err(|e| io_err("create", vst3, e))?;
@@ -1009,13 +1055,37 @@ fn cli(raw: &[String]) -> i32 {
             return 1;
         }
     };
-    let b = Bundle::embedded();
-    let mut r = inspect(&b, &t);
+    let (ok, vst3_changed) = cli_one(&Bundle::embedded(), &t, remove, dry, force);
+    // (10 nov.) macOS : les Audio Units aussi (Logic Pro), dans le dossier Components
+    let (mut all_ok, mut au_changed) = (ok, false);
+    if cfg!(target_os = "macos") {
+        println!();
+        let (ok, changed) = cli_one(&Bundle::component(), &t.component(), remove, dry, force);
+        all_ok &= ok;
+        au_changed = changed;
+    }
+    if vst3_changed {
+        println!("Restart your DAW, or rescan its plugins: FL Studio › Options › Manage plugins › Find installed plugins; Ableton Live › Settings › Plug-Ins › Rescan.");
+    }
+    if au_changed {
+        println!("Restart Logic Pro: it checks new Audio Units when it starts (Logic Pro › Settings › Plug-in Manager lists them).");
+    }
+    if all_ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// Un paquet de `--install-plugins` (le VST3, ou les Audio Units de macOS) : son etat, puis ce qui est fait → (sans
+/// erreur ni invite refusee, pose ou mis a jour).
+fn cli_one(b: &Bundle, t: &Target, remove: bool, dry: bool, force: bool) -> (bool, bool) {
+    let mut r = inspect(b, t);
     plan(&mut r, remove, force);
-    println!("Uppwind Link plugins (VST3: Uppwind Link Return, Uppwind Link Notes)");
+    println!("{}", if t.is_component() { "Uppwind Link Audio Units (for Logic Pro: Uppwind Link Return, Uppwind Link Notes)" } else { "Uppwind Link plugins (VST3: Uppwind Link Return, Uppwind Link Notes)" });
     if !r.supported {
         println!("  {}.", r.reason);
-        return 0;
+        return (true, false);
     }
     println!(
         "  this companion: {}",
@@ -1038,24 +1108,17 @@ fn cli(raw: &[String]) -> i32 {
             println!("  embedded: {rel}  {} bytes  sha256 {}", bytes.len(), sha256::hex(bytes));
         }
         println!("  would: {:?} — {}{}", r.action, r.reason, if r.admin && matches!(r.action, Action::Install | Action::Update | Action::Remove) { " (Windows asks for administrator rights)" } else { "" });
-        return 0;
+        return (true, false);
     }
     println!("  {:?} — {}", r.action, r.reason);
-    let a = apply(&mut r, &b, &t, &|l| println!("  {l}"));
+    let a = apply(&mut r, b, t, &|l| println!("  {l}"));
     for l in &a.done {
         println!("{l}");
     }
     for e in &a.errors {
         eprintln!("{e}");
     }
-    if a.changed() && matches!(r.action, Action::Install | Action::Update) {
-        println!("Restart your DAW, or rescan its plugins: FL Studio › Options › Manage plugins › Find installed plugins; Ableton Live › Settings › Plug-Ins › Rescan.");
-    }
-    if a.errors.is_empty() && !a.refused {
-        0
-    } else {
-        1
-    }
+    (a.errors.is_empty() && !a.refused, a.changed() && matches!(r.action, Action::Install | Action::Update))
 }
 
 #[cfg(test)]

@@ -74,7 +74,15 @@ extern "C" {
     fn CFStringGetCString(s: CFStringRef, buf: *mut c_char, size: isize, enc: u32) -> bool;
     fn CFBooleanGetValue(b: *const c_void) -> bool;
     fn CFRelease(o: CFTypeRef);
+    fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, enc: u32) -> CFStringRef;
+    fn CFGetTypeID(o: CFTypeRef) -> usize;
+    fn CFStringGetTypeID() -> usize;
+    fn CFArrayGetTypeID() -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFNumberCreate(alloc: *const c_void, ty: i32, v: *const c_void) -> CFNumberRef;
+    fn CFRetain(o: CFTypeRef) -> CFTypeRef;
 }
+const kCFNumberFloat64Type: i32 = 6;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -109,10 +117,54 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    // (11 nov.) les fenetres d'une appli par l'Accessibilite : Logic Pro n'en donne les titres qu'a elle (ax_windows)
+    fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+    fn AXUIElementCreateSystemWide() -> CFTypeRef;
+    fn AXUIElementCopyAttributeValue(e: CFTypeRef, attr: CFStringRef, out: *mut CFTypeRef) -> i32;
+    fn AXUIElementSetMessagingTimeout(e: CFTypeRef, seconds: f32) -> i32;
+    fn AXValueGetValue(v: CFTypeRef, ty: u32, out: *mut c_void) -> bool;
+    // (11 nov.) les gestes de Logic par l'Accessibilite (input.rs) : un clic poste a Logic en arriere-plan est ignore
+    fn AXUIElementCopyElementAtPosition(app: CFTypeRef, x: f32, y: f32, out: *mut CFTypeRef) -> i32;
+    fn AXUIElementPerformAction(e: CFTypeRef, action: CFStringRef) -> i32;
+    fn AXUIElementSetAttributeValue(e: CFTypeRef, attr: CFStringRef, value: CFTypeRef) -> i32;
+    fn AXUIElementIsAttributeSettable(e: CFTypeRef, attr: CFStringRef, out: *mut u8) -> i32;
 }
+const kAXValueCGPointType: u32 = 1;
+const kAXValueCGSizeType: u32 = 2;
 
 extern "C" {
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    // libproc (libSystem) : le chemin de l'executable d'un processus (la meme signature que dans install.rs)
+    fn proc_pidpath(pid: i32, buf: *mut u8, size: u32) -> i32;
+}
+
+/// (9 nov.) L'appli « responsable » d'un processus, et le nom de son executable (« Logic Pro ») : pour un service XPC
+/// lance pour une appli (les Audio Units que Logic Pro 12 fait tourner dans AUHostingServiceXPC_arrow), l'appli
+/// elle-meme. responsibility_get_pid_responsible_for_pid n'est pas une API publique d'Apple : cherchee a l'execution
+/// (dlsym), comme CGWindowListCreateImage ; absente, ou le processus responsable de lui-meme : None. Lit un nom, rien
+/// d'autre.
+pub fn responsible_exe(pid: u32) -> Option<String> {
+    type RespFn = unsafe extern "C" fn(i32) -> i32;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let p = unsafe { dlsym(RTLD_DEFAULT, c"responsibility_get_pid_responsible_for_pid".as_ptr()) };
+    if p.is_null() {
+        return None;
+    }
+    let f = unsafe { std::mem::transmute::<*mut c_void, RespFn>(p) };
+    let r = unsafe { f(pid as i32) };
+    if r <= 0 || r as u32 == pid {
+        return None;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE : 4 × MAXPATHLEN
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { proc_pidpath(r, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned();
+    path.rsplit('/').next().filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 /// RTLD_DEFAULT sous macOS
 const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
@@ -205,6 +257,492 @@ pub fn window_pid(id: u64) -> u32 {
 /// Les autorisations, lues sans rien demander : (Enregistrement de l'ecran, Accessibilite).
 pub fn permissions() -> (bool, bool) {
     unsafe { (CGPreflightScreenCaptureAccess(), AXIsProcessTrusted()) }
+}
+
+/// (11 nov.) Une fenetre d'une appli vue par l'Accessibilite : son titre, son cadre ([x, y, largeur, hauteur] en
+/// points, origine en haut a gauche de l'ecran principal, comme kCGWindowBounds), et l'element, pour chercher plus tard
+/// ce qu'elle porte (`view_button`).
+pub struct AxWin {
+    pub title: String,
+    pub frame: [f64; 4],
+    el: AxElement,
+}
+
+impl AxWin {
+    /// (11 nov., relecture M1) Porte-t-elle le bouton de menu de l'affichage (AXMenuButton decrit « view ») que Logic Pro
+    /// met en haut de chacune de ses fenetres de plugins ? (`ax_view_button` : trois niveaux, 400 elements au plus.)
+    pub fn view_button(&self) -> bool {
+        unsafe { ax_view_button(&self.el).is_some() }
+    }
+}
+
+/// (11 nov.) Les fenetres d'une appli vues par l'Accessibilite. Logic Pro 12.3.1 ne donne pas a CGWindowList le titre
+/// de ses fenetres de plugins, meme avec « Enregistrement de l'ecran » ; l'Accessibilite le donne (« Deluxe Classic »).
+/// Lit, ne change rien. Vide sans l'autorisation « Accessibilite » (rien n'est demande), ou si l'appli ne repond pas
+/// dans le quart de seconde.
+pub fn ax_windows(pid: i32) -> Vec<AxWin> {
+    let mut out = Vec::new();
+    if pid <= 0 || !unsafe { AXIsProcessTrusted() } {
+        return out;
+    }
+    ax_timeout();
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return out;
+        }
+        let wins = ax_attr(app, c"AXWindows");
+        if !wins.is_null() && CFGetTypeID(wins) == CFArrayGetTypeID() {
+            for i in 0..CFArrayGetCount(wins) {
+                let w = CFArrayGetValueAtIndex(wins, i);
+                let (title, pos, size) = (ax_attr(w, c"AXTitle"), ax_attr(w, c"AXPosition"), ax_attr(w, c"AXSize"));
+                let (mut p, mut s) = (CGPoint::default(), CGSize::default());
+                let framed = !pos.is_null()
+                    && !size.is_null()
+                    && AXValueGetValue(pos, kAXValueCGPointType, &mut p as *mut CGPoint as *mut c_void)
+                    && AXValueGetValue(size, kAXValueCGSizeType, &mut s as *mut CGSize as *mut c_void);
+                let t = if !title.is_null() && CFGetTypeID(title) == CFStringGetTypeID() { cf_string(title) } else { String::new() };
+                if framed && !t.is_empty() {
+                    out.push(AxWin { title: t, frame: [p.x, p.y, s.width, s.height], el: AxElement(CFRetain(w)) });
+                }
+                for o in [title, pos, size] {
+                    if !o.is_null() {
+                        CFRelease(o);
+                    }
+                }
+            }
+        }
+        if !wins.is_null() {
+            CFRelease(wins);
+        }
+        CFRelease(app);
+    }
+    out
+}
+
+/// Pour toutes les demandes de l'Accessibilite de ce processus : une appli occupee ne retient pas le compagnon plus
+/// d'un quart de seconde (6 s par defaut).
+fn ax_timeout() {
+    static TIMEOUT: std::sync::Once = std::sync::Once::new();
+    TIMEOUT.call_once(|| unsafe {
+        let sys = AXUIElementCreateSystemWide();
+        if !sys.is_null() {
+            AXUIElementSetMessagingTimeout(sys, 0.25);
+            CFRelease(sys);
+        }
+    });
+}
+
+/// (11 nov.) Un element de l'Accessibilite garde d'un evenement a l'autre (l'appui, puis son relachement) ; libere a
+/// la fin.
+pub struct AxElement(CFTypeRef);
+// les demandes de l'Accessibilite passent par le systeme : un element se garde et s'utilise depuis n'importe quel fil
+unsafe impl Send for AxElement {}
+impl Drop for AxElement {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+
+/// Ce que l'Accessibilite trouve sous un point : un bouton a appuyer, ou un bouton rotatif (sa valeur, ses bornes si
+/// elle les donne).
+pub enum AxTarget {
+    Press(AxElement),
+    /// `horizontal` : un curseur couche (l'affichage « Controls » de Logic), `width` sa largeur en points
+    Knob { el: AxElement, value: f64, range: Option<(f64, f64)>, horizontal: bool, width: f64 },
+}
+
+/// (11 nov.) L'element d'une fenetre de plugin sous un point de l'ecran (points, origine en haut a gauche, comme
+/// kCGWindowBounds), par l'Accessibilite de l'appli `pid`. Mesure (Logic Pro 12.3.1, l'E-Piano a 50 %) : le test de
+/// Logic trouve l'element la ou il est DESSINE (l'onglet DETAILS, le bouton VOLUME), meme quand les cadres annonces
+/// sont decales ; sous un bouton rotatif, c'est un AXSlider sans valeur dont le PARENT est le vrai (valeur reglable,
+/// AXIncrement/AXDecrement) : on remonte de quelques parents (input::ax_step_of dit quoi faire de chacun).
+/// None : rien a faire la (du decor, un menu), ou l'element d'une autre fenetre que `frame` (une fenetre de Logic
+/// couvre celle du plugin a cet endroit). Err : pas d'« Accessibilite ».
+pub fn ax_target_at(pid: i32, x: f64, y: f64, frame: [f64; 4]) -> Result<Option<AxTarget>, String> {
+    if pid <= 0 {
+        return Ok(None);
+    }
+    if !unsafe { AXIsProcessTrusted() } {
+        return Err("allow Accessibility for the program that runs the companion (System Settings › Privacy & Security › Accessibility)".into());
+    }
+    ax_timeout();
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Ok(None);
+        }
+        let mut hit: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyElementAtPosition(app, x as f32, y as f32, &mut hit);
+        CFRelease(app);
+        if err != 0 || hit.is_null() {
+            return Ok(None);
+        }
+        let mut cur = AxElement(hit);
+        // l'element est-il dans la fenetre du plugin (son cadre) ?
+        let win = AxElement(ax_attr(cur.0, c"AXWindow"));
+        match ax_frame(win.0) {
+            Some(f) if f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0) => {}
+            _ => return Ok(None),
+        }
+        // (11 nov., relecture M1) et cette fenetre est-elle une fenetre de plugin (le bouton de menu de l'affichage) ?
+        // Sinon, rien : un studio ne presse rien dans une autre fenetre de Logic, meme si on la lui montrait
+        if !plugin_window_sign(pid, frame, &win) {
+            return Ok(None);
+        }
+        for _ in 0..5 {
+            let role = AxElement(ax_attr(cur.0, c"AXRole"));
+            let role = if !role.0.is_null() && CFGetTypeID(role.0) == CFStringGetTypeID() { cf_string(role.0) } else { String::new() };
+            let value = ax_number(cur.0, c"AXValue");
+            let settable = value.is_some() && ax_settable(cur.0, c"AXValue");
+            match crate::input::ax_step_of(&role, settable) {
+                crate::input::AxStep::Press => return Ok(Some(AxTarget::Press(cur))),
+                crate::input::AxStep::Knob => {
+                    let range = match (ax_number(cur.0, c"AXMinValue"), ax_number(cur.0, c"AXMaxValue")) {
+                        (Some(lo), Some(hi)) if hi > lo => Some((lo, hi)),
+                        _ => None,
+                    };
+                    let orient = AxElement(ax_attr(cur.0, c"AXOrientation"));
+                    let horizontal = !orient.0.is_null() && CFGetTypeID(orient.0) == CFStringGetTypeID() && cf_string(orient.0) == "AXHorizontalOrientation";
+                    let width = ax_frame(cur.0).map(|f| f[2]).unwrap_or(0.0);
+                    return Ok(Some(AxTarget::Knob { value: value.unwrap_or(0.0), range, horizontal, width, el: cur }));
+                }
+                crate::input::AxStep::Stop => return Ok(None),
+                crate::input::AxStep::Up => {}
+            }
+            let parent = ax_attr(cur.0, c"AXParent");
+            if parent.is_null() {
+                break;
+            }
+            cur = AxElement(parent);
+        }
+        Ok(None)
+    }
+}
+
+/// L'appui (AXPress) d'un bouton.
+pub fn ax_press(el: &AxElement) -> Result<(), String> {
+    ax_action(el, c"AXPress")
+}
+
+/// Un cran de plus (AXIncrement) ou de moins (AXDecrement) d'un bouton rotatif.
+pub fn ax_step(el: &AxElement, up: bool) -> Result<(), String> {
+    ax_action(el, if up { c"AXIncrement" } else { c"AXDecrement" })
+}
+
+/// La valeur d'un bouton rotatif.
+pub fn ax_set_value(el: &AxElement, v: f64) -> Result<(), String> {
+    unsafe {
+        let key = CFStringCreateWithCString(std::ptr::null(), c"AXValue".as_ptr(), kCFStringEncodingUTF8);
+        let num = CFNumberCreate(std::ptr::null(), kCFNumberFloat64Type, &v as *const f64 as *const c_void);
+        let err = if key.is_null() || num.is_null() { -1 } else { AXUIElementSetAttributeValue(el.0, key, num) };
+        if !key.is_null() {
+            CFRelease(key);
+        }
+        if !num.is_null() {
+            CFRelease(num);
+        }
+        if err == 0 {
+            Ok(())
+        } else {
+            Err(format!("the plugin refused the value (Accessibility error {err})"))
+        }
+    }
+}
+
+/// (11 nov.) La valeur d'un bouton, verifiee : mesure dans l'affichage « Controls » de Logic, la case de valeur
+/// numerique prend un AXValue pour UN cran (75 → 74 en demandant 50), la glissiere voisine le prend tel quel. On relit
+/// donc la valeur, et on finit par crans (AXIncrement / AXDecrement, 32 au plus) jusqu'a `tol` pres. → la valeur atteinte.
+pub fn ax_reach_value(el: &AxElement, target: f64, tol: f64) -> Result<f64, String> {
+    ax_set_value(el, target)?;
+    let read = || unsafe { ax_number(el.0, c"AXValue") };
+    let Some(mut now) = read() else { return Ok(target) };
+    for _ in 0..32 {
+        let gap = target - now;
+        if gap.abs() <= tol {
+            break;
+        }
+        ax_step(el, gap > 0.0)?;
+        let Some(next) = read() else { break };
+        // plus rien ne bouge, ou la cible est depassee : on s'arrete la
+        let stuck = (next - now).abs() < 1e-9 || (target - next).signum() != gap.signum();
+        now = next;
+        if stuck {
+            break;
+        }
+    }
+    Ok(now)
+}
+
+fn ax_action(el: &AxElement, name: &std::ffi::CStr) -> Result<(), String> {
+    unsafe {
+        let key = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), kCFStringEncodingUTF8);
+        if key.is_null() {
+            return Err("CFString failed".into());
+        }
+        let err = AXUIElementPerformAction(el.0, key);
+        CFRelease(key);
+        if err == 0 {
+            Ok(())
+        } else {
+            Err(format!("the plugin refused the gesture (Accessibility error {err})"))
+        }
+    }
+}
+
+/// (11 nov.) L'affichage d'une fenetre de plugin de Logic Pro : « Controls » (Logic y dessine tous les reglages en
+/// curseurs, accessibles) ou le dessin du plugin ; `opaque` : ce dessin ne montre rien a l'Accessibilite (mesure : PSP
+/// VintageWarmer2, sous un bouton Logic ne trouve que la fenetre), les gestes du studio n'y passent donc pas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogicView {
+    pub controls: bool,
+    pub opaque: bool,
+}
+
+/// La fenetre de l'appli dont le cadre est `frame` (a 2 points pres), par l'Accessibilite.
+unsafe fn ax_window_by_frame(app: CFTypeRef, frame: [f64; 4]) -> Option<AxElement> {
+    let wins = AxElement(ax_attr(app, c"AXWindows"));
+    if wins.0.is_null() || CFGetTypeID(wins.0) != CFArrayGetTypeID() {
+        return None;
+    }
+    for i in 0..CFArrayGetCount(wins.0) {
+        let w = CFArrayGetValueAtIndex(wins.0, i);
+        if ax_frame(w).is_some_and(|f| f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0)) {
+            return Some(AxElement(CFRetain(w)));
+        }
+    }
+    None
+}
+
+/// (11 nov., relecture M1) La derniere fenetre reconnue comme fenetre de plugin par son bouton de menu de l'affichage
+/// (pid, cadre, quand) : les gestes d'une rafale (la molette, plusieurs dizaines par seconde) ne refont pas la recherche.
+static PLUGIN_SIGN: std::sync::Mutex<Option<(i32, [f64; 4], std::time::Instant)>> = std::sync::Mutex::new(None);
+const PLUGIN_SIGN_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn plugin_window_sign(pid: i32, frame: [f64; 4], win: &AxElement) -> bool {
+    let same = |f: [f64; 4]| f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0);
+    if let Ok(g) = PLUGIN_SIGN.lock() {
+        if g.as_ref().is_some_and(|&(p, f, t)| p == pid && same(f) && t.elapsed() < PLUGIN_SIGN_FRESH) {
+            return true;
+        }
+    }
+    let ok = unsafe { ax_view_button(win).is_some() };
+    if let Ok(mut g) = PLUGIN_SIGN.lock() {
+        *g = ok.then(|| (pid, frame, std::time::Instant::now()));
+    }
+    ok
+}
+
+/// (11 nov., relecture M1) La fenetre de Logic `frame` porte-t-elle le bouton de menu de l'affichage, que seules ses
+/// fenetres de plugins portent ? Relu a chaque fois (pour `view`, rare). false sans « Accessibilite ».
+pub fn ax_plugin_window(pid: i32, frame: [f64; 4]) -> bool {
+    if pid <= 0 || !unsafe { AXIsProcessTrusted() } {
+        return false;
+    }
+    ax_timeout();
+    unsafe {
+        let app = AxElement(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
+            return false;
+        }
+        ax_window_by_frame(app.0, frame).is_some_and(|w| ax_view_button(&w).is_some())
+    }
+}
+
+/// Le bouton de menu de l'affichage dans la barre de Logic, au-dessus du plugin (AXMenuButton, AXDescription
+/// « view », titre « Editor » ou « Controls » : mesure du 11 nov.) ; cherche sur trois niveaux, 400 elements au plus.
+unsafe fn ax_view_button(win: &AxElement) -> Option<AxElement> {
+    let mut level = vec![AxElement(CFRetain(win.0))];
+    let mut seen = 0;
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for e in &level {
+            let kids = AxElement(ax_attr(e.0, c"AXChildren"));
+            if kids.0.is_null() || CFGetTypeID(kids.0) != CFArrayGetTypeID() {
+                continue;
+            }
+            for i in 0..CFArrayGetCount(kids.0) {
+                seen += 1;
+                if seen > 400 {
+                    return None;
+                }
+                let k = CFArrayGetValueAtIndex(kids.0, i);
+                if ax_text(k, c"AXRole") == "AXMenuButton" && ax_text(k, c"AXDescription") == "view" {
+                    return Some(AxElement(CFRetain(k)));
+                }
+                next.push(AxElement(CFRetain(k)));
+            }
+        }
+        level = next;
+    }
+    None
+}
+
+/// Le texte d'un attribut (AXRole, AXTitle…), ou vide.
+unsafe fn ax_text(e: CFTypeRef, name: &std::ffi::CStr) -> String {
+    let v = AxElement(ax_attr(e, name));
+    if !v.0.is_null() && CFGetTypeID(v.0) == CFStringGetTypeID() {
+        cf_string(v.0)
+    } else {
+        String::new()
+    }
+}
+
+/// L'affichage de la fenetre `win` : son bouton de menu, et ce qui est sous le centre du plugin (sous la barre de
+/// Logic, 100 points) : la fenetre elle-meme, le dessin est opaque.
+unsafe fn ax_logic_view_of(app: CFTypeRef, win: &AxElement) -> Option<LogicView> {
+    let button = ax_view_button(win)?;
+    let controls = ax_text(button.0, c"AXTitle") == "Controls";
+    let f = ax_frame(win.0)?;
+    let (cx, cy) = (f[0] + f[2] / 2.0, f[1] + 100.0 + (f[3] - 100.0).max(0.0) / 2.0);
+    let mut hit: CFTypeRef = std::ptr::null();
+    let opaque = AXUIElementCopyElementAtPosition(app, cx as f32, cy as f32, &mut hit) == 0 && !hit.is_null() && {
+        let h = AxElement(hit);
+        ax_text(h.0, c"AXRole") == "AXWindow"
+    };
+    Some(LogicView { controls, opaque })
+}
+
+/// (11 nov.) L'affichage de la fenetre de plugin de Logic Pro au cadre `frame`. None : pas d'Accessibilite, ou pas de
+/// fenetre de plugin de Logic la.
+pub fn ax_logic_view(pid: i32, frame: [f64; 4]) -> Option<LogicView> {
+    if pid <= 0 || !unsafe { AXIsProcessTrusted() } {
+        return None;
+    }
+    ax_timeout();
+    unsafe {
+        let app = AxElement(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
+            return None;
+        }
+        let win = ax_window_by_frame(app.0, frame)?;
+        ax_logic_view_of(app.0, &win)
+    }
+}
+
+/// (11 nov.) Passe la fenetre de plugin de Logic Pro au cadre `frame` a « Controls » (ou au dessin du plugin), par son
+/// menu d'affichage : AXPress ouvre le menu, puis AXPress sur l'element choisi (plugins::logic_view_item ; mesure :
+/// « Controls », puis le nom du plugin). Le menu s'ouvre un instant ; sans l'element voulu, il est referme (AXCancel).
+/// → l'affichage obtenu (la fenetre change de taille).
+pub fn ax_set_logic_view(pid: i32, frame: [f64; 4], controls: bool) -> Result<LogicView, String> {
+    if pid <= 0 {
+        return Err("no application".into());
+    }
+    if !unsafe { AXIsProcessTrusted() } {
+        return Err("allow Accessibility for the program that runs the companion (System Settings › Privacy & Security › Accessibility)".into());
+    }
+    ax_timeout();
+    unsafe {
+        let app = AxElement(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
+            return Err("no application".into());
+        }
+        let win = ax_window_by_frame(app.0, frame).ok_or("the plugin window is not found by Accessibility")?;
+        let button = ax_view_button(&win).ok_or("this window has no Editor / Controls menu")?;
+        if (ax_text(button.0, c"AXTitle") == "Controls") == controls {
+            return ax_logic_view_of(app.0, &win).ok_or_else(|| "the view cannot be read".to_string());
+        }
+        ax_press(&button)?;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        // le menu ouvert : ses elements (AXMenu > AXMenuItem)
+        let mut items: Vec<AxElement> = Vec::new();
+        let menus = AxElement(ax_attr(button.0, c"AXChildren"));
+        if !menus.0.is_null() && CFGetTypeID(menus.0) == CFArrayGetTypeID() {
+            for i in 0..CFArrayGetCount(menus.0) {
+                let menu = CFArrayGetValueAtIndex(menus.0, i);
+                let kids = AxElement(ax_attr(menu, c"AXChildren"));
+                if kids.0.is_null() || CFGetTypeID(kids.0) != CFArrayGetTypeID() {
+                    continue;
+                }
+                for j in 0..CFArrayGetCount(kids.0) {
+                    let k = CFArrayGetValueAtIndex(kids.0, j);
+                    if ax_text(k, c"AXRole") == "AXMenuItem" {
+                        items.push(AxElement(CFRetain(k)));
+                    }
+                }
+            }
+        }
+        let titles: Vec<String> = items.iter().map(|e| ax_text(e.0, c"AXTitle")).collect();
+        let Some(i) = crate::plugins::logic_view_item(&titles, controls) else {
+            if !menus.0.is_null() && CFGetTypeID(menus.0) == CFArrayGetTypeID() {
+                for i in 0..CFArrayGetCount(menus.0) {
+                    let menu = AxElement(CFRetain(CFArrayGetValueAtIndex(menus.0, i)));
+                    let _ = ax_action(&menu, c"AXCancel");
+                }
+            }
+            return Err(format!("the view menu has no {} item ({titles:?})", if controls { "Controls" } else { "plugin" }));
+        };
+        ax_press(&items[i])?;
+        // le bouton prend le titre du nouvel affichage un instant apres (mesure : pas encore a 250 ms) : on l'attend,
+        // une seconde au plus
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if (ax_text(button.0, c"AXTitle") == "Controls") == controls {
+                break;
+            }
+        }
+        ax_logic_view_of(app.0, &win).ok_or_else(|| "the view cannot be read".to_string())
+    }
+}
+
+/// Un nombre de l'Accessibilite (AXValue, AXMinValue…), s'il en est un.
+unsafe fn ax_number(e: CFTypeRef, name: &std::ffi::CStr) -> Option<f64> {
+    let v = ax_attr(e, name);
+    if v.is_null() {
+        return None;
+    }
+    let mut out = 0.0f64;
+    let ok = CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue(v, kCFNumberFloat64Type, &mut out as *mut f64 as *mut c_void);
+    CFRelease(v);
+    (ok && out.is_finite()).then_some(out)
+}
+
+unsafe fn ax_settable(e: CFTypeRef, name: &std::ffi::CStr) -> bool {
+    let key = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), kCFStringEncodingUTF8);
+    if key.is_null() {
+        return false;
+    }
+    let mut ok: u8 = 0;
+    let err = AXUIElementIsAttributeSettable(e, key, &mut ok);
+    CFRelease(key);
+    err == 0 && ok != 0
+}
+
+/// Le cadre d'un element (x, y, largeur, hauteur en points), s'il le donne.
+unsafe fn ax_frame(e: CFTypeRef) -> Option<[f64; 4]> {
+    if e.is_null() {
+        return None;
+    }
+    let (pos, size) = (ax_attr(e, c"AXPosition"), ax_attr(e, c"AXSize"));
+    let (mut p, mut s) = (CGPoint::default(), CGSize::default());
+    let ok = !pos.is_null()
+        && !size.is_null()
+        && AXValueGetValue(pos, kAXValueCGPointType, &mut p as *mut CGPoint as *mut c_void)
+        && AXValueGetValue(size, kAXValueCGSizeType, &mut s as *mut CGSize as *mut c_void);
+    for o in [pos, size] {
+        if !o.is_null() {
+            CFRelease(o);
+        }
+    }
+    ok.then_some([p.x, p.y, s.width, s.height])
+}
+
+/// Un attribut d'un element de l'Accessibilite (a liberer par CFRelease), ou nul.
+unsafe fn ax_attr(e: CFTypeRef, name: &std::ffi::CStr) -> CFTypeRef {
+    let key = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), kCFStringEncodingUTF8);
+    if key.is_null() {
+        return std::ptr::null();
+    }
+    let mut v: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(e, key, &mut v);
+    CFRelease(key);
+    if err == 0 {
+        v
+    } else {
+        std::ptr::null()
+    }
 }
 
 type CreateImageFn = unsafe extern "C" fn(CGRect, u32, u32, u32) -> CGImageRef;
@@ -341,4 +879,18 @@ pub fn post_key(pid: u32, keycode: u16, down: bool, text: &[u16], flags: u64) ->
         CFRelease(e as CFTypeRef);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// (9 nov.) L'appli responsable : rien pour un pid absent ; pour ce processus d'essai, son appli responsable (un
+    /// terminal, l'agent de la CI…) ou rien, jamais un nom vide. Lu, jamais rien de modifie.
+    #[test]
+    fn the_responsible_app_is_read_and_never_empty() {
+        assert_eq!(super::responsible_exe(0), None);
+        assert_eq!(super::responsible_exe(u32::MAX), None);
+        if let Some(n) = super::responsible_exe(std::process::id()) {
+            assert!(!n.is_empty() && !n.contains('/'), "{n}");
+        }
+    }
 }

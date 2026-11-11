@@ -120,6 +120,20 @@ mod imp {
         }
     }
 
+    /// (11 nov.) Un Uppwind Link avec icone tourne-t-il ? (son mutex existe ; rien ne lui est dit)
+    pub fn running() -> bool {
+        let (m, _, _) = names(&scope());
+        unsafe {
+            match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(m.as_str())) {
+                Ok(h) => {
+                    let _ = CloseHandle(h);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
     /// Ecoute « Show » et « Quit » dans un fil ; `on(true)` : show, `on(false)` : quit (puis le fil s'arrete).
     pub fn listen(g: &Guard, on: impl Fn(bool) + Send + 'static) {
         let (show, quit) = (g.show, g.quit);
@@ -137,10 +151,15 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{acquire, listen, request_quit, signal_show, Acquire, Guard};
+pub use imp::{acquire, listen, request_quit, running, signal_show, Acquire, Guard};
 
 #[cfg(not(windows))]
 pub fn request_quit(_wait: Duration) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn running() -> bool {
     false
 }
 

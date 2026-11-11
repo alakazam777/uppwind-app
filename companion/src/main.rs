@@ -7,7 +7,7 @@
 //! seulement). Voir README.md.
 //!
 //!   uppwind-companion                    le serveur (port 47410, ou le suivant libre jusqu'a 47419)
-//!   uppwind-companion --list             les fenetres de plugins de Live, puis quitte
+//!   uppwind-companion --list             les fenetres de plugins de Live (et sous macOS de Logic Pro), puis quitte
 //!   uppwind-companion --probe Diva       filme 10 s la fenetre dont le titre contient « Diva » et mesure, puis quitte
 //!   uppwind-companion --bench Diva       ou passe la latence (bench.rs) : le cout de chaque capture, la cadence du
 //!                                        plugin ; --bench-clicks "x,y;…" clic → image ; --bench-out DIR une image
@@ -35,6 +35,7 @@ mod arming;
 mod audio;
 mod bench;
 mod capture;
+mod discord;
 mod encode;
 mod input;
 mod install;
@@ -60,6 +61,7 @@ mod stream;
 mod testwin;
 // (24 oct.) le compagnon s'installe lui-meme : la fenetre d'installation, l'icone, la fenetre d'etat
 mod tray;
+mod update;
 mod ui;
 mod wizard;
 
@@ -104,12 +106,27 @@ pub struct Shared {
     pub arming: arming::Arming,
     /// (9 nov., audit F2) avance a chaque nouveau code : les connexions appairees avec l'ancien se ferment (4403)
     pub revoked: AtomicU64,
+    /// (11 nov.) ce qu'on ecoute dans Music, sur le profil Discord : seulement si la personne l'a permis ici
+    pub presence: discord::Presence,
 }
 
 impl Shared {
     /// Le jeton en cours.
     pub fn token(&self) -> String {
         self.token.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// (11 nov.) Permettre ou retirer la presence Discord (la fenetre d'etat, la console ; jamais le studio) ; le fichier
+    /// d'etat le garde (« discordPresence »). Err : le choix vaut maintenant, mais n'a pas pu etre garde.
+    pub fn set_presence(&self, on: bool, by: &str) -> Result<bool, String> {
+        self.presence.set_allowed(on, by);
+        let Some(path) = &self.state else { return Ok(on) };
+        state_file::update(path, |v| {
+            v["discordPresence"] = json!(on);
+            true
+        })
+        .map(|_| on)
+        .map_err(|e| format!("Discord presence is {} now, but {} could not keep it ({e})", if on { "on" } else { "off" }, shown_path(path)))
     }
 
     /// (9 nov., audit F2) Un nouveau code : un jeton neuf, tout de suite le seul accepte ; les studios appaires avec
@@ -167,6 +184,20 @@ pub fn shown_path_in(p: &std::path::Path, home: &std::path::Path) -> String {
     s
 }
 
+/// (10 nov.) Un programme a lancer en collant la ligne dans Terminal (macOS) : `~/"Library/Application Support/…"`.
+/// Le ~ reste hors des guillemets, sinon le shell ne le remplace pas (`"~/…"` ne se trouve pas) ; hors du dossier de
+/// l'utilisateur, le chemin entier entre guillemets.
+pub fn terminal_path(p: &std::path::Path) -> String {
+    terminal_path_in(p, &home_dir())
+}
+
+pub fn terminal_path_in(p: &std::path::Path, home: &std::path::Path) -> String {
+    match p.strip_prefix(home) {
+        Ok(rest) if home.as_os_str().len() > 1 && !rest.as_os_str().is_empty() => format!("~/\"{}\"", rest.display()),
+        _ => format!("\"{}\"", p.display()),
+    }
+}
+
 /// --pairing-code : le code du fichier d'etat (celui du compagnon qui tourne, meme en fond) → (29 oct.)
 /// « UWC2-<port>-<jeton> » (security::pairing_code).
 pub fn pairing_code_of(state_json: &str) -> Option<String> {
@@ -189,6 +220,8 @@ struct Args {
     demo: bool,
     list: bool,
     probe: Option<String>,
+    /// (11 nov.) --logic-view show|controls|editor (macOS, diagnostic) : l'affichage des fenetres de plugins de Logic
+    logic_view: Option<String>,
     any: bool,
     seconds: f64,
     test_window: Option<(i32, i32)>,
@@ -239,6 +272,7 @@ fn parse_args() -> Result<Args, String> {
             "--list" => a.list = true,
             "--probe" => a.probe = Some(val("--probe")?),
             "--describe" => a.describe = Some(val("--describe")?),
+            "--logic-view" => a.logic_view = Some(val("--logic-view")?),
             "--bench" => a.bench = Some(val("--bench")?),
             "--bench-out" => a.bench_out = Some(val("--bench-out")?),
             "--bench-clicks" => {
@@ -310,9 +344,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!("Uppwind Link companion {}. {NOTICE}", env!("CARGO_PKG_VERSION"));
-                println!("uppwind-companion [--list | --probe TITLE [--seconds S]] [--port N] [--new-token] [--capture wgc|dwm|print] [--dev-origins] [--allow-origin URL] [--studio-origin URL|none] [--state-file PATH] [--demo] [--test-window [--test-window-at X,Y] [--test-window-unaware] [--test-window-ghost]] [--bench TITLE [--bench-clicks \"x,y;x,y\"] [--bench-out DIR]] [--background] [--plugin-port N | --no-plugins] [--no-midi-ports (macOS)]");
+                println!("uppwind-companion [--list | --probe TITLE [--seconds S]] [--port N] [--new-token] [--capture wgc|dwm|print] [--dev-origins] [--allow-origin URL] [--studio-origin URL|none] [--state-file PATH] [--demo] [--test-window [--test-window-at X,Y] [--test-window-unaware] [--test-window-ghost]] [--bench TITLE [--bench-clicks \"x,y;x,y\"] [--bench-out DIR]] [--background] [--plugin-port N | --no-plugins] [--no-midi-ports (macOS)] [--logic-view show|controls|editor (macOS)]");
                 println!("  Studio origin accepted by default: {} (only that one). --dev-origins adds http://localhost and http://127.0.0.1 on ports 5174 and 5747; --allow-origin adds one https:// or local origin (for your own development server only).", security::default_studio_origin());
-                println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH] | --stop-midi-ports (macOS)");
+                println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH] | --stop-midi-ports (macOS) | --check-update [--download DIR]");
                 if cfg!(target_os = "macos") {
                     println!("  macOS: the MIDI ports live in a small helper process that outlives the companion (DAWs keep them across restarts). --stop leaves it running; --stop-midi-ports and --uninstall stop it (the ports go).");
                 }
@@ -337,27 +371,100 @@ fn dpi_aware() {
 fn dpi_aware() {}
 
 fn print_windows() {
+    // sans « Enregistrement de l'ecran » (macOS), les titres des fenetres des autres applis sont vides
+    #[cfg(not(target_os = "macos"))]
+    let (titles, access) = (true, true);
     #[cfg(target_os = "macos")]
-    {
+    let (titles, access) = {
         // lues sans rien demander (aucune fenetre de macOS ne s'ouvre)
         let (screen, access) = macos::permissions();
         let yn = |b: bool| if b { "allowed" } else { "NOT allowed yet" };
-        println!("macOS permissions for this program: Screen Recording {} (window titles and pictures), Accessibility {} (clicks and keys).", yn(screen), yn(access));
+        println!(
+            "macOS permissions for this program: Screen Recording {} (window titles and pictures), Accessibility {} (clicks and keys, and the titles of Logic Pro's plugin windows).",
+            yn(screen),
+            yn(access)
+        );
         if !screen || !access {
             println!("  System Settings › Privacy & Security › Screen Recording / Accessibility: add the program that runs the companion (Terminal, or uppwind-companion itself).");
         }
-    }
+        (screen, access)
+    };
     let all = plugins::enumerate();
-    if !plugins::live_running(&all) {
-        println!("Ableton Live is not running.");
+    // (10 nov.) sous macOS, Logic Pro aussi : il ouvre ses fenetres de plugins lui-meme (un clic sur le plugin, dans sa tranche)
+    let (live, logic) = (plugins::live_running(&all), plugins::logic_running(&all));
+    if !live && !logic {
+        println!("Ableton Live is not running{}.", if cfg!(target_os = "macos") { ", nor Logic Pro" } else { "" });
         return;
     }
     let wins = plugins::plugin_windows(&all);
-    if wins.is_empty() {
-        println!("Live is running, but no plugin window is open (open one in Live: the wrench icon of the device).");
+    if wins.is_empty() && !titles {
+        println!("Without Screen Recording, this program cannot read the windows' titles: no plugin window can be recognized.");
+    } else if wins.is_empty() {
+        if live {
+            println!("Live is running, but no plugin window is open (open one in Live: the wrench icon of the device).");
+        }
+        // (11 nov.) Logic ne donne les titres de ses fenetres de plugins qu'a l'Accessibilite
+        if logic && !access {
+            println!("Logic Pro names its plugin windows only for Accessibility: without it, none of them can be recognized.");
+        } else if logic {
+            println!("Logic Pro is running, but no plugin window is open (open one in Logic Pro: click a plugin in a channel strip).");
+        }
     }
     for w in wins {
         println!("{:>12}  {}×{}{}  \"{}\"  (plugin {}, track {})", w.id, w.w, w.h, if w.minimized { " minimized" } else { "" }, w.title, w.plugin, w.track);
+    }
+}
+
+/// (11 nov.) --logic-view : l'affichage de chaque fenetre de plugin de Logic Pro (« show »), ou le passer a « controls »
+/// ou « editor », par l'Accessibilite, comme le message « view » du studio. Un diagnostic lance depuis le Terminal : rien
+/// d'autre n'est touche.
+fn logic_view_cli(what: &str) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        let set = match what {
+            "show" => None,
+            "controls" => Some(true),
+            "editor" => Some(false),
+            _ => {
+                eprintln!("--logic-view show|controls|editor");
+                return 2;
+            }
+        };
+        let wins = plugins::logic_plugin_windows(&plugins::enumerate());
+        if wins.is_empty() {
+            println!("No plugin window of Logic Pro is open (or Screen Recording / Accessibility is missing: --list says).");
+            return 1;
+        }
+        let mut code = 0;
+        for w in wins {
+            let Some(mw) = macos::window(w.id) else { continue };
+            let b = mw.bounds;
+            let frame = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+            let r = match set {
+                None => macos::ax_logic_view(mw.pid, frame).ok_or_else(|| "no Editor / Controls menu found".to_string()),
+                Some(c) => macos::ax_set_logic_view(mw.pid, frame, c),
+            };
+            match r {
+                Ok(v) => println!(
+                    "{:>12}  \"{}\"  {}{}",
+                    w.id,
+                    w.title,
+                    if v.controls { "Controls" } else { "the plugin's own view" },
+                    if v.opaque { " (opaque to Accessibility: the studio's clicks do not reach it)" } else { "" }
+                ),
+                Err(e) => {
+                    println!("{:>12}  \"{}\"  {e}", w.id, w.title);
+                    code = 1;
+                }
+            }
+        }
+        code
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = what;
+        eprintln!("--logic-view needs macOS (Logic Pro)");
+        2
     }
 }
 
@@ -484,8 +591,16 @@ fn console_commands(sh: Arc<Shared>) {
                         eprintln!("warning: {e}");
                     }
                 }
-                "help" | "?" => println!("Commands: arm (allow remote control), disarm (stop it), newcode (a new pairing code)."),
-                other => println!("Unknown command {:?}. Commands: arm, disarm, newcode, help.", other.chars().take(20).collect::<String>()),
+                "discord on" | "discord off" => {
+                    let on = line.trim().to_ascii_lowercase().ends_with("on");
+                    match sh.set_presence(on, "the console") {
+                        Ok(true) => println!("Discord presence is on: what you play in Music shows on your Discord profile (the Discord desktop app must be open)."),
+                        Ok(false) => println!("Discord presence is off."),
+                        Err(e) => eprintln!("warning: {e}"),
+                    }
+                }
+                "help" | "?" => println!("Commands: arm (allow remote control), disarm (stop it), newcode (a new pairing code), discord on / discord off (show what you play in Music on Discord)."),
+                other => println!("Unknown command {:?}. Commands: arm, disarm, newcode, discord on, discord off, help.", other.chars().take(20).collect::<String>()),
             }
         }
     });
@@ -548,10 +663,14 @@ fn run_installer(a: &Args) -> i32 {
                 if cfg!(windows) {
                     println!("Start it from the Start Menu: \"Uppwind Link Companion\".");
                 } else {
-                    println!("Start it from a Terminal: \"{}\" (or --autostart on, for every login).", shown_path(&dirs.exe()));
+                    println!("Start it from a Terminal: {} (or --autostart on, for every login).", terminal_path(&dirs.exe()));
                 }
                 println!("The pairing code stays in {}: the studio stays paired.", shown_path(&state));
-                println!("A companion that is already running keeps the old version until you close its window.");
+                if cfg!(windows) {
+                    println!("A companion that is already running keeps the old version until you close its window.");
+                } else {
+                    println!("A companion that is already running keeps the old version until you stop it (Ctrl+C in its Terminal).");
+                }
             }
             if a.uninstall {
                 println!("The pairing code file {} was left in place.", shown_path(&state));
@@ -715,6 +834,9 @@ fn main() {
     if let Some(name) = &args.probe {
         std::process::exit(probe(name, args.seconds, args.capture.as_deref(), args.any));
     }
+    if let Some(what) = &args.logic_view {
+        std::process::exit(logic_view_cli(what));
+    }
 
     let state = args.state_file.clone().unwrap_or_else(wizard::state_file);
     // (29 oct., audit MAC-1) 0600 sous macOS et Linux, avant toute lecture ; ce que le lancement d'avant y avait note
@@ -723,6 +845,10 @@ fn main() {
     }
     let token = load_token(&state, args.new_token);
     let pairing_v2 = state_file::read(&state).map(|v| state_file::pairing_v2(&v, &token)).unwrap_or(false);
+    // (11 nov.) la presence Discord : off tant que la personne ne l'a pas permise ici ; son choix d'avant
+    let discord_presence = state_file::read(&state).map(|v| v["discordPresence"] == json!(true)).unwrap_or(false);
+    // (11 nov., update.rs) la case « Update automatically » : off tant que la personne ne l'a pas cochee ici
+    let auto_update = state_file::read(&state).map(|v| v[update::STATE_KEY] == json!(true)).unwrap_or(false);
     // la machine elle-meme, et rien d'autre (un seul socket a l'ecoute, sur 127.0.0.1)
     let listener = match bind(args.port) {
         Ok(l) => l,
@@ -768,6 +894,12 @@ fn main() {
     }
     if pairing_v2 {
         st["pairingV2"] = json!(true);
+    }
+    if discord_presence {
+        st["discordPresence"] = json!(true);
+    }
+    if auto_update {
+        st[update::STATE_KEY] = json!(true);
     }
     if let Err(e) = state_file::write(&state, &st) {
         eprintln!("warning: cannot write {} ({e})", shown_path(&state));
@@ -871,7 +1003,19 @@ fn main() {
         // (9 nov., audit F1) desarme a chaque lancement ; --demo : arme (rien de reel n'est filme ni pilote)
         arming: arming::Arming::new(args.demo, !args.demo),
         revoked: AtomicU64::new(0),
+        presence: discord::Presence::new(discord_presence),
     });
+    println!(
+        "Discord presence (what you play in Music, on your Discord profile): {}",
+        // (11 nov., 0.4.0) un Mac n'a pas de fenetre d'etat : seulement la console
+        if discord_presence {
+            "ON (type « discord off » to stop it)"
+        } else if cfg!(target_os = "macos") {
+            "off (type « discord on » to allow it)"
+        } else {
+            "off (type « discord on » to allow it, or use the status window)"
+        }
+    );
     // (9 nov., audit F1/F2) dans une console : « arm », « disarm », « newcode » (sans console, la fenetre d'etat et l'icone)
     if !to_log {
         console_commands(shared.clone());
@@ -913,5 +1057,18 @@ mod tests {
         assert_eq!(shown_path_in(Path::new("/Users/someone/Library/x"), Path::new("/Users/someone")), format!("{HOME_SHOWN}/Library/x"));
         assert_eq!(shown_path_in(Path::new(r"C:\Users\someone2\x"), home), r"C:\Users\someone2\x", "another account");
         assert_eq!(shown_path_in(Path::new(r"D:\state.json"), home), r"D:\state.json");
+    }
+
+    /// (10 nov.) macOS : la ligne a coller dans Terminal garde le ~ hors des guillemets (zsh et bash ne remplacent pas
+    /// un ~ entre guillemets : `"~/Library/…"` ne se trouve pas)
+    #[cfg(not(windows))]
+    #[test]
+    fn a_path_to_paste_in_terminal_keeps_the_tilde_outside_the_quotes() {
+        let home = Path::new("/Users/someone");
+        let exe = Path::new("/Users/someone/Library/Application Support/Uppwind Link/uppwind-companion");
+        assert_eq!(terminal_path_in(exe, home), r#"~/"Library/Application Support/Uppwind Link/uppwind-companion""#);
+        assert_eq!(terminal_path_in(Path::new("/private/tmp/sb/uppwind-companion"), home), r#""/private/tmp/sb/uppwind-companion""#);
+        assert_eq!(terminal_path_in(Path::new("/Users/someone2/x"), home), r#""/Users/someone2/x""#, "another account");
+        assert_eq!(terminal_path_in(home, home), r#""/Users/someone""#);
     }
 }

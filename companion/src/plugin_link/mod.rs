@@ -477,7 +477,14 @@ impl Hub {
     pub fn old_notice(&self) -> Option<Value> {
         let list = self.old_json();
         let first = list.first()?;
-        let daw = first["daw"].as_str().map(|d| if d == "fl" { "FL Studio" } else { "Ableton Live" }).unwrap_or("your DAW");
+        let daw = first["daw"]
+            .as_str()
+            .map(|d| match d {
+                "fl" => "FL Studio",
+                "logic" => "Logic Pro",
+                _ => "Ableton Live",
+            })
+            .unwrap_or("your DAW");
         let message = format!("An older Uppwind Link plugin ({} in {daw}) cannot connect to this companion: reinstall the plugins and restart your DAW.", first["name"].as_str().unwrap_or("Uppwind Link"));
         Some(json!({ "type": "notice", "code": "old-plugin", "message": message, "plugins": list }))
     }
@@ -487,7 +494,8 @@ impl Hub {
     pub fn preferred_return(&self, target: &str) -> Option<String> {
         let want = match target {
             "auto" => None,
-            "live" | "fl" => Some(target),
+            // (9 nov.) « logic » : un Return de Logic Pro (le studio demande « auto » sans script ; ceci pour plus tard)
+            "live" | "fl" | "logic" => Some(target),
             _ => return None,
         };
         self.list()

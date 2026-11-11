@@ -40,6 +40,8 @@ pub const LOG_NAME: &str = "companion.log";
 pub const ROOT_ENV: &str = "UWC_INSTALL_ROOT";
 pub const LOG_MAX: u64 = 1024 * 1024;
 const ASIDE_PREFIX: &str = "uppwind-companion.old-";
+/// (11 nov.) la copie provisoire de `replace_exe`, avant l'echange
+const NEW_PREFIX: &str = "uppwind-companion.new-";
 
 /// Les dossiers de l'utilisateur ou tout se range.
 #[derive(Debug, Clone, PartialEq)]
@@ -158,7 +160,8 @@ fn remove_or_aside(p: &Path) -> Result<Option<String>, String> {
     Err(format!("cannot rename {} aside", p.display()))
 }
 
-/// Les copies mises de cote par un --install precedent (plus tenues : on peut les effacer) → combien.
+/// Les copies mises de cote par un --install precedent (plus tenues : on peut les effacer) → combien. (11 nov.) Aussi
+/// les copies provisoires d'un `replace_exe` interrompu (pas comptees).
 fn sweep_asides(dir: &Path) -> usize {
     let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
     let mut n = 0;
@@ -166,9 +169,61 @@ fn sweep_asides(dir: &Path) -> usize {
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with(ASIDE_PREFIX) && name.ends_with(".exe") && std::fs::remove_file(e.path()).is_ok() {
             n += 1;
+        } else if name.starts_with(NEW_PREFIX) && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
         }
     }
     n
+}
+
+/// (11 nov.) Pose `src` a la place de `dst` sans jamais laisser `dst` absent s'il etait la : `src` est d'abord copie a
+/// cote de `dst` sous un nom provisoire (executable sous Unix), puis l'ancien `dst` est renomme a cote, la copie prend
+/// son nom, et l'ancien est efface (ou garde a cote s'il tourne, efface au prochain --install). Si une etape echoue
+/// apres que l'ancien a ete renomme, il reprend sa place. → la ligne a dire si l'ancien tourne et a ete garde a cote.
+pub fn replace_exe(src: &Path, dst: &Path) -> Result<Option<String>, String> {
+    let dir = dst.parent().ok_or("no parent folder")?;
+    let tmp = dir.join(format!("{NEW_PREFIX}{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let staged = (|| -> Result<(), String> {
+        std::fs::copy(src, &tmp).map_err(|e| format!("cannot copy to {} ({e})", dst.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("cannot make {} executable ({e})", dst.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if !dst.exists() {
+        return std::fs::rename(&tmp, dst).map(|_| None).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot copy to {} ({e})", dst.display())
+        });
+    }
+    // l'ancien a cote (Windows renomme un exe qui tourne, il ne l'efface pas)
+    let Some(old) = (0..20).map(|n| dir.join(aside_name(n))).find(|p| !p.exists()) else {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot rename {} aside", dst.display()));
+    };
+    if let Err(e) = std::fs::rename(dst, &old) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot remove or rename {} ({e}): stop the companion that runs from there, then try again", dst.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, dst) {
+        // l'ancien reprend sa place (sinon, sa copie)
+        if std::fs::rename(&old, dst).is_err() {
+            let _ = std::fs::copy(&old, dst);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot put the new copy in place of {} ({e}): the old one is kept", dst.display()));
+    }
+    if std::fs::remove_file(&old).is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(format!("{} is in use (running?): renamed it to {} (removed next time)", dst.display(), old.display())))
 }
 
 /// --install : `src` (l'exe qui tourne) copie dans le dossier de l'application, le raccourci du menu Demarrer (et celui
@@ -181,16 +236,9 @@ pub fn install(dirs: &Dirs, src: &Path) -> Result<Vec<String>, String> {
     if same_file(src, &dst) {
         did.push(format!("Already running from {}: nothing to copy.", dst.display()));
     } else {
-        if let Some(l) = remove_or_aside(&dst)? {
-            if l.contains("renamed") {
-                did.push(format!("The installed copy {l}."));
-            }
-        }
-        std::fs::copy(src, &dst).map_err(|e| format!("cannot copy to {} ({e})", dst.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("cannot make {} executable ({e})", dst.display()))?;
+        // (11 nov.) jamais sans programme : la nouvelle copie d'abord, l'ancienne remise si l'echange echoue
+        if let Some(l) = replace_exe(src, &dst)? {
+            did.push(format!("The installed copy {l}."));
         }
         did.push(format!("Copied {} to {}", src.display(), dst.display()));
     }
@@ -809,6 +857,54 @@ mod tests {
         assert!(did2.iter().any(|l| l.starts_with("Removed 1 old copy")), "{did2:?}");
         assert_eq!(asides(), 0);
         uninstall(&d).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Le dossier de l'application, sans les fichiers provisoires ou mis de cote.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with(NEW_PREFIX) || n.starts_with(ASIDE_PREFIX)).collect()
+    }
+
+    #[test]
+    fn a_failed_copy_keeps_the_installed_program() {
+        let root = temp_root("copyfail");
+        let d = dirs_in(&root);
+        let src = fake_exe(&root, b"v1");
+        install(&d, &src).unwrap();
+        // une source qui n'existe pas : la copie echoue, l'exe installe reste
+        let e = install(&d, &root.join("missing").join("uppwind-companion.exe")).unwrap_err();
+        assert!(e.starts_with("cannot copy to"), "{e}");
+        assert_eq!(std::fs::read(d.exe()).unwrap(), b"v1");
+        assert!(leftovers(&d.app_dir()).is_empty(), "{:?}", leftovers(&d.app_dir()));
+        // replace_exe seul : pareil, et rien de cree quand il n'y avait rien
+        assert!(replace_exe(&root.join("missing.exe"), &d.exe()).is_err());
+        assert_eq!(std::fs::read(d.exe()).unwrap(), b"v1");
+        let none = d.app_dir().join("other.exe");
+        assert!(replace_exe(&root.join("missing.exe"), &none).is_err());
+        assert!(!none.exists());
+        assert!(leftovers(&d.app_dir()).is_empty());
+        uninstall(&d).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replace_exe_puts_the_new_copy_in_place_and_leaves_nothing_behind() {
+        let root = temp_root("replace");
+        let dir = root.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join(EXE_NAME);
+        let src = fake_exe(&root, b"new");
+        assert_eq!(replace_exe(&src, &dst), Ok(None), "nothing there yet");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        std::fs::write(&src, b"newer").unwrap();
+        assert_eq!(replace_exe(&src, &dst), Ok(None), "the old one is not running: removed");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"newer");
+        assert_eq!(std::fs::read(&src).unwrap(), b"newer", "the source stays");
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        // une copie provisoire laissee par un echange interrompu part au prochain --install
+        std::fs::write(dir.join(format!("{NEW_PREFIX}1.tmp")), b"x").unwrap();
+        assert_eq!(sweep_asides(&dir), 0, "not counted as an old copy");
+        assert!(leftovers(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

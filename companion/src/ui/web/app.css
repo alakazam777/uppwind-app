@@ -326,3 +326,38 @@ details.uw-more[open] summary::before { content: "▾ "; }
 .uw-cell-k { padding: 9px 0; color: var(--dim); font-size: 12px; border-top: 1px solid var(--line-2); }
 .uw-cell-v { padding: 9px 0; border-top: 1px solid var(--line-2); min-width: 0; }
 .uw-cell-v > * + * { margin-top: 5px; }
+
+/* (11 nov.) la fenetre d'etat sans le cadre de Windows : la tete est la barre de titre (la deplacer, double-clic :
+   agrandir), Reduire / Agrandir / Fermer a droite, un bord fin, les bords pour redimensionner */
+body.is-frameless { border: 1px solid rgba(155, 77, 255, 0.28); }
+body.is-frameless.is-max { border-color: transparent; }
+.is-frameless .uw-head { padding: 0 0 0 16px; height: 44px; gap: 10px; cursor: default; }
+.is-frameless .uw-head-right { margin-left: auto; }
+.uw-settings-btn { display: inline-flex; align-items: center; gap: 6px; }
+.uw-settings-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; }
+.uw-settings-btn.is-on { border-color: var(--neon); background: rgba(155, 77, 255, 0.22); }
+.uw-winctl { display: flex; align-self: stretch; margin-left: 4px; }
+.uw-winbtn {
+    width: 46px;
+    border: 0;
+    background: none;
+    color: var(--ink-2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: default;
+}
+.uw-winbtn svg { width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 1; }
+.uw-winbtn:hover, .uw-winbtn:focus-visible { background: rgba(255, 255, 255, 0.08); color: var(--ink); outline: none; }
+.uw-winbtn.is-close:hover, .uw-winbtn.is-close:focus-visible { background: #c42b1c; color: #fff; }
+body[data-edge="n"], body[data-edge="s"] { cursor: ns-resize; }
+body[data-edge="e"], body[data-edge="w"] { cursor: ew-resize; }
+body[data-edge="ne"], body[data-edge="sw"] { cursor: nesw-resize; }
+body[data-edge="nw"], body[data-edge="se"] { cursor: nwse-resize; }
+body[data-edge="n"] *, body[data-edge="s"] *, body[data-edge="e"] *, body[data-edge="w"] *,
+body[data-edge="ne"] *, body[data-edge="sw"] *, body[data-edge="nw"] *, body[data-edge="se"] * { cursor: inherit; }
+
+/* (11 nov.) le panneau Settings */
+.uw-settings-head { margin-bottom: 4px; }
+.uw-settings-head h1 { margin: 0; }
+.uw-card-body.is-flush { margin-left: 0; }

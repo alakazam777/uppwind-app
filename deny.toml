@@ -5,6 +5,9 @@
 #   cargo deny --manifest-path plugin/Cargo.toml --config deny.toml check advisories bans licenses sources
 
 [graph]
+# (10 Nov 2026) every feature, so that the macOS plugins' Audio Units (the auv2 feature: clap-wrapper, a patched copy in
+# plugin/vendor/, and its build dependencies) are checked like the rest
+all-features = true
 # the systems the companion and the plugins are built for
 targets = [
     "x86_64-pc-windows-msvc",

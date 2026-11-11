@@ -101,6 +101,71 @@ fn install_update_and_remove_in_a_test_folder() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// (10 nov.) Les Audio Units (macOS, Logic Pro) : « Uppwind Link.component » dans le dossier Components a cote du dossier
+// VST3, avec son propre releve ; poses, relus et retires comme le VST3, sans jamais le toucher.
+#[test]
+fn the_audio_units_go_next_to_the_vst3_folder_with_their_own_record() {
+    // le dossier du systeme (macOS) : ~/Library/Audio/Plug-Ins/VST3 → ~/Library/Audio/Plug-Ins/Components
+    let home = Path::new("/Users/someone");
+    let sys = Target { vst3: mac_vst3(home), name: BUNDLE_NAME, marker: home.join("Library/Application Support/Uppwind Link").join(MARKER_NAME), system: false, simulate: true };
+    let au = sys.component();
+    assert_eq!(au.bundle(), home.join("Library/Audio/Plug-Ins/Components/Uppwind Link.component"));
+    assert_eq!(au.marker, home.join("Library/Application Support/Uppwind Link").join(COMPONENT_MARKER));
+    assert!(au.is_component() && !sys.is_component() && au.simulate && !au.system);
+    assert_eq!((sys.what(), au.what()), (PLUGINS_WHAT, COMPONENT_WHAT));
+    // un dossier d'essai qui ne s'appelle pas VST3 (--plugins-dir) les garde avec lui
+    let d = Target::in_dir(Path::new("/tmp/uwl-check"));
+    assert_eq!(d.component().bundle(), Path::new("/tmp/uwl-check").join(COMPONENT_NAME));
+    assert_eq!(d.component().marker, Path::new("/tmp/uwl-check").join(COMPONENT_MARKER));
+
+    let root = temp_root("component");
+    let t = Target::in_dir(&root.join("VST3"));
+    let c = t.component();
+    assert_eq!(c.vst3, root.join("Components"));
+    let b = Bundle { files: MAC_V1 };
+    let mut r = inspect(&b, &c);
+    assert_eq!(r.what, COMPONENT_WHAT);
+    if !cfg!(target_os = "macos") {
+        // ailleurs, rien : Logic Pro est sur un Mac
+        plan(&mut r, false, false);
+        assert_eq!((r.supported, r.action, r.reason.as_str()), (false, Action::Skip, "the Audio Units are for macOS (Logic Pro)"));
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    // le VST3 et les Audio Units poses l'un apres l'autre
+    let mut rv = inspect(&b, &t);
+    plan(&mut rv, false, false);
+    assert!(apply(&mut rv, &b, &t, &|_| panic!("no prompt")).errors.is_empty());
+    assert_eq!(r.status, Status::Missing);
+    plan(&mut r, false, false);
+    assert_eq!(r.action, Action::Install);
+    let a = apply(&mut r, &b, &c, &|_| panic!("no prompt"));
+    assert!(a.errors.is_empty() && a.changed(), "{a:#?}");
+    assert_eq!(a.done, vec![format!("Uppwind Link Audio Units (Uppwind Link Return, Uppwind Link Notes, for Logic Pro) installed in {}.", crate::shown_path(&c.bundle()))]);
+    for (rel, bytes, _) in MAC_V1 {
+        assert_eq!(std::fs::read(path_in(&c.bundle(), rel)).unwrap(), *bytes, "{rel}");
+    }
+    assert!(c.marker.is_file() && t.marker.is_file() && c.marker != t.marker, "two records");
+    assert_eq!((status(&b, &t), status(&b, &c)), (Status::UpToDate, Status::UpToDate));
+    // une version plus ancienne d'apres son releve : « outdated », sans toucher au VST3
+    set_marker_version(&c, "0.0.1");
+    assert_eq!((status(&Bundle { files: MAC_V2 }, &c), status(&b, &t)), (Status::Outdated, Status::UpToDate));
+    set_marker_version(&c, env!("CARGO_PKG_VERSION"));
+    // retires : eux seuls, avec leur releve ; le VST3 et le sien restent
+    let mut r = inspect(&b, &c);
+    plan(&mut r, true, false);
+    assert_eq!(r.action, Action::Remove);
+    let a = apply(&mut r, &b, &c, &|_| {});
+    assert_eq!(a.done, vec![format!("Removed the Uppwind Link Audio Units from {}.", crate::shown_path(&c.bundle()))]);
+    assert!(!c.bundle().exists() && !c.marker.exists() && root.join("Components").is_dir());
+    assert_eq!(status(&b, &t), Status::UpToDate);
+    assert!(t.marker.is_file());
+    // un exe sans eux le dit, avec la bonne variable
+    let e = write_bundle(&Bundle { files: &[] }, &c.bundle()).unwrap_err();
+    assert!(e.text().contains("no Audio Units (a build without UWL_PLUGIN_COMPONENT)"), "{}", e.text());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn plugins_the_companion_did_not_install_are_left_alone() {
     let root = temp_root("foreign");
@@ -220,9 +285,18 @@ fn the_elevated_copy_takes_exactly_its_flag_and_never_runs_in_a_test() {
 
 #[test]
 fn the_embedded_bundle_has_the_layout_of_this_system() {
+    // (10 nov.) les Audio Units : seulement sous macOS, la disposition du VST3 de macOS, le meme binaire
+    let au = Bundle::component();
+    if !au.is_empty() {
+        assert!(cfg!(target_os = "macos"), "the Audio Units are embedded only in a macOS companion");
+        let names: Vec<&str> = au.files.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names, vec!["Contents/Info.plist", "Contents/MacOS/Uppwind Link", "Contents/PkgInfo", "Contents/_CodeSignature/CodeResources"]);
+        assert!(au.files.iter().all(|(n, _, x)| *x == n.starts_with("Contents/MacOS/")));
+        assert!(!notices().is_empty(), "the plugins' notices are embedded with them");
+    }
     let b = Bundle::embedded();
     if b.is_empty() {
-        assert!(notices().is_empty(), "notices only travel with the plugins");
+        assert!(!au.is_empty() || notices().is_empty(), "notices only travel with the plugins");
         return;
     }
     let names: Vec<&str> = b.files.iter().map(|(n, _, _)| *n).collect();

@@ -94,15 +94,17 @@ jobs:
           rustup default "$RUST_VERSION"
           rustc -V
           uname -m
+      # (10 Nov 2026) with their Audio Units (the auv2 feature: Logic Pro), as the macOS release builds them
       - name: Plugin tests
-        run: cargo test --release --locked --manifest-path plugin/Cargo.toml
+        run: cargo test --release --locked --manifest-path plugin/Cargo.toml --features uppwind-link/auv2
       # this runner's architecture only, signed ad hoc (no secret here); the signed, universal build: macos-build.yml
       - name: Plugin build and bundle
         run: |
-          cargo build --release --locked --manifest-path plugin/Cargo.toml
-          plugin/target/release/uwl-bundle --out "$RUNNER_TEMP/bundle" --sign -
-          codesign --verify --deep --strict "$RUNNER_TEMP/bundle/Uppwind Link.vst3"
+          cargo build --release --locked --manifest-path plugin/Cargo.toml --features uppwind-link/auv2
+          plugin/target/release/uwl-bundle --out "$RUNNER_TEMP/bundle" --auv2 --sign -
+          for k in vst3 component; do codesign --verify --deep --strict "$RUNNER_TEMP/bundle/Uppwind Link.$k"; done
           echo "UWL_PLUGIN_BUNDLE=$RUNNER_TEMP/bundle/Uppwind Link.vst3" >> "$GITHUB_ENV"
+          echo "UWL_PLUGIN_COMPONENT=$RUNNER_TEMP/bundle/Uppwind Link.component" >> "$GITHUB_ENV"
       - name: Companion tests
         run: cargo test --release --locked --manifest-path companion/Cargo.toml
       # into a folder of the runner: the same bytes, so the bundle's signature stays valid
@@ -111,9 +113,11 @@ jobs:
           cargo build --release --locked --manifest-path companion/Cargo.toml
           companion/target/release/uppwind-companion --install-plugins --plugins-dir "$RUNNER_TEMP/vst3-check"
           diff -r "$UWL_PLUGIN_BUNDLE" "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          diff -r "$UWL_PLUGIN_COMPONENT" "$RUNNER_TEMP/vst3-check/Uppwind Link.component"
+          for k in vst3 component; do codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-check/Uppwind Link.$k"; done
           companion/target/release/uppwind-companion --install-plugins --remove --plugins-dir "$RUNNER_TEMP/vst3-check"
           test ! -e "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          test ! -e "$RUNNER_TEMP/vst3-check/Uppwind Link.component"
 
   supply-chain:
     name: Dependencies (cargo audit, cargo deny)

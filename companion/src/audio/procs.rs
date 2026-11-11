@@ -21,7 +21,21 @@ pub fn daw_of_exe(exe: &str) -> Option<&'static str> {
     if name == "live" {
         return Some("live");
     }
+    // (9 nov.) macOS : « …/Logic Pro.app/Contents/MacOS/Logic Pro » (« Logic Pro X » avant la 11). Ses Audio Units
+    // tournent dans un service d'Apple (is_au_hosting_service) : plugin_link nomme alors l'appli responsable
+    if name == "logic pro" || name == "logic pro x" {
+        return Some("logic");
+    }
     None
+}
+
+/// (9 nov.) Le service d'Apple qui fait tourner des Audio Units hors du processus de leur hote : Logic Pro 12 y met nos
+/// plugins (« AUHostingServiceXPC_arrow » ; « AUHostingServiceXPC », « AUHostingService » ailleurs). Le nom d'hote qu'un
+/// plugin donne n'est alors pas celui du DAW.
+pub fn is_au_hosting_service(exe: &str) -> bool {
+    let e = exe.to_ascii_lowercase();
+    let name = e.rsplit(['\\', '/']).next().unwrap_or(&e);
+    name.starts_with("auhostingservice")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +160,15 @@ mod tests {
         assert_eq!(daw_of_exe("/Applications/Ableton Live 12 Suite.app/Contents/MacOS/Live"), Some("live"));
         assert_eq!(daw_of_exe("Live"), Some("live"));
         assert_eq!(daw_of_exe("Live Helper"), None);
+        // (9 nov.) Logic Pro, et le service d'Apple qui fait tourner ses Audio Units (pas un DAW par lui-meme)
+        assert_eq!(daw_of_exe("/Applications/Logic Pro.app/Contents/MacOS/Logic Pro"), Some("logic"));
+        assert_eq!(daw_of_exe("Logic Pro"), Some("logic"));
+        assert_eq!(daw_of_exe("Logic Pro X"), Some("logic"));
+        assert_eq!(daw_of_exe("Logic Pro Helper"), None);
+        assert_eq!(daw_of_exe("AUHostingServiceXPC_arrow"), None);
+        assert!(is_au_hosting_service("AUHostingServiceXPC_arrow"));
+        assert!(is_au_hosting_service("/System/Library/Frameworks/AudioToolbox.framework/XPCServices/AUHostingServiceXPC.xpc/Contents/MacOS/AUHostingServiceXPC"));
+        assert!(!is_au_hosting_service("Logic Pro") && !is_au_hosting_service("OsxFL") && !is_au_hosting_service(""));
     }
 
     #[test]

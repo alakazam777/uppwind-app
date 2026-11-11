@@ -38,6 +38,8 @@ pub struct Env<'a> {
     /// `simulate` dans le bac a sable), et lesquels (ceux de l'exe ; un faux bundle dans les tests)
     pub plugins: plugins::Target,
     pub plugin_bundle: plugins::Bundle,
+    /// (10 nov.) macOS : leurs Audio Units (Logic Pro), poses a cote du VST3 (`plugins.component()`) ; ceux de l'exe
+    pub component_bundle: plugins::Bundle,
 }
 
 /// Les effets sur le systeme, a part (la fenetre les fait ; les essais n'en font aucun).
@@ -92,11 +94,16 @@ pub fn webview_dir(dirs: &Dirs) -> PathBuf {
     dirs.app_dir().join("webview")
 }
 
+/// (10 nov.) Le nom de l'etape du demarrage automatique, dans la progression : « Start with Windows », ou sous macOS
+/// le LaunchAgent (install.rs), a l'ouverture de session.
+pub const AUTOSTART_STEP: &str = if cfg!(target_os = "macos") { "Start at login" } else { "Start with Windows" };
+
 /// « Start with Windows » (install.rs : le raccourci du dossier Demarrage, sans fenetre : l'icone seulement) ; un essai
-/// y ajoute ses options.
+/// y ajoute ses options. (10 nov.) macOS : le LaunchAgent d'install.rs, sans les options d'un essai (celui d'un bac a
+/// sable reste dans le bac, et launchd ne le lit jamais).
 pub fn set_autostart(dirs: &Dirs, on: bool, extra_args: &[String]) -> Result<Vec<String>, String> {
     let l = install::autostart(dirs, on, true)?;
-    if on && !extra_args.is_empty() {
+    if on && !extra_args.is_empty() && cfg!(windows) {
         let su = Shortcut { target: dirs.exe(), args: args_line(&["--background"], extra_args), minimized: true };
         shortcut::write(&dirs.startup_link(), &su)?;
     }
@@ -136,6 +143,14 @@ pub fn plan_uninstall(env: &Env) -> UninstallPlan {
             if pr.admin && !env.plugins.simulate { ": Windows asks for administrator rights" } else { "" }
         ));
     }
+    // (10 nov.) macOS : leurs Audio Units (Logic Pro)
+    if cfg!(target_os = "macos") {
+        let mut ar = plugins::inspect(&env.component_bundle, &env.plugins.component());
+        plugins::plan(&mut ar, true, false);
+        if ar.action == plugins::Action::Remove {
+            p.removes.push(format!("The Uppwind Link Audio Units, for Logic Pro ({}).", crate::shown_path(&ar.folder)));
+        }
+    }
     if r.fl_settings.available {
         p.puts_back.push("FL Studio’s MIDI settings, as they were before Uppwind Link changed them.".into());
         p.fl_running = r.fl.running.clone();
@@ -154,7 +169,8 @@ pub fn plan_uninstall(env: &Env) -> UninstallPlan {
 
 /// L'installation : le programme, les raccourcis, les scripts des DAW coches, les reglages de FL, le demarrage avec
 /// Windows, l'entree « Applications installees », puis le compagnon lance. Chaque etape dit ce qu'elle a fait ; une
-/// erreur n'arrete que ce qui en depend.
+/// erreur n'arrete que ce qui en depend. (10 nov.) macOS : ni raccourci, ni entree, ni compagnon lance en fond (la
+/// liste de la fin dit de le lancer depuis Terminal) ; le demarrage automatique y est un LaunchAgent.
 pub fn install(env: &Env, src: &Path, c: &Choices, h: &dyn Hooks) -> Outcome {
     let mut o = Outcome { simulated: env.simulate_daws, fl: "skipped".into(), ..Default::default() };
     if let Some(l) = h.stop_running() {
@@ -169,10 +185,13 @@ pub fn install(env: &Env, src: &Path, c: &Choices, h: &dyn Hooks) -> Outcome {
         }
     }
     let exe = env.dirs.exe();
-    // le raccourci du menu Demarrer ouvre la fenetre d'etat (la console du compagnon reste celle d'un terminal)
-    let sm = Shortcut { target: exe.clone(), args: args_line(&["--app"], &env.extra_args), minimized: true };
-    if let Err(e) = shortcut::write(&env.dirs.start_menu_link(), &sm) {
-        o.errors.push(e);
+    // le raccourci du menu Demarrer ouvre la fenetre d'etat (la console du compagnon reste celle d'un terminal) ;
+    // (10 nov.) Windows seulement : ailleurs, shortcut::write ne fait qu'une erreur (« shortcuts are for Windows »)
+    if cfg!(windows) {
+        let sm = Shortcut { target: exe.clone(), args: args_line(&["--app"], &env.extra_args), minimized: true };
+        if let Err(e) = shortcut::write(&env.dirs.start_menu_link(), &sm) {
+            o.errors.push(e);
+        }
     }
 
     h.progress("Setting up your DAWs");
@@ -184,7 +203,7 @@ pub fn install(env: &Env, src: &Path, c: &Choices, h: &dyn Hooks) -> Outcome {
         install_plugins(env, &mut o, &|l| h.progress(l));
     }
 
-    h.progress("Start with Windows");
+    h.progress(AUTOSTART_STEP);
     match set_autostart(&env.dirs, c.autostart, &env.extra_args) {
         Ok(l) => {
             o.autostart = c.autostart;
@@ -195,29 +214,36 @@ pub fn install(env: &Env, src: &Path, c: &Choices, h: &dyn Hooks) -> Outcome {
         Err(e) => o.errors.push(e),
     }
 
-    h.progress("Adding Uppwind Link to Installed apps");
-    let entry = arp::Entry {
-        version: env!("CARGO_PKG_VERSION").into(),
-        location: env.dirs.app_dir().display().to_string(),
-        exe: exe.display().to_string(),
-        extra_args: args_line(&[], &env.extra_args),
-        size_kb: std::fs::metadata(&exe).map(|m| m.len().div_ceil(1024)).unwrap_or(0),
-        date: env.stamp.chars().take(8).collect(),
-    };
-    match arp::write(env.arp_reg, &env.arp_key, &entry) {
-        Ok(l) => {
-            o.listed = true;
-            o.done.extend(l);
+    // (10 nov.) « Applications installees » : Windows seulement (ailleurs, le registre est en lecture seule : une erreur)
+    if cfg!(windows) {
+        h.progress("Adding Uppwind Link to Installed apps");
+        let entry = arp::Entry {
+            version: env!("CARGO_PKG_VERSION").into(),
+            location: env.dirs.app_dir().display().to_string(),
+            exe: exe.display().to_string(),
+            extra_args: args_line(&[], &env.extra_args),
+            size_kb: std::fs::metadata(&exe).map(|m| m.len().div_ceil(1024)).unwrap_or(0),
+            date: env.stamp.chars().take(8).collect(),
+        };
+        match arp::write(env.arp_reg, &env.arp_key, &entry) {
+            Ok(l) => {
+                o.listed = true;
+                o.done.extend(l);
+            }
+            Err(e) => o.errors.push(e),
         }
-        Err(e) => o.errors.push(e),
     }
 
-    h.progress("Starting Uppwind Link");
-    let mut args: Vec<String> = vec!["--background".into(), "--replace".into()];
-    args.extend(env.extra_args.iter().cloned());
-    match h.start(&exe, &args) {
-        Ok(p) => o.port = p,
-        Err(e) => o.errors.push(e),
+    // (10 nov.) macOS : pas de copie lancee en fond. Elle n'aurait pas de Terminal ou taper `arm` (ni fenetres ni son),
+    // et celle que l'on lance ensuite pour `arm` tournerait a cote d'elle. La liste de la fin dit de le lancer.
+    if !cfg!(target_os = "macos") {
+        h.progress("Starting Uppwind Link");
+        let mut args: Vec<String> = vec!["--background".into(), "--replace".into()];
+        args.extend(env.extra_args.iter().cloned());
+        match h.start(&exe, &args) {
+            Ok(p) => o.port = p,
+            Err(e) => o.errors.push(e),
+        }
     }
     o.todo = todo(env, c, report.as_ref(), &o);
     o.ok = o.errors.is_empty();
@@ -330,6 +356,21 @@ fn install_plugins(env: &Env, o: &mut Outcome, progress: &dyn Fn(&str)) {
     o.plugin_lines.extend(a.done);
     o.errors.extend(a.errors);
     o.plugins_restart = a.restart;
+    // (10 nov.) macOS : leurs Audio Units (Logic Pro), quand l'exe les porte (une construction sans eux n'en dit rien)
+    if cfg!(target_os = "macos") && !env.component_bundle.is_empty() {
+        let (b, t) = (env.component_bundle, env.plugins.component());
+        let mut r = plugins::inspect(&b, &t);
+        plugins::plan(&mut r, false, false);
+        let a = plugins::apply(&mut r, &b, &t, progress);
+        match r.action {
+            plugins::Action::None => o.plugin_lines.push(format!("{}: already up to date in {}.", r.what, crate::shown_path(&r.folder))),
+            plugins::Action::Skip => o.plugin_lines.push(format!("{}: {}.", r.what, r.reason)),
+            _ => {}
+        }
+        o.plugin_lines.extend(a.done);
+        o.errors.extend(a.errors);
+        o.plugins_restart |= a.restart;
+    }
 }
 
 fn todo_of(id: &str, title: &str, lines: &[&str]) -> Todo {
@@ -367,7 +408,15 @@ fn todo(env: &Env, c: &Choices, r: Option<&Report>, o: &Outcome) -> Vec<Todo> {
                 ));
             }
             let mme = r.ableton.settings.as_ref().and_then(|s| s.driver.as_deref()).is_some_and(|d| d.to_ascii_lowercase().contains("mme"));
-            if !mme {
+            // (10 nov.) macOS : le compagnon ne capte pas une appli : le son revient par Uppwind Link Return, avec
+            // n'importe quel pilote
+            if cfg!(target_os = "macos") {
+                v.push(todo_of(
+                    "live-audio",
+                    "For your sound to come back to the studio",
+                    &["In Live: drag Uppwind Link Return onto the Master track (Plug-ins › VST3 › Uppwind); in the studio: Audio return › Companion (no cable)."],
+                ));
+            } else if !mme {
                 v.push(todo_of(
                     "live-audio",
                     "For your sound to come back to the studio",
@@ -392,29 +441,40 @@ fn todo(env: &Env, c: &Choices, r: Option<&Report>, o: &Outcome) -> Vec<Todo> {
                 }
                 _ => {
                     if !c.fl_settings {
-                        v.push(Todo {
-                            id: "fl".into(),
-                            title: "In FL Studio".into(),
-                            lines: vec![
-                                "Options › MIDI settings:".into(),
-                                format!("Input “Uppwind Link”: Enable, Controller type “Uppwind Link (user)”, Port {port}."),
-                                format!("Output “Uppwind Link Back”: Port {port} — the same number."),
-                            ],
-                        });
+                        let mut lines = vec![
+                            "Options › MIDI settings:".into(),
+                            format!("Input “Uppwind Link”: Enable, Controller type “Uppwind Link (user)”, Port {port}."),
+                            format!("Output “Uppwind Link Back”: Port {port} — the same number."),
+                        ];
+                        // (10 nov.) FL Studio for Mac, a la main (--setup le dit aussi)
+                        if cfg!(target_os = "macos") {
+                            lines.push("Output “Uppwind Link”: no port (---). FL gives it the input’s port when the controller type is picked again.".into());
+                        }
+                        v.push(Todo { id: "fl".into(), title: "In FL Studio".into(), lines });
                     }
                 }
             }
-            v.push(todo_of(
-                "fl-audio",
-                "For your sound to come back to the studio",
-                &["In FL Studio: Options › Audio settings — Device: Primary Sound Driver (or a Windows output, not a hardware ASIO driver), playing into an output you do not listen to."],
-            ));
+            if cfg!(target_os = "macos") {
+                v.push(todo_of(
+                    "fl-audio",
+                    "For your sound to come back to the studio",
+                    &["In FL Studio: put Uppwind Link Return in an effect slot of the Master mixer track (untick “Allow smart disable” in its wrapper); in the studio: Audio return › Companion (no cable)."],
+                ));
+            } else {
+                v.push(todo_of(
+                    "fl-audio",
+                    "For your sound to come back to the studio",
+                    &["In FL Studio: Options › Audio settings — Device: Primary Sound Driver (or a Windows output, not a hardware ASIO driver), playing into an output you do not listen to."],
+                ));
+            }
         }
     }
     // (29 oct.) les plugins Uppwind Link : les retrouver dans le DAW, l'invite refusee, un DAW a relancer
     match o.plugins.as_str() {
         "installed" | "updated" => {
-            let (live, fl) = r.map(|r| (r.ableton.found(), r.fl.found())).filter(|(l, f)| *l || *f).unwrap_or((true, true));
+            // (10 nov.) macOS : un Mac sans Live ni FL n'a peut-etre que Logic Pro, qui a sa propre ligne
+            let mac = cfg!(target_os = "macos");
+            let (live, fl) = r.map(|r| (r.ableton.found(), r.fl.found())).filter(|(l, f)| *l || *f).unwrap_or((!mac, !mac));
             let mut lines = Vec::new();
             if fl {
                 lines.push("FL Studio: Options › Manage plugins › Find installed plugins (or restart FL Studio).".to_string());
@@ -422,7 +482,14 @@ fn todo(env: &Env, c: &Choices, r: Option<&Report>, o: &Outcome) -> Vec<Todo> {
             if live {
                 lines.push("Ableton Live: Settings › Plug-Ins: Use VST3 Plug-In System Folders on, then Rescan.".to_string());
             }
-            lines.push("Then put Uppwind Link Return on the master: your DAW’s sound comes back with any audio driver, ASIO included.".to_string());
+            if mac && !env.component_bundle.is_empty() {
+                lines.push("Logic Pro: restart it, it checks new Audio Units when it starts (Logic Pro › Settings › Plug-in Manager lists them).".to_string());
+            }
+            lines.push(if mac {
+                "Then put Uppwind Link Return on the master (in Logic Pro, an Audio FX slot of the Stereo Out): your DAW’s sound comes back to the studio without a cable.".to_string()
+            } else {
+                "Then put Uppwind Link Return on the master: your DAW’s sound comes back with any audio driver, ASIO included.".to_string()
+            });
             v.push(Todo { id: "plugins-scan".into(), title: "Find the Uppwind Link plugins in your DAW".into(), lines });
         }
         "refused" => v.push(Todo {
@@ -439,7 +506,26 @@ fn todo(env: &Env, c: &Choices, r: Option<&Report>, o: &Outcome) -> Vec<Todo> {
         v.push(todo_of("plugins-restart", "Restart your DAW", &["It still has the previous Uppwind Link plugins loaded: the new ones load when it starts again."]));
     }
     let (link, back, _) = super::steps::ports_of(&env.probe.midi_in, &env.probe.midi_out);
-    if link.is_none() || back.is_none() {
+    let no_ports = link.is_none() || back.is_none();
+    if cfg!(target_os = "macos") {
+        // (10 nov.) macOS : rien n'a ete lance (voir `install`). Le compagnon se lance depuis Terminal, ou `arm` met le
+        // controle a distance ; il y montre le code d'appairage, et fait les deux ports MIDI s'ils manquent (son gardien)
+        let mut cmd = crate::terminal_path(&env.dirs.exe());
+        if !env.extra_args.is_empty() {
+            cmd = format!("{cmd} {}", args_line(&[], &env.extra_args));
+        }
+        let mut lines = vec![
+            cmd,
+            "It shows the pairing code: paste it once in the studio › Settings › Uppwind Link › Plugin windows.".to_string(),
+            "Type arm there to turn on remote control: the plugin windows, and your DAW’s sound.".to_string(),
+        ];
+        if no_ports {
+            lines.push("It also makes the two MIDI ports, “Uppwind Link” and “Uppwind Link Back”.".to_string());
+        }
+        v.push(Todo { id: "start".into(), title: "Start Uppwind Link from Terminal".into(), lines });
+        return v;
+    }
+    if no_ports {
         v.push(todo_of(
             "ports",
             "Create the two MIDI ports",
@@ -544,20 +630,28 @@ fn scripts_out(env: &Env, o: &mut Removal) -> bool {
 /// (29 oct.) Les plugins Uppwind Link : retires s'ils sont du compagnon (son releve, ou ses octets), laisses sinon.
 /// L'invite d'administrateur refusee : ils restent (dit dans `kept`), la desinstallation continue.
 fn plugins_out(env: &Env, o: &mut Removal, progress: &dyn Fn(&str)) {
-    let b = env.plugin_bundle;
-    let mut r = plugins::inspect(&b, &env.plugins);
+    bundle_out(&env.plugin_bundle, &env.plugins, o, progress);
+    // (10 nov.) macOS : leurs Audio Units (Logic Pro) aussi, s'ils sont du compagnon
+    if cfg!(target_os = "macos") {
+        bundle_out(&env.component_bundle, &env.plugins.component(), o, progress);
+    }
+}
+
+/// Un paquet des plugins (le VST3, ou les Audio Units de macOS), retire s'il est du compagnon.
+fn bundle_out(b: &plugins::Bundle, t: &plugins::Target, o: &mut Removal, progress: &dyn Fn(&str)) {
+    let mut r = plugins::inspect(b, t);
     plugins::plan(&mut r, true, false);
     let shown = crate::shown_path(&r.folder);
     match r.action {
         plugins::Action::Remove => {}
         plugins::Action::Skip if r.supported && r.status != plugins::Status::Missing => {
-            o.done.push(format!("Uppwind Link plugins in {shown}: not installed by Uppwind Link, left as they are."));
+            o.done.push(format!("{} in {shown}: not installed by Uppwind Link, left as they are.", r.what));
             return;
         }
         _ => return,
     }
-    progress("Removing the Uppwind Link plugins");
-    let a = plugins::apply(&mut r, &b, &env.plugins, progress);
+    progress(&format!("Removing the {}", r.what));
+    let a = plugins::apply(&mut r, b, t, progress);
     if a.refused {
         o.kept.extend(a.done);
     } else {
@@ -714,6 +808,7 @@ mod tests {
             // (29 oct.) un dossier d'essai : jamais le dossier VST3 du systeme, jamais d'invite
             plugins: plugins::Target::in_dir(&root.join("VST3")),
             plugin_bundle: plugins::Bundle { files: TEST_PLUGINS },
+            component_bundle: plugins::Bundle { files: &[] },
         }
     }
 
@@ -956,6 +1051,169 @@ mod tests {
         let u = uninstall(&env, &NoHooks);
         assert!(u.done.iter().any(|l| l.contains("not installed by Uppwind Link, left as they are")), "{:?}", u.done);
         assert!(dll.is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// (10 nov.) macOS : l'installation de la console (`--wizard`), sur une fausse machine de Mac.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_tests {
+    use super::*;
+    use crate::setup::env::{FakeRegistry, Paths};
+    use crate::setup::tests::temp_root;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
+    /// Une fausse machine de Mac : Live 12 (sa User Library) et FL Studio 2026 dans « /Applications » (program_data),
+    /// sans les deux ports MIDI ; le dossier d'installation, tout dans `root`.
+    fn mac_machine(root: &Path) -> (Probe, Dirs) {
+        let p = Probe::empty(Paths::in_root(root));
+        for app in ["Ableton Live 12 Suite.app", "FL Studio 2026.app"] {
+            std::fs::create_dir_all(p.paths.program_data.join(app)).unwrap();
+        }
+        let ul = root.join("Music").join("Ableton").join("User Library");
+        std::fs::create_dir_all(&ul).unwrap();
+        let prefs = p.paths.roaming.join("Ableton").join("Live 12.4.6");
+        std::fs::create_dir_all(&prefs).unwrap();
+        std::fs::write(
+            prefs.join("Library.cfg"),
+            format!("<Ableton><UserLibrary><LibraryProject Id=\"0\"><ProjectName Value=\"User Library\" /><ProjectPath Value=\"{}\" /></LibraryProject></UserLibrary></Ableton>", ul.parent().unwrap().display()),
+        )
+        .unwrap();
+        std::fs::write(prefs.join("Log.txt"), "t: info: Audio In Out: Driver Type: CoreAudio\n").unwrap();
+        std::fs::create_dir_all(root.join("Documents").join("Image-Line")).unwrap();
+        let env: HashMap<&str, OsString> = HashMap::from([(install::ROOT_ENV, root.join("inst").into_os_string())]);
+        (p, Dirs::from_lookup(|k| env.get(k).cloned()).unwrap())
+    }
+
+    /// la progression, et ce qui serait lance
+    struct Rec(RefCell<Vec<String>>);
+    impl Hooks for Rec {
+        fn progress(&self, line: &str) {
+            self.0.borrow_mut().push(line.to_string());
+        }
+        fn start(&self, exe: &Path, args: &[String]) -> Result<Option<u16>, String> {
+            self.0.borrow_mut().push(format!("started {} {}", exe.display(), args.join(" ")));
+            Ok(Some(47999))
+        }
+    }
+
+    static TEST_VST3: &[(&str, &[u8], bool)] = &[("Contents/MacOS/Uppwind Link", b"a test VST3", false)];
+    static TEST_AU: &[(&str, &[u8], bool)] = &[("Contents/MacOS/Uppwind Link", b"a test Audio Unit", false)];
+
+    /// ce qu'un Mac ne doit jamais lire a l'installation
+    const WINDOWS_WORDS: &[&str] = &["Windows", "Start menu", "Start Menu", "Installed apps", "loopMIDI", "ASIO", "MME", "WebView2", "registry", "HKCU"];
+
+    fn windows_words(lines: &[String]) -> Vec<String> {
+        lines.iter().filter(|l| WINDOWS_WORDS.iter().any(|w| l.contains(w))).cloned().collect()
+    }
+
+    #[test]
+    fn on_a_mac_the_console_setup_does_nothing_of_windows_and_says_to_start_it_from_terminal() {
+        let root = temp_root("flow-mac");
+        let (probe, dirs) = mac_machine(&root);
+        let reg = FakeRegistry::default();
+        let env = Env {
+            dirs: dirs.clone(),
+            probe: &probe,
+            simulate_daws: false,
+            arp_reg: &reg,
+            arp_key: r"HKCU\Software\UppwindLinkTest\flow-mac\UppwindLink".into(),
+            state_file: root.join(".uppwind-companion.json"),
+            extra_args: vec![],
+            stamp: "20261110-160000".into(),
+            plugins: plugins::Target::in_dir(&root.join("VST3")),
+            plugin_bundle: plugins::Bundle { files: TEST_VST3 },
+            component_bundle: plugins::Bundle { files: TEST_AU },
+        };
+        let m = super::super::steps::Model::from_report(&setup::gather(&probe, &Opts { fl_settings: Some(true), ..Default::default() }, &env.stamp), None, None, false, String::new());
+        // les choix de la console : ni les reglages de FL (a la main) ni le LaunchAgent (pas de `arm` sans Terminal)
+        let mut c = Choices::for_console(&m);
+        assert!(!c.fl_settings && !c.autostart && !c.open_studio, "{c:?}");
+        assert_eq!(c.daws.iter().filter(|d| d.starts_with("ableton:") || *d == "fl").count(), 2, "{:?}", m.daws);
+        if !c.wants_plugins() {
+            c.daws.push(super::super::steps::PLUGINS.into());
+        }
+        let exe = root.join("Downloads").join("uppwind-companion");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"the companion").unwrap();
+        let rec = Rec(Default::default());
+        let o = install(&env, &exe, &c, &rec);
+        assert!(o.ok && o.errors.is_empty(), "{:#?}", o);
+        assert!(dirs.exe().is_file(), "the program is copied");
+        assert!(!dirs.launch_agent().exists(), "no LaunchAgent unless asked");
+        assert!(!o.listed && o.port.is_none() && !o.autostart, "no Installed apps entry, nothing started: {o:#?}");
+        let progress = rec.0.borrow().clone();
+        assert!(!progress.iter().any(|l| l.starts_with("started")), "nothing runs in the background: {progress:?}");
+        assert!(progress.iter().any(|l| l == AUTOSTART_STEP) && AUTOSTART_STEP == "Start at login", "{progress:?}");
+        assert!(o.plugin_lines.iter().any(|l| l.contains("Audio Units")), "the Audio Units too: {:?}", o.plugin_lines);
+        assert!(root.join("Components").join("Uppwind Link.component").join("Contents").join("MacOS").join("Uppwind Link").is_file());
+        // ce qui reste a faire : FL a la main, le son par Uppwind Link Return, le lancer depuis Terminal (et `arm`)
+        let ids: Vec<&str> = o.todo.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["live", "live-audio", "fl", "fl-audio", "plugins-scan", "start"], "{:#?}", o.todo);
+        let fl = &o.todo[2];
+        assert!(fl.lines.iter().any(|l| l.contains("Controller type “Uppwind Link (user)”")) && fl.lines.iter().any(|l| l.contains("no port (---)")), "{fl:?}");
+        for t in o.todo.iter().filter(|t| t.id.ends_with("-audio")) {
+            assert!(t.lines.iter().all(|l| l.contains("Uppwind Link Return") && l.contains("Companion (no cable)")), "{t:?}");
+        }
+        let scan = &o.todo[4];
+        assert!(scan.lines.iter().any(|l| l.starts_with("Logic Pro: restart it")) && scan.lines.iter().any(|l| l.contains("Stereo Out")), "{scan:?}");
+        let start = o.todo.last().unwrap();
+        assert_eq!(start.title, "Start Uppwind Link from Terminal");
+        assert_eq!(start.lines[0], crate::terminal_path(&dirs.exe()));
+        assert!(start.lines.iter().any(|l| l.contains("arm")) && start.lines.iter().any(|l| l.contains("pairing code")), "{start:?}");
+        assert!(start.lines.iter().any(|l| l.contains("makes the two MIDI ports")), "the ports are missing on this machine: {start:?}");
+        // rien de Windows, nulle part
+        let mut said: Vec<String> = progress.clone();
+        said.extend(o.done.iter().chain(o.scripts.iter()).chain(o.fl_lines.iter()).chain(o.plugin_lines.iter()).cloned());
+        for t in &o.todo {
+            said.push(t.title.clone());
+            said.extend(t.lines.iter().cloned());
+        }
+        assert_eq!(windows_words(&said), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ce que la console demande et dit avant de commencer
+    #[test]
+    fn the_console_speaks_of_terminal_not_of_windows() {
+        let intro = super::super::console_intro();
+        assert!(intro.iter().any(|l| l.contains("Terminal")), "{intro:?}");
+        assert_eq!(windows_words(&intro), Vec::<String>::new());
+        assert_eq!(windows_words(&[super::super::AUTOSTART_QUESTION.to_string()]), Vec::<String>::new());
+        assert!(super::super::AUTOSTART_QUESTION.contains("log in") && super::super::AUTOSTART_QUESTION.contains("remote control stays off"));
+    }
+
+    /// avec un LaunchAgent demande : celui du dossier d'essai, jamais une erreur de raccourci (meme avec --sandbox)
+    #[test]
+    fn a_login_start_asked_for_on_a_mac_is_a_launch_agent() {
+        let root = temp_root("flow-mac-agent");
+        let (probe, dirs) = mac_machine(&root);
+        let reg = FakeRegistry::default();
+        let exe = root.join("Downloads").join("uppwind-companion");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"the companion").unwrap();
+        let env = Env {
+            dirs: dirs.clone(),
+            probe: &probe,
+            simulate_daws: true,
+            arp_reg: &reg,
+            arp_key: r"HKCU\Software\UppwindLinkTest\flow-mac-agent\UppwindLink".into(),
+            state_file: root.join(".uppwind-companion.json"),
+            extra_args: vec!["--sandbox".into(), root.join("my sandbox").display().to_string()],
+            stamp: "20261110-161000".into(),
+            plugins: plugins::Target { simulate: true, ..plugins::Target::in_dir(&root.join("VST3")) },
+            plugin_bundle: plugins::Bundle { files: TEST_VST3 },
+            component_bundle: plugins::Bundle { files: TEST_AU },
+        };
+        let c = Choices { daws: vec!["fl".into()], fl_settings: false, autostart: true, open_studio: false };
+        let o = install(&env, &exe, &c, &NoHooks);
+        assert!(o.ok && o.errors.is_empty(), "{:#?}", o);
+        assert!(o.autostart && dirs.launch_agent().is_file(), "{o:#?}");
+        let start = o.todo.last().unwrap();
+        assert_eq!(start.id, "start");
+        assert!(start.lines[0].ends_with(&format!("--sandbox \"{}\"", root.join("my sandbox").display())), "{start:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

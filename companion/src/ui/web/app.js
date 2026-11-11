@@ -77,6 +77,78 @@
     let readySent = false;
     const ready = () => { if (!readySent) { readySent = true; send('ready'); } };
 
+    // ── (11 nov.) la barre de titre de la fenetre d'etat : sans le cadre de Windows, la page dessine Reduire, Agrandir,
+    // Fermer ; la tete sert a deplacer la fenetre (double-clic : agrandir), les bords a la redimensionner ──────────
+    const FRAMELESS = PAGE === 'status';
+    const NS = 'http://www.w3.org/2000/svg';
+    function icon(d, size = 10) {
+        const s = document.createElementNS(NS, 'svg');
+        s.setAttribute('viewBox', `0 0 ${size} ${size}`);
+        s.setAttribute('aria-hidden', 'true');
+        for (const one of [].concat(d)) {
+            const p = document.createElementNS(NS, 'path');
+            p.setAttribute('d', one);
+            s.append(p);
+        }
+        return s;
+    }
+    const ICON_MIN = 'M1 5.5h8';
+    const ICON_MAX = 'M1.5 1.5h7v7h-7z';
+    const ICON_RESTORE = ['M1.5 3.5h5v5h-5z', 'M3.5 3.5v-2h5v5h-2'];
+    const ICON_CLOSE = ['M1.5 1.5l7 7', 'M8.5 1.5l-7 7'];
+    const ICON_GEAR = ['M8 5.2a2.8 2.8 0 1 0 0 5.6 2.8 2.8 0 0 0 0-5.6z',
+        'M8 1.2v1.6M8 13.2v1.6M1.2 8h1.6M13.2 8h1.6M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M3.2 12.8l1.1-1.1M11.7 4.3l1.1-1.1'];
+    let maxBtn = null;
+    let settingsBtn = null;
+    function setMaximized(on) {
+        if (!maxBtn) return;
+        maxBtn.replaceChildren(icon(on ? ICON_RESTORE : ICON_MAX));
+        maxBtn.title = on ? 'Restore' : 'Maximize';
+        maxBtn.setAttribute('aria-label', maxBtn.title);
+        document.body.classList.toggle('is-max', !!on);
+    }
+    if (FRAMELESS) {
+        document.body.classList.add('is-frameless');
+        const head = document.querySelector('.uw-head');
+        const winBtn = (cls, title, d, onClick) => {
+            const b = h('button', { type: 'button', class: `uw-winbtn ${cls}`, title, 'aria-label': title, onclick: onClick });
+            b.append(icon(d));
+            return b;
+        };
+        settingsBtn = h('button', { type: 'button', class: 'uw-btn uw-btn-sm uw-settings-btn', title: 'Settings', onclick: () => toggleSettings() });
+        settingsBtn.append(icon(ICON_GEAR, 16), h('span', null, 'Settings'));
+        maxBtn = winBtn('', 'Maximize', ICON_MAX, () => send('win', { action: 'maximize' }));
+        head.append(settingsBtn, h('div', { class: 'uw-winctl' },
+            winBtn('', 'Minimize', ICON_MIN, () => send('win', { action: 'minimize' })),
+            maxBtn,
+            winBtn('is-close', 'Close', ICON_CLOSE, () => send('close'))));
+        // deplacer : un bouton enfonce sur la tete, hors de ses boutons
+        head.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || e.target.closest('button') || edgeAt(e)) return;
+            if (e.detail === 2) { send('win', { action: 'maximize' }); return; }
+            send('win', { action: 'drag' });
+        });
+        // redimensionner : les 6 pixels du bord
+        const EDGE = 6;
+        function edgeAt(e) {
+            if (document.body.classList.contains('is-max')) return '';
+            const w = window.innerWidth;
+            const hh = window.innerHeight;
+            const n = e.clientY < EDGE ? 'n' : e.clientY >= hh - EDGE ? 's' : '';
+            const we = e.clientX < EDGE ? 'w' : e.clientX >= w - EDGE ? 'e' : '';
+            return n + we;
+        }
+        // (le curseur par une classe : la CSP n'a pas de style en ligne)
+        document.addEventListener('mousemove', (e) => {
+            const edge = edgeAt(e);
+            if ((document.body.dataset.edge || '') !== edge) document.body.dataset.edge = edge;
+        });
+        document.addEventListener('mousedown', (e) => {
+            const edge = edgeAt(e);
+            if (e.button === 0 && edge) { e.preventDefault(); send('win', { action: 'resize', edge }); }
+        }, true);
+    }
+
     // ── l'installation ─────────────────────────────────────────────────────────────────────────────────
     const W = { s: null, progress: [], code: null };
     const FLOW = ['daws', 'ports', 'options', 'progress'];
@@ -111,8 +183,19 @@
         const asks = p.admin && !s.model.simulate_daws && s.choices.daws.includes(PLUGINS) && (p.action === 'install' || p.action === 'update');
         return (asks ? 'One administrator prompt, for the plugins only.' : 'No administrator rights.') + ' Uninstall any time from Windows Settings › Apps.';
     }
+    // (10 nov.) macOS : leurs Audio Units (Logic Pro) suivent la meme case ; quand elles n'en sont pas au meme point que
+    // le VST3, chacun dit le sien
+    function formatLine(q) {
+        switch (q.action) {
+            case 'install': return 'will be installed';
+            case 'update': return q.status === 'outdated' ? 'an older version will be updated' : 'different files will be replaced';
+            case 'none': return 'already up to date';
+            default: return q.reason || 'nothing to do';
+        }
+    }
     function pluginLine(p) {
         if (p.not_in_build) return 'Not in this build of Uppwind Link (a development build).';
+        if (p.au && (p.au.action !== p.action || p.au.status !== p.status)) return `VST3: ${formatLine(p)}. Audio Units, for Logic Pro: ${formatLine(p.au)}.`;
         switch (p.action) {
             case 'install': return 'Uppwind Link Return and Uppwind Link Notes will be installed.';
             case 'update': return p.status === 'outdated' ? 'An older version is installed: it will be updated.' : 'Different files are installed: they will be replaced.';
@@ -124,14 +207,15 @@
         const p = s.model.plugins;
         if (!p || !(p.available || p.not_in_build)) return null;
         const on = s.choices.daws.includes(PLUGINS) && p.selectable;
-        const body = [h('div', null, pluginLine(p)), p.folder ? h('div', { class: 'uw-path' }, p.folder) : null];
+        const body = [h('div', null, pluginLine(p)), p.folder ? h('div', { class: 'uw-path' }, p.folder) : null, p.au && p.au.folder ? h('div', { class: 'uw-path' }, p.au.folder) : null];
         if (p.admin && on && (p.action === 'install' || p.action === 'update')) {
             body.push(note('', 'Windows asks for administrator rights once, to put them where FL Studio looks for VST3 plugins. Nothing else runs as administrator.'));
         }
         if (p.held) body.push(note('', 'A DAW still has an older copy loaded: restart it after the install.'));
         return h('div', { class: 'uw-card' + (p.selectable ? '' : ' is-off') },
-            check('Uppwind Link plugins (VST3)', on, (v) => choose((x) => { x.daws = x.daws.filter((i) => i !== PLUGINS); if (v) x.daws.push(PLUGINS); }),
-                { disabled: !p.selectable, sub: 'Needed for FL Studio. They also bring your DAW’s sound to the studio with any audio driver, ASIO included.' }),
+            check(p.au ? 'Uppwind Link plugins (VST3 and Audio Units)' : 'Uppwind Link plugins (VST3)', on, (v) => choose((x) => { x.daws = x.daws.filter((i) => i !== PLUGINS); if (v) x.daws.push(PLUGINS); }),
+                { disabled: !p.selectable, sub: p.au ? 'Needed for FL Studio, and for Logic Pro, which loads only Audio Units. They also bring your DAW’s sound to the studio.'
+                    : 'Needed for FL Studio. They also bring your DAW’s sound to the studio with any audio driver, ASIO included.' }),
             h('div', { class: 'uw-card-body' }, body));
     }
 
@@ -333,8 +417,83 @@
     let helpOpen = false;
     // (9 nov., audit F2) « New code… » demande une confirmation sur place (il deconnecte le studio)
     let confirmNew = false;
-    const ago = (s) => (s < 60 ? 'just now' : `${Math.round(s / 60)} min ago`);
+    const ago = (s) => (s < 60 ? 'just now' : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`);
+    // (11 nov.) le panneau Settings, et ce que la mise a jour en cours dit
+    let settingsOpen = false;
+    let updLine = '';
+    let updBusy = false;
+    let checking = false;
+    function toggleSettings(on) {
+        settingsOpen = on === undefined ? !settingsOpen : !!on;
+        if (settingsBtn) settingsBtn.classList.toggle('is-on', settingsOpen);
+        if (W.last && W.last.status) status(W.last);
+    }
+
+    // Les reglages : seulement cette fenetre les change (le studio n'a aucune de ces commandes).
+    function settingsView(s) {
+        const R = s.remote || {};
+        const D = s.discord || {};
+        const U = s.update || {};
+        const running = !!s.port;
+        const idle = R.idle_disarm_min || 10;
+        const setting = (label, on, onChange, sub, disabled) => h('div', { class: 'uw-card' }, check(label, on, onChange, { sub, disabled }));
+        // la mise a jour
+        const last = U.last && U.last.version && U.last.version === s.version && U.last.from && U.last.from !== U.last.version
+            ? (U.last.ok ? note('is-neon', `Updated from ${U.last.from} to ${U.last.version}.`)
+                : note('is-bad', `The update to ${U.last.version} had a problem: ${(U.last.errors || []).join(' ') || 'see the log.'}`))
+            : null;
+        let line;
+        if (checking || U.checking) line = st('', 'Checking GitHub…');
+        else if (updBusy || U.installing) line = st('is-ok', updLine || 'Installing the new version…');
+        else if (U.newer) line = st('is-ok', `Uppwind Link ${U.latest} is available`);
+        else if (U.latest) line = st('is-ok', `Up to date · the latest is ${U.latest}${U.checked_ago_s != null ? `, checked ${ago(U.checked_ago_s)}` : ''}`);
+        else if (U.error) line = st('is-warn', `Could not check: ${U.error}`);
+        else line = st('', 'Not checked yet');
+        const updButtons = h('div', { class: 'uw-row' },
+            btn(checking ? 'Checking…' : 'Check for updates', () => { checking = true; status(W.last); send('checkupdate'); }, 'uw-btn-sm', checking || updBusy),
+            U.newer ? (U.supported
+                ? btn(updBusy ? 'Updating…' : `Update to ${U.latest}`, () => { updBusy = true; updLine = 'Downloading the new version…'; status(W.last); send('update'); }, 'uw-btn-sm uw-btn-primary', updBusy || !running)
+                : btn('Download it', () => send('open', { link: 'releases' }), 'uw-btn-sm uw-btn-primary')) : null);
+        const updates = h('div', { class: 'uw-card' },
+            h('div', { class: 'uw-card-title' }, `Uppwind Link ${s.version}`),
+            h('div', { class: 'uw-card-body is-flush' }, line, updButtons, last,
+                check('Update automatically', !!U.auto, (v) => send('autoupdate', { on: v }), {
+                    disabled: !running || !U.supported,
+                    sub: U.supported ? 'Checks GitHub every 6 hours and installs a newer version by itself, while the studio is not connected. Off until you tick it.'
+                        : 'Updates from the app are for Windows: download the new version from its release page.',
+                }),
+                h('p', { class: 'uw-small' }, 'Updates are the only time Uppwind Link itself goes on the internet, and only to its GitHub releases (github.com/alakazam777/uppwind-app). Show on Discord, when you turn it on, hands what you play to the Discord app on this computer, and Discord publishes it on your profile. Each download is checked against the SHA-256 published with the release before it is installed. The program is not code-signed yet, so the check proves the file is the one published there, not who published it.')));
+        return [
+            h('div', { class: 'uw-row uw-settings-head' }, h('h1', { class: 'uw-grow' }, 'Settings'), btn('Done', () => toggleSettings(false), 'uw-btn-sm uw-btn-primary')),
+            h('p', { class: 'uw-lede' }, 'Only this window changes these settings: the studio cannot.'),
+            h('div', { class: 'uw-k' }, 'General'),
+            setting('Start with Windows', s.autostart, (v) => send('autostart', { on: v }), 'Uppwind Link waits next to the clock: the studio finds it when you need it.'),
+            h('div', { class: 'uw-k' }, 'Updates'),
+            updates,
+            h('div', { class: 'uw-k' }, 'Studio'),
+            setting('Remote control', !!R.armed, (v) => send('arm', { on: v }),
+                running ? `The studio can capture plugin windows, send them gestures and take your DAW’s sound. Turns itself off after ${idle} min without the studio, and at every start.` : 'Appears once Uppwind Link runs.', !running),
+            setting('Show on Discord', !!D.allowed, (v) => send('discord', { on: v }),
+                running ? 'What you play in Music shows on your Discord profile (title, artist, cover). Music must be open, with Show on Discord turned on there too.' : 'Appears once Uppwind Link runs.', !running),
+            h('div', { class: 'uw-k' }, 'Set up'),
+            h('div', { class: 'uw-card' }, h('div', { class: 'uw-row' },
+                h('div', { class: 'uw-grow' }, h('div', { class: 'uw-card-title' }, 'Set up again'), h('div', { class: 'uw-card-sub' }, 'Looks at your DAWs again and puts back what is missing; your pairing stays.')),
+                btn('Set up again…', () => send('setup'), 'uw-btn-sm'))),
+        ];
+    }
+
     function status(msg) {
+        // (11 nov.) la barre de titre : agrandie ou non
+        if (msg.type === 'win') { setMaximized(!!msg.maximized); return; }
+        // (11 nov.) la mise a jour : une ligne tout de suite ; la relecture suit
+        if (msg.type === 'update') {
+            checking = false;
+            updBusy = !!msg.busy;
+            updLine = msg.text || '';
+            if (msg.text) toast(msg.text, 'is-neon');
+            if (W.last && W.last.status) status(W.last);
+            return;
+        }
         // (9 nov., audit F1) arme ou desarme (ici, ou par le menu de l'icone) : tout de suite ; la relecture suit
         if (msg.type === 'armed') {
             if (W.last && W.last.status) {
@@ -410,12 +569,36 @@
                     h('li', null, 'FL Studio: Options › Audio settings › Primary Sound Driver (not a hardware ASIO driver).')),
                 s.audio.trouble ? h('p', null, h('b', null, 'Still silent? '), 'Install VB-CABLE, a virtual audio cable, and pick ', q('Virtual cable'),
                     ' in the studio: Settings › Uppwind Link › Audio return. ', h('button', { type: 'button', class: 'uw-link', onclick: () => send('open', { link: 'vbcable' }) }, 'VB-CABLE’s page')) : null) : null);
+        // (11 nov., discord.rs) ce qu'on ecoute dans Music, sur le profil Discord : seulement si c'est permis ici
+        const D = s.discord || {};
+        const discord = !s.port ? [h('div', { class: 'uw-small' }, 'Appears once Uppwind Link runs.')]
+            : D.allowed ? [
+                D.shown ? st('is-ok', 'On · showing what you play in Music on your Discord profile')
+                    : D.discord === 'absent' ? st('is-warn', 'On · open the Discord desktop app to show what you play')
+                        : st('is-ok', 'On · what you play in Music will show on your Discord profile'),
+                h('div', { class: 'uw-row' }, btn('Turn off', () => send('discord', { on: false }), 'uw-btn-sm'),
+                    h('span', { class: 'uw-small' }, 'Music must be open in your browser, and Show on Discord turned on there.')),
+            ] : [
+                st('', 'Off · nothing is shown on Discord'),
+                h('div', { class: 'uw-row' }, btn('Show on Discord', () => send('discord', { on: true }), 'uw-btn-sm'),
+                    h('span', { class: 'uw-small' }, 'Your Discord friends see the title, artist and cover of what you play in Music.')),
+            ];
         const sb = s.sandbox ? note('is-warn uw-banner', h('b', null, 'Sandbox. '), `This Uppwind Link runs from ${s.sandbox}.`) : null;
-        render([sb, h('div', { class: 'uw-grid' }, cell('Remote control', remote), cell('Studio', studio), cell('DAWs', daws), cell('MIDI ports', ports), cell('Sound', sound), cell('Help', help))],
-            [check('Start with Windows', s.autostart, (v) => send('autostart', { on: v })),
-                h('button', { type: 'button', class: 'uw-link', onclick: () => send('setup') }, 'Set up again…'),
-                h('span', { class: 'uw-sp' }), btn('Check again', () => send('recheck'), 'uw-btn-sm'), btn('Close', () => send('close'))],
-            s.port ? h('span', { class: 'uw-pill is-ok' }, `Running · port ${s.port}`) : h('span', { class: 'uw-pill' }, 'Not running'));
+        const pill = s.port ? h('span', { class: 'uw-pill is-ok' }, `Running · port ${s.port}`) : h('span', { class: 'uw-pill' }, 'Not running');
+        if (settingsOpen) {
+            render([sb, settingsView(s)], [h('span', { class: 'uw-sp' }), btn('Done', () => toggleSettings(false), 'uw-btn-primary')], pill);
+        } else {
+            // (11 nov.) une version plus recente, deja lue : un bandeau, et la mise a jour dans Settings
+            const U = s.update || {};
+            const upd = U.newer && !updBusy ? note('is-neon uw-banner', h('div', { class: 'uw-row' },
+                h('span', { class: 'uw-grow' }, h('b', null, `Uppwind Link ${U.latest} is available. `), U.supported ? 'Your settings and your pairing stay.' : 'Download it from its release page.'),
+                U.supported ? btn('Update', () => { updBusy = true; updLine = 'Downloading the new version…'; send('update'); status(msg); }, 'uw-btn-sm uw-btn-primary', !s.port)
+                    : btn('Download it', () => send('open', { link: 'releases' }), 'uw-btn-sm uw-btn-primary'))) : null;
+            const busy = updBusy ? note('is-neon uw-banner', updLine || 'Installing the new version…') : null;
+            render([sb, upd, busy, h('div', { class: 'uw-grid' }, cell('Remote control', remote), cell('Studio', studio), cell('DAWs', daws), cell('MIDI ports', ports), cell('Sound', sound), cell('Discord', discord), cell('Help', help))],
+                [h('span', { class: 'uw-sp' }), btn('Check again', () => send('recheck'), 'uw-btn-sm'), btn('Close', () => send('close'))],
+                pill);
+        }
         const brand = document.getElementById('brand');
         if (brand) set(brand, 'Uppwind Link', h('small', null, s.version));
         ready();
@@ -465,13 +648,18 @@
     window.__uwl = Object.freeze({
         recv(msg) {
             if (!msg || typeof msg !== 'object') return;
-            if (msg.type === 'error') { toast(msg.message || 'Something went wrong.'); return; }
+            if (msg.type === 'error') {
+                // (11 nov.) une verification ou une mise a jour qui echoue : ses boutons reviennent
+                if (checking || updBusy) { checking = false; updBusy = false; if (W.last && W.last.status) status(W.last); }
+                toast(msg.message || 'Something went wrong.');
+                return;
+            }
             if (msg.type === 'copied') { toast('Copied.', 'is-neon'); return; }
             (pages[PAGE] || wizard)(msg);
         },
     });
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && PAGE === 'status') send('close');
+        if (e.key === 'Escape' && PAGE === 'status') { if (settingsOpen) toggleSettings(false); else send('close'); }
         if ((e.ctrlKey || e.metaKey) && ['p', 'f', 'g', 'r', 'u'].includes(e.key.toLowerCase())) e.preventDefault();
     });
     document.addEventListener('contextmenu', (e) => e.preventDefault());

@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Uppwind
-//! Les fenetres de plugins d'Ableton Live.
+//! Les fenetres de plugins d'Ableton Live ; (10 nov.) sous macOS, aussi celles de Logic Pro.
 //!
 //! Mesure du 20 oct. (Live 12.4.6, Windows 10) : une fenetre de plugin est une fenetre de premier niveau du
 //! processus de Live, POSSEDEE par sa fenetre principale, de style WS_EX_TOOLWINDOW, titree « <Plugin>/<Piste> »
 //! (« Diva/2-Diva »). `plugin_windows` fait le tri sur une liste de fenetres brutes (testee avec une fausse liste) ;
 //! `enumerate` (Windows seulement) remplit cette liste avec EnumWindows.
+//!
+//! Mesure du 9-10 nov. (Logic Pro 12.3.1, macOS 26.6) : la fenetre d'un plugin (AU) s'intitule, pour l'Accessibilite, du
+//! nom de sa TRANCHE (« Deluxe Classic » 526×180, « Stereo Out » 526×200), sans le nom du plugin. Pour CGWindowList, son
+//! titre est VIDE, meme avec « Enregistrement de l'ecran » (mesure du 11 nov. : le projet et « Logic Pro » y ont le
+//! leur) : `enumerate` le demande a l'Accessibilite. Elle appartient a l'appli « Logic Pro »
+//! (pas au service XPC d'Apple ou tournent nos AU), au niveau 0, et reste a l'ecran quand Logic n'est pas devant. Les
+//! autres fenetres de Logic : le projet « <projet> - Tracks » (1728×1014), « Logic Pro » et « Choose a Project » (hors
+//! de l'ecran ce soir-la). Le 11 nov., l'instrument de la meme piste (l'E-Piano de « Deluxe Classic », 516×462) s'est
+//! ouvert au niveau 3 (flottant), Logic derriere : une fenetre de plugin de Logic est au niveau 0 ou 3.
 
 use serde::Serialize;
 
@@ -32,6 +41,12 @@ pub struct RawWindow {
     pub h: i32,
     /// macOS : le niveau de la fenetre (kCGWindowLayer : 0 normal, 3 flottant…) ; 0 sous Windows
     pub layer: i32,
+    /// (11 nov., relecture M1) macOS, Logic Pro : la fenetre porte le bouton de menu de l'affichage (AXMenuButton
+    /// decrit « view » : Editor / Controls) que Logic met en haut de chacune de ses fenetres de plugins. Mesure : la
+    /// fenetre de PSP VintageWarmer2 l'a ; celle du projet et « Control Surface Setup » (niveau 3, comme un plugin
+    /// flottant) non. Lu par l'Accessibilite, seulement pour une fenetre que le reste n'exclut pas deja ; false sans
+    /// elle, ou ailleurs que sous macOS.
+    pub view_button: bool,
 }
 
 /// Une fenetre de plugin, telle que le studio la voit (`list`).
@@ -73,13 +88,70 @@ pub fn is_live_app(owner: &str) -> bool {
 }
 
 /// Le tri : les fenetres d'un processus de Live, visibles, d'outil, possedees par une fenetre du meme processus,
-/// titrees « plugin/piste ». Triees par titre (l'ordre de la liste ne bouge pas d'un appel a l'autre).
+/// titrees « plugin/piste ». Triees par titre (l'ordre de la liste ne bouge pas d'un appel a l'autre). (10 nov.) Sous
+/// macOS, puis celles de Logic Pro (`logic_plugin_windows`).
 pub fn plugin_windows(all: &[RawWindow]) -> Vec<PluginWindow> {
     if cfg!(target_os = "macos") {
-        plugin_windows_mac(all)
+        let mut v = plugin_windows_mac(all);
+        v.extend(logic_plugin_windows(all));
+        v
     } else {
         plugin_windows_win(all)
     }
+}
+
+/// macOS : l'appli Logic Pro telle que CGWindowList la nomme (kCGWindowOwnerName) : « Logic Pro » (11, 12), « Logic Pro
+/// X » (10.x).
+pub fn is_logic_app(owner: &str) -> bool {
+    matches!(owner.trim(), "Logic Pro" | "Logic Pro X")
+}
+
+/// Les vues d'un projet de Logic, que sa fenetre porte apres son nom (« <projet> - Tracks ») : jamais un plugin.
+const LOGIC_VIEWS: &[&str] = &[
+    "Tracks", "Mixer", "Piano Roll", "Score", "Step Editor", "Step Sequencer", "Event List", "Audio Track Editor",
+    "Audio File Editor", "Live Loops", "Smart Tempo Editor", "Project Audio", "Environment", "Transform", "Event Float",
+];
+/// Les fenetres de Logic lui-meme, qui ne sont pas des plugins (les titres mesures, et ses reglages).
+const LOGIC_OWN: &[&str] = &["Logic Pro", "Logic Pro X", "Choose a Project", "Plug-in Manager", "Key Commands", "Settings", "Project Settings", "Control Surface Setup", "Tempo List"];
+
+/// Les niveaux (kCGWindowLayer) d'une fenetre de plugin de Logic : 0, la fenetre normale (Notes et Return, 9-10 nov.),
+/// et 3, la fenetre flottante (l'E-Piano, 11 nov.). Pas un dialogue modal (8), une bulle ni un menu (au-dela).
+const LOGIC_PLUGIN_LAYERS: [i32; 2] = [0, 3];
+
+/// (10 nov.) macOS : les fenetres de plugins de Logic Pro. Celles de l'appli « Logic Pro », a l'ecran, au niveau 0 ou 3
+/// (LOGIC_PLUGIN_LAYERS), titrees : ni la fenetre d'un projet (« … - Tracks », « … - Mixer »), ni une fenetre de Logic
+/// lui-meme (LOGIC_OWN), ni un dialogue (« Bounce “Stereo Out” », « Save »). Le titre est le nom de la tranche (le
+/// plugin, Logic ne le dit pas) : `track` le porte, `plugin` reste vide (le studio montre alors le titre). Deux plugins
+/// de la meme tranche (Notes et l'instrument) ont donc le meme titre.
+/// (11 nov., relecture M1) La seconde barriere, seule : ce qui exclut deja une fenetre de Logic (hors de l'ecran, un
+/// autre niveau que 0 ou 3, sans titre, Logic lui-meme, la vue d'un projet, un dialogue). Une fenetre qui la passe est
+/// seulement candidate : `is_logic_plugin` lui demande encore le signe positif.
+pub fn logic_candidate(title: &str, layer: i32, visible: bool) -> bool {
+    let t = title.trim();
+    visible
+        && LOGIC_PLUGIN_LAYERS.contains(&layer)
+        && !t.is_empty()
+        && !LOGIC_OWN.contains(&t)
+        && !LOGIC_VIEWS.iter().any(|v| t.strip_suffix(v).is_some_and(|head| head.ends_with(" - ")))
+        && !["Bounce", "Export", "Save", "Open", "Import"].iter().any(|d| t == *d || t.starts_with(&format!("{d} ")))
+}
+
+/// (11 nov., relecture M1) Une fenetre de Logic est une fenetre de plugin si elle porte le signe positif (le bouton de
+/// menu de l'affichage, `view_button`) ET passe la seconde barriere (`logic_candidate`). Avant, seule la liste
+/// d'exclusion jouait : une fenetre de Logic au titre non liste (un panneau de reglages, une alerte titree) pouvait
+/// etre montree au studio, puis pressee par ses gestes.
+pub fn is_logic_plugin(title: &str, layer: i32, visible: bool, view_button: bool) -> bool {
+    view_button && logic_candidate(title, layer, visible)
+}
+
+pub fn logic_plugin_windows(all: &[RawWindow]) -> Vec<PluginWindow> {
+    let mut out: Vec<PluginWindow> = all
+        .iter()
+        .filter(|w| is_logic_app(&w.exe) && is_logic_plugin(&w.title, w.layer, w.visible, w.view_button))
+        .map(|w| PluginWindow { id: w.hwnd, title: w.title.clone(), plugin: String::new(), track: w.title.trim().to_string(), w: w.w, h: w.h, minimized: w.minimized })
+        .collect();
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
+    out
 }
 
 /// Windows : le tri de `plugin_windows` (fenetres d'outil possedees).
@@ -115,32 +187,144 @@ pub fn plugin_windows_mac(all: &[RawWindow]) -> Vec<PluginWindow> {
     out
 }
 
+/// (10 nov.) macOS : Logic Pro tourne-t-il (une fenetre de l'appli, quelle qu'elle soit ; son nom se lit sans
+/// « Enregistrement de l'ecran ») ?
+pub fn logic_running(all: &[RawWindow]) -> bool {
+    cfg!(target_os = "macos") && all.iter().any(|w| is_logic_app(&w.exe))
+}
+
 /// Live tourne-t-il (une fenetre de son processus, quelle qu'elle soit) ?
 pub fn live_running(all: &[RawWindow]) -> bool {
     all.iter().any(|w| is_live_exe(&w.exe) || (cfg!(target_os = "macos") && is_live_app(&w.exe)))
 }
 
+/// (10 nov.) Ce qui accompagne la liste (hello, windows) pour que le studio dise pourquoi elle est vide
+/// (companion-link.js) : Live tourne-t-il ; sous macOS, Logic Pro aussi, et les titres des fenetres se lisent-ils
+/// (« Enregistrement de l'ecran »). Ailleurs, None : le studio n'en dit rien.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Running {
+    pub live: bool,
+    pub logic: Option<bool>,
+    pub titles: Option<bool>,
+    /// (11 nov.) macOS : « Accessibilite » est-elle accordee ? Logic Pro ne nomme ses fenetres de plugins que pour elle
+    /// (sans elle, sa liste reste vide), et ses gestes passent par elle.
+    pub access: Option<bool>,
+}
+
+impl Running {
+    /// `screen` : « Enregistrement de l'ecran » est accorde (screen_recording) ; `access` : « Accessibilite »
+    /// (accessibility)
+    pub fn of(all: &[RawWindow], screen: bool, access: bool) -> Running {
+        let mac = cfg!(target_os = "macos");
+        Running { live: live_running(all), logic: mac.then(|| logic_running(all)), titles: mac.then_some(screen), access: mac.then_some(access) }
+    }
+
+    /// Les champs d'un message : « live », et ceux que ce systeme connait (« logic », « titles », « access »).
+    pub fn put(&self, v: &mut serde_json::Value) {
+        v["live"] = self.live.into();
+        if let Some(l) = self.logic {
+            v["logic"] = l.into();
+        }
+        if let Some(t) = self.titles {
+            v["titles"] = t.into();
+        }
+        if let Some(a) = self.access {
+            v["access"] = a.into();
+        }
+    }
+}
+
+/// (11 nov.) macOS : « Accessibilite » est-elle accordee (lue sans rien demander : macOS ne la propose jamais de
+/// lui-meme) ? Ailleurs : vrai.
+pub fn accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::permissions().1
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// macOS : « Enregistrement de l'ecran » est-il accorde (lu sans rien demander) ? Sans lui, les titres des fenetres
+/// des autres applis sont vides. Ailleurs : vrai.
+pub fn screen_recording() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::permissions().0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 /// macOS : les fenetres du systeme (CGWindowList) → la liste brute. Sans « Enregistrement de l'ecran », les titres
-/// des autres applis sont vides : aucune fenetre de plugin ne sort (--list le dit).
+/// des autres applis sont vides : aucune fenetre de plugin ne sort (--list le dit). (11 nov.) Logic Pro, lui, ne donne
+/// jamais a CGWindowList le titre de ses fenetres de plugins : pour une fenetre de Logic sans titre, a l'ecran, a un
+/// niveau de plugin, le titre vient de l'Accessibilite (`macos::ax_windows`, une lecture par Logic et par appel), la
+/// fenetre retrouvee par son cadre (`title_by_frame`). Sans l'autorisation « Accessibilite », elle reste sans titre.
 #[cfg(target_os = "macos")]
 pub fn enumerate() -> Vec<RawWindow> {
+    let mut ax: std::collections::HashMap<i32, Vec<crate::macos::AxWin>> = std::collections::HashMap::new();
     crate::macos::all_windows()
         .into_iter()
-        .map(|w| RawWindow {
-            hwnd: w.id as u64,
-            pid: w.pid.max(0) as u32,
-            exe: w.owner,
-            title: w.title,
-            class: String::new(),
-            owner: 0,
-            ex_style: 0,
-            visible: w.onscreen,
-            minimized: false,
-            w: w.bounds.size.width.round() as i32,
-            h: w.bounds.size.height.round() as i32,
-            layer: w.layer,
+        .map(|w| {
+            let b = w.bounds;
+            let mut title = w.title;
+            let mut view_button = false;
+            if w.onscreen && is_logic_app(&w.owner) && LOGIC_PLUGIN_LAYERS.contains(&w.layer) {
+                let seen = ax.entry(w.pid).or_insert_with(|| crate::macos::ax_windows(w.pid));
+                let frames: Vec<[f64; 4]> = seen.iter().map(|a| a.frame).collect();
+                if let Some(a) = index_by_frame(&frames, [b.origin.x, b.origin.y, b.size.width, b.size.height]).map(|i| &seen[i]) {
+                    if title.is_empty() {
+                        title = a.title.clone();
+                    }
+                    // (11 nov., relecture M1) le signe positif, cherche seulement pour une candidate (pas la fenetre du
+                    // projet, ni Logic lui-meme : la recherche coute plus que le titre)
+                    view_button = logic_candidate(&title, w.layer, w.onscreen) && a.view_button();
+                }
+            }
+            RawWindow {
+                hwnd: w.id as u64,
+                pid: w.pid.max(0) as u32,
+                exe: w.owner,
+                title,
+                class: String::new(),
+                owner: 0,
+                ex_style: 0,
+                visible: w.onscreen,
+                minimized: false,
+                w: b.size.width.round() as i32,
+                h: b.size.height.round() as i32,
+                layer: w.layer,
+                view_button,
+            }
         })
         .collect()
+}
+
+/// (11 nov.) Le menu d'affichage d'une fenetre de plugin de Logic (mesure avec PSP VintageWarmer2 : « Controls », le
+/// nom du plugin, puis une ligne vide) : l'element a choisir pour passer a « Controls », ou au dessin du plugin (le
+/// premier element titre qui n'est pas « Controls »).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn logic_view_item(titles: &[String], controls: bool) -> Option<usize> {
+    titles.iter().position(|t| if controls { t == "Controls" } else { !t.trim().is_empty() && t != "Controls" })
+}
+
+/// (11 nov.) Le titre d'une fenetre retrouvee par son cadre (x, y, largeur, hauteur, en points), a un point pres,
+/// parmi celles que l'Accessibilite decrit. Deux fenetres exactement l'une sur l'autre : la premiere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn title_by_frame(seen: &[(String, [f64; 4])], frame: [f64; 4]) -> Option<&str> {
+    let frames: Vec<[f64; 4]> = seen.iter().map(|(_, r)| *r).collect();
+    index_by_frame(&frames, frame).map(|i| seen[i].0.as_str())
+}
+
+/// (11 nov.) L'index de la fenetre dont le cadre est `frame`, a un point pres (la premiere s'il y en a deux).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn index_by_frame(frames: &[[f64; 4]], frame: [f64; 4]) -> Option<usize> {
+    frames.iter().position(|r| r.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 1.0))
 }
 
 /// Le titre que Live donne a la fenetre d'un device : « <device>/<piste> ».
@@ -215,6 +399,7 @@ mod win {
                 w: r.right - r.left,
                 h: r.bottom - r.top,
                 layer: 0,
+                view_button: false,
             }
         }
     }
@@ -251,6 +436,7 @@ mod tests {
             w: 800,
             h: 500,
             layer: 0,
+            view_button: false,
         }
     }
 
@@ -270,6 +456,124 @@ mod tests {
         let ids: Vec<u64> = plugin_windows_mac(&d).iter().map(|w| w.id).collect();
         assert_eq!(ids, vec![2, 3]);
         assert!(is_live_app("Live") && is_live_app("Ableton Live 12 Suite") && !is_live_app("Ableton Live 12 Suite.exe") && !is_live_app("Livestream"));
+    }
+
+    /// (11 nov., relecture M1) La decision : le signe positif d'abord, puis la seconde barriere.
+    #[test]
+    fn a_logic_window_is_a_plugin_only_with_the_view_button() {
+        // le signe et la seconde barriere : une fenetre de plugin (au niveau 0, ou flottante au niveau 3)
+        assert!(is_logic_plugin("Deluxe Classic", 0, true, true));
+        assert!(is_logic_plugin("Stereo Out", 3, true, true));
+        // sans le signe : jamais, quel que soit le titre (un panneau, une alerte titree, une fenetre de reglages)
+        for t in ["Deluxe Classic", "Audio Settings", "Are you sure?", "Untitled", "Control Surface Setup"] {
+            assert!(!is_logic_plugin(t, 0, true, false), "{t}");
+            assert!(!is_logic_plugin(t, 3, true, false), "{t}");
+        }
+        // avec le signe, la seconde barriere tient encore
+        assert!(!is_logic_plugin("Deluxe Classic", 8, true, true), "a modal level");
+        assert!(!is_logic_plugin("Deluxe Classic", 0, false, true), "off screen");
+        assert!(!is_logic_plugin("  ", 0, true, true), "no title");
+        assert!(!is_logic_plugin("Settings", 0, true, true), "Logic itself");
+        assert!(!is_logic_plugin("My Song - Tracks", 0, true, true), "a project view");
+        assert!(!is_logic_plugin("Bounce “Stereo Out”", 0, true, true), "a dialog");
+        // la candidate seule (ce qui decide si le signe est cherche)
+        assert!(logic_candidate("Audio Settings", 0, true) && !logic_candidate("Control Surface Setup", 3, true));
+    }
+
+    /// (11 nov.) Le cadre d'une fenetre retrouve son index parmi celles de l'Accessibilite (a un point pres).
+    #[test]
+    fn finds_a_window_by_its_frame() {
+        let f = [[193.0, 146.0, 1524.0, 920.0], [538.0, 251.0, 516.0, 462.0]];
+        assert_eq!(index_by_frame(&f, [538.6, 251.0, 516.0, 462.0]), Some(1));
+        assert_eq!(index_by_frame(&f, [536.0, 251.0, 516.0, 462.0]), None);
+        assert_eq!(index_by_frame(&[], [0.0; 4]), None);
+    }
+
+    /// (11 nov.) Le menu d'affichage d'une fenetre de Logic, tel que PSP VintageWarmer2 l'a montre.
+    #[test]
+    fn picks_the_logic_view_menu_item() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let menu = t(&["Controls", "PSP VintageWarmer2", ""]);
+        assert_eq!(logic_view_item(&menu, true), Some(0));
+        assert_eq!(logic_view_item(&menu, false), Some(1));
+        assert_eq!(logic_view_item(&t(&["", "Controls"]), false), None, "no plugin view");
+        assert_eq!(logic_view_item(&t(&["Vintage Electric Piano"]), true), None);
+    }
+
+    /// (11 nov.) Logic ne nomme ses fenetres de plugins que pour l'Accessibilite : la fenetre est retrouvee par son cadre.
+    #[test]
+    fn names_a_logic_window_by_its_frame() {
+        let seen = vec![
+            ("Uppwind Link - essai Logic - Tracks".to_string(), [193.0, 146.0, 1524.0, 920.0]),
+            ("Deluxe Classic".to_string(), [538.0, 251.0, 516.0, 462.0]),
+        ];
+        assert_eq!(title_by_frame(&seen, [538.0, 251.0, 516.0, 462.0]), Some("Deluxe Classic"));
+        assert_eq!(title_by_frame(&seen, [538.4, 250.6, 516.0, 461.5]), Some("Deluxe Classic")); // a un point pres
+        assert_eq!(title_by_frame(&seen, [540.0, 251.0, 516.0, 462.0]), None);
+        assert_eq!(title_by_frame(&[], [538.0, 251.0, 516.0, 462.0]), None);
+    }
+
+    /// (10 nov.) Logic Pro 12.3.1 : les fenetres mesurees (titres, tailles, niveaux), et ce qui n'est pas un plugin.
+    /// (11 nov.) L'instrument de la piste, ouvert au niveau 3 (flottant), en est une aussi. (11 nov., relecture M1)
+    /// Seules les fenetres qui portent le bouton de menu de l'affichage (`view_button`) en sont : une fenetre de Logic au
+    /// titre non liste, sans ce bouton, n'est plus montree.
+    #[test]
+    fn finds_logic_plugin_windows_on_macos() {
+        let mac = |id: u64, owner: &str, title: &str, w: i32, h: i32, layer: i32, on: bool| RawWindow { hwnd: id, pid: 300, exe: owner.into(), title: title.into(), visible: on, w, h, layer, ..Default::default() };
+        let plugin = |id: u64, owner: &str, title: &str, w: i32, h: i32, layer: i32| RawWindow { view_button: true, ..mac(id, owner, title, w, h, layer, true) };
+        let d = vec![
+            mac(9781, "Logic Pro", "Uppwind Link - essai Logic - Tracks", 1728, 1014, 0, true), // le projet
+            plugin(9779, "Logic Pro", "Deluxe Classic", 526, 180, 0),                        // Notes (MIDI FX), sur sa piste
+            plugin(9999, "Logic Pro", "Deluxe Classic", 516, 462, 3),                        // l'E-Piano de la piste, flottant
+            mac(9797, "Logic Pro", "Pad", 900, 600, 8, true),                                // un dialogue modal
+            plugin(9780, "Logic Pro", "Stereo Out", 526, 200, 0),                            // Return, sur la sortie
+            mac(9778, "Logic Pro", "Logic Pro", 415, 105, 0, true),                          // une fenetre de Logic lui-meme
+            mac(9775, "Logic Pro", "Choose a Project", 1042, 626, 0, true),
+            mac(9790, "Logic Pro", "Uppwind Link - essai Logic - Mixer", 1200, 700, 0, true),
+            mac(9791, "Logic Pro", "Bounce “Stereo Out”", 700, 500, 0, true),
+            mac(9792, "Logic Pro", "Alchemy", 900, 600, 0, false), // hors de l'ecran
+            mac(9793, "Logic Pro", "Pad", 900, 600, 25, true),     // un menu, une bulle
+            mac(9794, "Logic Pro", "", 526, 180, 0, true),         // sans « Enregistrement de l'ecran » : pas de titre
+            mac(9795, "Google Chrome", "Deluxe Classic", 526, 180, 0, true),
+            plugin(9796, "Logic Pro X", "Bass - Synth", 600, 400, 0), // Logic 10.x ; un « - » qui n'est pas une vue
+            // (relecture M1) des fenetres de Logic au titre que la liste ne connait pas, sans le bouton : pas des plugins
+            mac(9801, "Logic Pro", "Audio Settings", 600, 400, 0, true),
+            mac(9802, "Logic Pro", "Are you sure?", 400, 160, 3, true),
+            mac(9803, "Logic Pro", "Control Surface Setup", 862, 814, 3, true), // mesure : niveau 3, sans le bouton
+            // le bouton, mais une fenetre que la seconde barriere exclut deja : pas un plugin non plus
+            plugin(9804, "Logic Pro", "Settings", 600, 400, 0),
+            plugin(9805, "Logic Pro", "Deluxe Classic", 526, 180, 8),
+        ];
+        let got = logic_plugin_windows(&d);
+        let ids: Vec<u64> = got.iter().map(|w| w.id).collect();
+        assert_eq!(ids, vec![9796, 9779, 9999, 9780]);
+        assert_eq!((got[1].title.as_str(), got[1].plugin.as_str(), got[1].track.as_str(), got[1].w, got[1].h), ("Deluxe Classic", "", "Deluxe Classic", 526, 180));
+        assert_eq!((got[2].title.as_str(), got[2].w, got[2].h), ("Deluxe Classic", 516, 462));
+        assert!(is_logic_app("Logic Pro") && is_logic_app("Logic Pro X") && !is_logic_app("Logic") && !is_logic_app("Logic Pro.app"));
+        // ni Live ni Logic ne prennent les fenetres de l'autre
+        assert!(plugin_windows_mac(&d).is_empty());
+        if cfg!(target_os = "macos") {
+            assert_eq!(plugin_windows(&d).len(), 4);
+        }
+    }
+
+    #[test]
+    fn says_what_runs_for_an_empty_list_logic_and_titles_only_on_macos() {
+        let logic = vec![RawWindow { hwnd: 1, pid: 300, exe: "Logic Pro".into(), title: String::new(), visible: true, ..Default::default() }];
+        let r = Running::of(&logic, false, false);
+        assert!(!r.live);
+        let mut v = serde_json::json!({ "type": "windows", "windows": [] });
+        r.put(&mut v);
+        assert_eq!(v["live"], false);
+        if cfg!(target_os = "macos") {
+            assert_eq!((r.logic, r.titles, r.access), (Some(true), Some(false), Some(false)));
+            assert_eq!((v["logic"].clone(), v["titles"].clone(), v["access"].clone()), (serde_json::json!(true), serde_json::json!(false), serde_json::json!(false)));
+            assert_eq!(Running::of(&fake_desktop(), true, true), Running { live: true, logic: Some(false), titles: Some(true), access: Some(true) });
+        } else {
+            // Windows : rien sur Logic, les titres ni l'Accessibilite (le studio ne parle que de Live)
+            assert_eq!((r.logic, r.titles, r.access), (None, None, None));
+            assert!(v.get("logic").is_none() && v.get("titles").is_none() && v.get("access").is_none());
+        }
     }
 
     fn fake_desktop() -> Vec<RawWindow> {

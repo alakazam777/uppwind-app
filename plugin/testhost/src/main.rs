@@ -20,6 +20,9 @@
 //!   uwl-host play --state-file F [--to ID] [--pattern scale|pulse] [--bpm 120] [--lead-ms 20] [--channel 1]
 //!       l'essai dans un vrai DAW : une gamme (ou des doubles croches) vers un plugin Notes, par le compagnon dont
 //!       on nomme le fichier d'etat ; dit si le plugin les a placees a l'heure
+//!   uwl-host listen --state-file F [--seconds 10] [--target auto|plugin|plugin:<id>]
+//!       (9 nov.) le studio pour le son seulement : demande le son du DAW (un Return) et mesure ce qui arrive, seconde par
+//!       seconde (paquets, niveau, silences, trous, age) ; le compagnon doit etre arme
 //!
 //! Le plugin trouve le compagnon par son fichier d'etat. return, notes et play exigent --state-file F ou
 //! UWL_STATE_FILE=F (le compagnon d'essai) et le passent au plugin charge ; scan lui donne un fichier qui n'existe pas.
@@ -629,6 +632,154 @@ fn run_play(a: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// (9 nov.) Le studio pour le son seulement : appaire, demande le son du DAW (« audio start », cible « auto » par defaut,
+/// comme le studio sans script) et compte les paquets UWA1 qui arrivent, seconde par seconde : leur nombre, le niveau
+/// (crete et RMS en dBFS), les paquets « silence », les trous (numeros sautes) et l'age (l'heure du premier echantillon
+/// contre l'horloge de cette machine). Le compagnon doit etre arme (« arm » dans sa console) : sinon il repond
+/// « disarmed » et l'essai le dit. Rien n'est enregistre, rien n'est joue.
+///   uwl-host listen --state-file F [--seconds 10] [--target auto|plugin|plugin:<id>] [--origin URL]
+fn run_listen(a: &[String]) -> Result<(), String> {
+    use tungstenite::client::IntoClientRequest;
+    let path = explicit_state_file(a)?;
+    let st: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{}: {e} (is the companion running?)", path.display()))?).map_err(|e| e.to_string())?;
+    let port = st["port"].as_u64().ok_or("no port in the state file")? as u16;
+    let token = st["token"].as_str().ok_or("no token in the state file")?.to_string();
+    let origin = arg(a, "--origin").unwrap_or_else(|| "https://uppwind.lucasmoreau.fr".into());
+    let seconds = num(a, "--seconds", 10.0)?.clamp(1.0, 600.0);
+    let target = arg(a, "--target").unwrap_or_else(|| "auto".into());
+    let mut req = format!("ws://127.0.0.1:{port}/").into_client_request().map_err(|e| e.to_string())?;
+    req.headers_mut().insert("Origin", origin.parse().map_err(|_| "bad origin")?);
+    let s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("no companion on {port} ({e})"))?;
+    let _ = s.set_nodelay(true);
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let (mut ws, _) = tungstenite::client(req, s).map_err(|e| format!("handshake: {e}"))?;
+    let mut errors = Vec::new();
+    let h = ws_pair(&mut ws, port, &token, &mut errors)?;
+    if h["audio"] != true {
+        return Err(format!("this companion cannot send sound here ({})", h["audioError"]));
+    }
+    ws.send(tungstenite::Message::text(json!({ "type": "audio", "action": "start", "target": target, "rate": 48000, "format": "f32", "ms": 5 }).to_string())).map_err(|e| e.to_string())?;
+    println!("Listening to the companion's sound (target {target}) for {seconds} s…");
+    // une seconde de mesures
+    #[derive(Default)]
+    struct Sec {
+        packets: u64,
+        frames: u64,
+        peak: f32,
+        sum_sq: f64,
+        n: u64,
+        silent: u64,
+        gaps: u64,
+        ages: Vec<f64>,
+    }
+    let db = |x: f64| if x > 0.0 { 20.0 * x.log10() } else { f64::NEG_INFINITY };
+    let t0 = Instant::now();
+    let mut sec = Sec::default();
+    let mut total = Sec::default();
+    let mut next_report = 1.0;
+    let mut last_seq: Option<u32> = None;
+    let mut stopped: Option<String> = None;
+    let report = |k: f64, s: &Sec| {
+        let mut ages = s.ages.clone();
+        ages.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let med = ages.get(ages.len() / 2).copied().unwrap_or(f64::NAN);
+        let rms = if s.n > 0 { (s.sum_sq / s.n as f64).sqrt() } else { 0.0 };
+        println!(
+            "  {k:>4.0} s  {:>4} packets  {:>6} frames  peak {:>6.1} dBFS  rms {:>6.1} dBFS  silent {:>3}  gaps {}  age {:.1} ms",
+            s.packets,
+            s.frames,
+            db(s.peak as f64),
+            db(rms),
+            s.silent,
+            s.gaps,
+            med
+        );
+    };
+    while t0.elapsed().as_secs_f64() < seconds {
+        match ws.read() {
+            Ok(tungstenite::Message::Binary(b)) if b.len() >= 36 && &b[..4] == b"UWA1" => {
+                let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+                let seq = u32_at(4);
+                let t_ms = f64::from_le_bytes(b[16..24].try_into().unwrap());
+                let frames = u16::from_le_bytes([b[28], b[29]]) as u64;
+                let (ch, fmt, flags) = (b[30] as usize, b[31], b[32]);
+                if let Some(p) = last_seq {
+                    if seq != p.wrapping_add(1) {
+                        sec.gaps += 1;
+                    }
+                }
+                last_seq = Some(seq);
+                sec.packets += 1;
+                sec.frames += frames;
+                if flags & 1 != 0 {
+                    sec.silent += 1;
+                }
+                sec.ages.push(epoch_ms() - t_ms);
+                let body = &b[36..];
+                let n = (frames as usize * ch).min(if fmt == 1 { body.len() / 4 } else { body.len() / 2 });
+                for i in 0..n {
+                    let x = if fmt == 1 { f32::from_le_bytes(body[4 * i..4 * i + 4].try_into().unwrap()) } else { i16::from_le_bytes([body[2 * i], body[2 * i + 1]]) as f32 / 32768.0 };
+                    sec.peak = sec.peak.max(x.abs());
+                    sec.sum_sq += (x as f64) * (x as f64);
+                }
+                sec.n += n as u64;
+            }
+            Ok(tungstenite::Message::Text(t)) => {
+                let v: Value = serde_json::from_str(t.as_str()).unwrap_or(Value::Null);
+                if v["type"] == "audio" {
+                    if v["state"] == "on" {
+                        println!("  the companion sends: {} ({} Hz, {})", v["exe"].as_str().or(v["daw"].as_str()).unwrap_or("?"), v["rate"], v["target"].as_str().unwrap_or(""));
+                    } else if v["state"] == "off" {
+                        stopped = Some(format!("{} {}", v["code"].as_str().unwrap_or(""), v["error"].as_str().unwrap_or("")).trim().to_string());
+                        break;
+                    }
+                } else if v["type"] == "error" {
+                    errors.push(v.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(format!("websocket: {e}")),
+        }
+        if t0.elapsed().as_secs_f64() >= next_report {
+            report(next_report, &sec);
+            total.packets += sec.packets;
+            total.frames += sec.frames;
+            total.peak = total.peak.max(sec.peak);
+            total.sum_sq += sec.sum_sq;
+            total.n += sec.n;
+            total.silent += sec.silent;
+            total.gaps += sec.gaps;
+            total.ages.append(&mut sec.ages);
+            sec = Sec::default();
+            next_report += 1.0;
+        }
+    }
+    let _ = ws.send(tungstenite::Message::text(r#"{"type":"audio","action":"stop"}"#.to_string()));
+    // la derniere seconde, incomplete
+    total.packets += sec.packets;
+    total.frames += sec.frames;
+    total.peak = total.peak.max(sec.peak);
+    total.sum_sq += sec.sum_sq;
+    total.n += sec.n;
+    total.silent += sec.silent;
+    total.gaps += sec.gaps;
+    total.ages.append(&mut sec.ages);
+    if let Some(why) = stopped {
+        println!("The companion stopped the sound: {why}");
+        if why.contains("disarmed") {
+            println!("(type « arm » in the companion's console, then run this again)");
+        }
+    }
+    println!("Total:");
+    report(t0.elapsed().as_secs_f64().floor(), &total);
+    for e in &errors {
+        println!("companion error: {e}");
+    }
+    let _ = ws.close(None);
+    Ok(())
+}
+
 /// Le fichier d'etat que l'hote d'essai ET le plugin qu'il charge liront : --state-file, sinon UWL_STATE_FILE, rien
 /// d'autre. Jamais celui du compagnon de l'utilisateur par defaut (%USERPROFILE%\.uppwind-companion.json) : le plugin
 /// charge ici se connecterait sinon au vrai compagnon de la session. Pour viser ce compagnon-la (play, dans un vrai
@@ -643,7 +794,7 @@ fn main() {
     // le plugin charge dans ce processus lit UWL_STATE_FILE : qu'il lise le meme fichier que l'hote, ou un fichier
     // qui n'existe pas (scan, ou aucune commande), jamais le fichier par defaut
     match a.first().map(|s| s.as_str()) {
-        Some("return") | Some("notes") | Some("play") => match explicit_state_file(&a) {
+        Some("return") | Some("notes") | Some("play") | Some("listen") => match explicit_state_file(&a) {
             Ok(p) => std::env::set_var("UWL_STATE_FILE", p),
             Err(e) => {
                 eprintln!("{e}");
@@ -657,6 +808,7 @@ fn main() {
         Some("return") => run_return(&a),
         Some("notes") => run_notes(&a),
         Some("play") => run_play(&a),
+        Some("listen") => run_listen(&a),
         _ => {
             println!("uwl-host scan|return|notes --bundle \"Uppwind Link.vst3\" … (see the source header)");
             Ok(())

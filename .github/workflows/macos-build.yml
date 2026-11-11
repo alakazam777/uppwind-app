@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Uppwind
 # Uppwind Link -- the macOS companion and its plugins, signed and notarized (called by macos-preview.yml and
-# release.yml): the Uppwind Link plugins first (Uppwind Link.vst3, universal), signed with the Developer ID
-# Application certificate (hardened runtime, Apple's timestamp), then the companion (universal, arm64 + x86_64, lipo),
-# built with the release flags and that signed bundle inside (it installs it itself, byte for byte), signed the same
+# release.yml): the Uppwind Link plugins first (Uppwind Link.vst3, and Uppwind Link.component, their Audio Units for
+# Logic Pro; universal), signed with the Developer ID Application certificate (hardened runtime, Apple's timestamp),
+# then the companion (universal, arm64 + x86_64, lipo), built with the release flags and those signed bundles inside
+# (it installs them itself, byte for byte), signed the same
 # way (no entitlements); both put in a .dmg with the README, the licences and the notices, the .dmg signed, notarized
 # by Apple (notarytool, which covers the bundle too) and stapled. The result is a workflow artifact
 # "uppwind-companion-macos" (the .dmg and its SHA-256); this workflow never publishes a release itself.
@@ -53,9 +54,12 @@ jobs:
           uname -m
           sw_vers
           xcodebuild -version
+      # (11 Nov, 0.4.0) the plugins twice: as the VST3 / CLAP, and with the Audio Units (the "auv2" feature, which
+      # dev/build-macos.sh builds by default)
       - name: Tests
         run: |
           cargo test --release --locked --manifest-path plugin/Cargo.toml
+          cargo test --release --locked --manifest-path plugin/Cargo.toml --features uppwind-link/auv2
           cargo test --release --locked --manifest-path companion/Cargo.toml
       # the notices embedded in the program (--license) must list the Mac crates too (option-ext, MPL-2.0…), the
       # companion's and the plugins'
@@ -102,18 +106,43 @@ jobs:
             sh dev/build-macos.sh "$RUNNER_TEMP/build"
           lipo -archs "$RUNNER_TEMP/build/uppwind-companion"
           lipo -archs "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link"
+          lipo -archs "$RUNNER_TEMP/build/Uppwind Link.component/Contents/MacOS/Uppwind Link"
       - name: Check the programs (no path of the runner) and the plugins' signature
         run: |
-          python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion" "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link"
-          VST3="$RUNNER_TEMP/build/Uppwind Link.vst3"
-          codesign --verify --deep --strict --verbose=2 "$VST3"
-          INFO=$(codesign -dv --verbose=4 "$VST3" 2>&1)
-          printf '%s\n' "$INFO" | grep -E '^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier|Runtime Version)'
-          # a Developer ID signature, timestamped, with the hardened runtime (not ad hoc); here-strings, not pipes
-          # into grep -q (pipefail)
-          grep -q '^Authority=Developer ID Application: ' <<< "$INFO"
-          grep -q '^Timestamp=' <<< "$INFO"
-          grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]*\(runtime\)' <<< "$INFO"
+          python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion" "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link" \
+            "$RUNNER_TEMP/build/Uppwind Link.component/Contents/MacOS/Uppwind Link"
+          for B in "$RUNNER_TEMP/build/Uppwind Link.vst3" "$RUNNER_TEMP/build/Uppwind Link.component"; do
+            codesign --verify --deep --strict --verbose=2 "$B"
+            INFO=$(codesign -dv --verbose=4 "$B" 2>&1)
+            printf '%s\n' "$INFO" | grep -E '^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier|Runtime Version)'
+            # a Developer ID signature, timestamped, with the hardened runtime (not ad hoc); here-strings, not pipes
+            # into grep -q (pipefail)
+            grep -q '^Authority=Developer ID Application: ' <<< "$INFO"
+            grep -q '^Timestamp=' <<< "$INFO"
+            grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]*\(runtime\)' <<< "$INFO"
+          done
+      # (11 Nov, 0.4.0) Logic Pro refuses an Audio Unit that fails auval: the three of the signed .component (Return,
+      # an effect; Notes, an instrument and a MIDI effect) are validated here, from this runner's own Components folder
+      # (the runner is thrown away after the job). Never auval -a: it scans every Audio Unit of the machine.
+      - name: auval (the Audio Units, as Logic Pro checks them)
+        run: |
+          COMP="$HOME/Library/Audio/Plug-Ins/Components"
+          mkdir -p "$COMP"
+          rm -rf "$COMP/Uppwind Link.component"
+          ditto "$RUNNER_TEMP/build/Uppwind Link.component" "$COMP/Uppwind Link.component"
+          # the registry of Audio Units reads the folder again
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          for AU in "aufx UwRt Uppw" "aumu UwNt Uppw" "aumi UwNm Uppw"; do
+            echo "auval -v $AU"
+            # (AU: three words, so unquoted)
+            auval -v $AU > "$RUNNER_TEMP/auval.txt" 2>&1 || true
+            tail -n 3 "$RUNNER_TEMP/auval.txt"
+            if ! grep -q "AU VALIDATION SUCCEEDED" "$RUNNER_TEMP/auval.txt"; then
+              cat "$RUNNER_TEMP/auval.txt"
+              exit 1
+            fi
+          done
+          rm -rf "$COMP/Uppwind Link.component"
       # hardened runtime, Apple's timestamp, a stable identifier (the one of the LaunchAgent), no entitlements: the
       # companion needs neither JIT (WKWebView runs its JavaScript in WebKit's own processes) nor get-task-allow, and
       # it loads only Apple's frameworks
@@ -129,20 +158,27 @@ jobs:
           "$BIN" --license > "$RUNNER_TEMP/license.txt"
           head -n 3 "$RUNNER_TEMP/license.txt"
           grep -q "Uppwind Link plugins -- third-party notices" "$RUNNER_TEMP/license.txt"
-          # the companion carries exactly the signed bundle: installed into a folder of the runner, same bytes, valid
+          grep -q "AudioUnitSDK" "$RUNNER_TEMP/license.txt"
+          # the companion carries exactly the signed bundles: installed into a folder of the runner (both there, as the
+          # folder is not called VST3), same bytes, valid
           "$BIN" --install-plugins --plugins-dir "$RUNNER_TEMP/vst3-check"
-          diff -r "$RUNNER_TEMP/build/Uppwind Link.vst3" "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-check/Uppwind Link.vst3"
+          for k in vst3 component; do
+            diff -r "$RUNNER_TEMP/build/Uppwind Link.$k" "$RUNNER_TEMP/vst3-check/Uppwind Link.$k"
+            codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-check/Uppwind Link.$k"
+          done
           rm -rf "$RUNNER_TEMP/vst3-check"
-      # the signed Uppwind Link.vst3 too: notarization covers it, and a user can drag it into ~/Library/Audio/Plug-Ins/VST3
+      # the signed Uppwind Link.vst3 and Uppwind Link.component too: notarization covers them, and a user can drag them
+      # into ~/Library/Audio/Plug-Ins/VST3 and ~/Library/Audio/Plug-Ins/Components
       - name: The .dmg (the companion, the plugins, README, licences, notices)
         run: |
           STAGE="$RUNNER_TEMP/dmg"
           rm -rf "$STAGE" dist
           mkdir -p "$STAGE" dist
           ditto "$RUNNER_TEMP/build/uppwind-companion" "$STAGE/uppwind-companion"
-          ditto "$RUNNER_TEMP/build/Uppwind Link.vst3" "$STAGE/Uppwind Link.vst3"
-          codesign --verify --deep --strict "$STAGE/Uppwind Link.vst3"
+          for k in vst3 component; do
+            ditto "$RUNNER_TEMP/build/Uppwind Link.$k" "$STAGE/Uppwind Link.$k"
+            codesign --verify --deep --strict "$STAGE/Uppwind Link.$k"
+          done
           cp README.md LICENSE LICENSE-EXCEPTION.txt LICENSE-EXCEPTION-PLUGINS.txt LICENSE-MIT THIRD-PARTY-NOTICES.txt "$STAGE/"
           cp plugin/THIRD-PARTY-NOTICES.txt "$STAGE/THIRD-PARTY-NOTICES-PLUGINS.txt"
           ok=0
@@ -204,13 +240,17 @@ jobs:
           head -n 3 "$RUNNER_TEMP/license-dmg.txt"
           grep -q "option-ext" "$RUNNER_TEMP/license-dmg.txt"
           # the plugins in the .dmg: the Developer ID signature, valid; Gatekeeper's view of a plugin bundle
-          codesign --verify --deep --strict --verbose=2 "$MNT/Uppwind Link.vst3"
-          codesign -dv --verbose=4 "$MNT/Uppwind Link.vst3" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)'
-          spctl -a -vvv -t install "$MNT/Uppwind Link.vst3" || echo "(spctl -t install on a plugin bundle: see above)"
-          # and the companion of the .dmg installs that very bundle (into a folder of the runner)
+          for k in vst3 component; do
+            codesign --verify --deep --strict --verbose=2 "$MNT/Uppwind Link.$k"
+            codesign -dv --verbose=4 "$MNT/Uppwind Link.$k" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)'
+            spctl -a -vvv -t install "$MNT/Uppwind Link.$k" || echo "(spctl -t install on a plugin bundle: see above)"
+          done
+          # and the companion of the .dmg installs those very bundles (into a folder of the runner)
           "$MNT/uppwind-companion" --install-plugins --plugins-dir "$RUNNER_TEMP/vst3-dmg"
-          diff -r "$MNT/Uppwind Link.vst3" "$RUNNER_TEMP/vst3-dmg/Uppwind Link.vst3"
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-dmg/Uppwind Link.vst3"
+          for k in vst3 component; do
+            diff -r "$MNT/Uppwind Link.$k" "$RUNNER_TEMP/vst3-dmg/Uppwind Link.$k"
+            codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/vst3-dmg/Uppwind Link.$k"
+          done
           hdiutil detach "$MNT"
       - name: SHA-256
         run: |

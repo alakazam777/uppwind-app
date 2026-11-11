@@ -56,6 +56,20 @@ fn next_frame(s: &mut TcpStream, rd: &mut p::FrameReader, buf: &mut [u8], t0: In
 
 /// Un secret (v1) ou une preuve (v2) faux : compte ; trop en 30 s, les suivants sont ralentis et refuses — mais le bon
 /// passe toujours, sinon n'importe quel programme local fermerait la porte aux vrais plugins du DAW.
+/// (9 nov.) L'hote d'un plugin : le nom que le plugin donne (son processus) ; sur Mac, pour un Audio Unit que son hote
+/// fait tourner dans le service d'Apple (AUHostingServiceXPC_arrow : Logic Pro 12), l'appli responsable de ce service
+/// (« Logic Pro »), pour que le studio sache quel DAW c'est. Le pid reste celui du service (la ou tourne le plugin).
+fn host_of(hello: &p::Hello) -> String {
+    #[cfg(target_os = "macos")]
+    if crate::audio::procs::is_au_hosting_service(&hello.host) {
+        if let Some(app) = crate::macos::responsible_exe(hello.pid) {
+            crate::log(&format!("plugin link: {} runs in {} (pid {}) for {app}", hello.kind.name(), hello.host, hello.pid));
+            return app;
+        }
+    }
+    hello.host.clone()
+}
+
 fn refuse_wrong(s: &mut TcpStream, hub: &Hub, what: &str, who: &p::Hello) {
     let locked = hub.locked();
     hub.failure();
@@ -155,7 +169,7 @@ pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr) {
         id: hello.instance,
         kind: hello.kind,
         name: hello.name.clone(),
-        host: hello.host.clone(),
+        host: host_of(&hello),
         pid: hello.pid,
         rate: AtomicU32::new(hello.rate),
         max_block: AtomicU32::new(hello.max_block),

@@ -13,6 +13,14 @@
 [workspace]
 resolver = "2"
 members = ["proto", "plugins", "testhost"]
+# (10 nov.) la copie corrigee de clap-wrapper (ci-dessous) n'est pas un membre : construite seulement par l'option auv2
+exclude = ["vendor"]
+
+# (10 nov.) clap-wrapper 0.3.1 de crates.io, copie dans vendor/clap-wrapper avec trois correctifs : l'heure des notes MIDI
+# des Audio Units (le decalage dans le bloc), des noms de classes Cocoa fixes (un build reproductible), ni journal ni
+# assert en release. Ce qui a change, et pourquoi : vendor/clap-wrapper/UPPWIND.md.
+[patch.crates-io]
+clap-wrapper = { path = "vendor/clap-wrapper" }
 
 [workspace.package]
 version = "0.1.0"

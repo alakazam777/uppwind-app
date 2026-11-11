@@ -190,6 +190,13 @@ struct Conn<'a> {
     rev_gen: u64,
     /// (9 nov., F4) le son du DAW partait-il au dernier tour (la fenetre d'etat et l'icone le disent) ?
     audio_was: bool,
+    /// (11 nov., discord.rs) le numero de cette connexion pour la presence Discord, et la generation deja dite
+    presence_owner: u64,
+    presence_gen: u64,
+    /// cette connexion a demande la presence au moins une fois (sinon elle ne recoit pas ses changements)
+    presence_used: bool,
+    /// (11 nov.) hello {role:"presence"} : la page Music, qui ne peut que poser la presence Discord
+    presence_only: bool,
 }
 
 enum Fatal {
@@ -236,10 +243,11 @@ impl<'a> Conn<'a> {
     }
 
     // ── les fenetres ─────────────────────────────────────────────────────────────────────────────────────────
-    fn windows(&self) -> (bool, Vec<plugins::PluginWindow>) {
+    // (10 nov.) avec ce qui tourne (plugins::Running : Live ; sous macOS, Logic Pro et les titres)
+    fn windows(&self) -> (plugins::Running, Vec<plugins::PluginWindow>) {
         if self.sh.demo {
             let w = plugins::PluginWindow { id: DEMO_ID, title: "Demo Synth/1-Demo".into(), plugin: "Demo Synth".into(), track: "1-Demo".into(), w: 640, h: 400, minimized: false };
-            return (true, vec![w]);
+            return (plugins::Running { live: true, logic: None, titles: None, access: None }, vec![w]);
         }
         let all = plugins::enumerate();
         let mut wins = plugins::plugin_windows(&all);
@@ -249,12 +257,14 @@ impl<'a> Conn<'a> {
                 wins.push(plugins::PluginWindow { id: t, title: raw.title.clone(), plugin: "Uppwind Test".into(), track: "0-Test".into(), w: raw.w, h: raw.h, minimized: raw.minimized });
             }
         }
-        (plugins::live_running(&all), wins)
+        (plugins::Running::of(&all, plugins::screen_recording(), plugins::accessibility()), wins)
     }
 
     fn on_list(&mut self) -> Result<(), Fatal> {
-        let (live, wins) = self.windows();
-        self.send_text(json!({ "type": "windows", "live": live, "windows": wins }).to_string())
+        let (run, wins) = self.windows();
+        let mut v = json!({ "type": "windows", "windows": wins });
+        run.put(&mut v);
+        self.send_text(v.to_string())
     }
 
     fn on_devices(&mut self) -> Result<(), Fatal> {
@@ -368,6 +378,48 @@ impl<'a> Conn<'a> {
         true
     }
 
+    // (11 nov.) macOS, Logic Pro : la fenetre montree passe a « Controls » (ses reglages en curseurs, accessibles) ou au
+    // dessin du plugin ; arme seulement, comme les gestes
+    fn on_view(&mut self, view: &str) -> Result<(), Fatal> {
+        let controls = match view {
+            "controls" => true,
+            "editor" => false,
+            _ => return self.send_text(json!({ "type": "view", "ok": false, "error": "view is controls or editor" }).to_string()),
+        };
+        if self.disarmed() {
+            return self.send_text(json!({ "type": "view", "ok": false, "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string());
+        }
+        let Some(id) = self.watch.as_ref().map(|w| w.id) else {
+            return self.send_text(json!({ "type": "view", "ok": false, "error": "no plugin window is shown" }).to_string());
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let r = match logic_window(id) {
+                None => Err("only a Logic Pro window has these views".to_string()),
+                // (11 nov., relecture M1) relu ici aussi : seulement une fenetre de plugin (le bouton de menu de l'affichage)
+                Some((pid, frame)) if !crate::macos::ax_plugin_window(pid, frame) => Err("this window of Logic Pro is not a plugin window".to_string()),
+                Some((pid, frame)) => crate::macos::ax_set_logic_view(pid, frame, controls),
+            };
+            match r {
+                Ok(v) => {
+                    let what = if v.controls { "Controls" } else { "the plugin's own view" };
+                    crate::log(&format!("view: the Logic Pro window shows {what}{}", if v.opaque { " (opaque to Accessibility)" } else { "" }));
+                    // une image au plus vite : la fenetre a change, sa taille aussi
+                    if let Some(w) = self.watch.as_mut() {
+                        w.next = Instant::now();
+                    }
+                    self.send_text(json!({ "type": "view", "ok": true, "view": if v.controls { "controls" } else { "editor" }, "opaque": v.opaque }).to_string())
+                }
+                Err(e) => self.send_text(json!({ "type": "view", "ok": false, "error": e }).to_string()),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (id, controls);
+            self.send_text(json!({ "type": "view", "ok": false, "error": "only Logic Pro on a Mac has these views" }).to_string())
+        }
+    }
+
     fn on_watch(&mut self, id: u64, fps: Option<f64>, quality: Option<u8>) -> Result<(), Fatal> {
         if self.disarmed() {
             self.stop_watch(None)?;
@@ -376,10 +428,10 @@ impl<'a> Conn<'a> {
         }
         let t0 = Instant::now();
         self.stop_watch(None)?;
-        // seulement une fenetre de plugin de Live, jamais une autre fenetre de la machine
+        // seulement une fenetre de plugin (de Live ; sous macOS, de Logic Pro aussi), jamais une autre fenetre
         let (_, wins) = self.windows();
         let Some(w) = wins.into_iter().find(|w| w.id == id) else {
-            return self.send_text(json!({ "type": "unwatched", "id": id, "reason": "not a Live plugin window (closed?)" }).to_string());
+            return self.send_text(json!({ "type": "unwatched", "id": id, "reason": "not a plugin window (closed?)" }).to_string());
         };
         let t_windows = t0.elapsed();
         let cap = if self.sh.demo {
@@ -395,10 +447,18 @@ impl<'a> Conn<'a> {
         let fps = fps.filter(|f| f.is_finite()).unwrap_or(30.0).clamp(1.0, 60.0);
         let kind = cap.as_ref().map(|c| c.kind()).unwrap_or("demo");
         crate::log(&format!("watch \"{}\" ({}×{}) with {kind} at {fps:.0} fps (input: {}; {setup})", w.title, w.w, w.h, self.inj.mode.name()));
-        self.send_text(
-            json!({ "type": "watching", "id": id, "title": w.title, "plugin": w.plugin, "track": w.track, "w": w.w, "h": w.h, "capture": kind, "fps": fps, "mode": self.inj.mode.name() })
-                .to_string(),
-        )?;
+        #[allow(unused_mut)]
+        let mut watching =
+            json!({ "type": "watching", "id": id, "title": w.title, "plugin": w.plugin, "track": w.track, "w": w.w, "h": w.h, "capture": kind, "fps": fps, "mode": self.inj.mode.name() });
+        // (11 nov.) macOS, Logic Pro : l'affichage de la fenetre (controls|editor), et si le dessin du plugin est opaque
+        #[cfg(target_os = "macos")]
+        if !self.sh.demo {
+            if let Some(v) = logic_view(id) {
+                watching["logicView"] = json!(if v.controls { "controls" } else { "editor" });
+                watching["opaque"] = json!(v.opaque);
+            }
+        }
+        self.send_text(watching.to_string())?;
         let (req_tx, req_rx) = mpsc::channel::<Req>();
         let (resp_tx, resp_rx) = mpsc::channel::<Resp>();
         let worker = Worker::new(id, w.title.clone(), cap).with_latest_input(self.latest_input.clone());
@@ -626,6 +686,10 @@ impl<'a> Conn<'a> {
             self.close(CLOSE_REVOKED, "new pairing code");
             return Err(Fatal::Closed);
         }
+        // (11 nov.) la page Music : un nouveau code la ferme (ci-dessus), l'armement ne la regarde pas
+        if self.presence_only {
+            return Ok(());
+        }
         let g = self.sh.arming.generation();
         if g == self.arm_gen {
             return Ok(());
@@ -647,8 +711,59 @@ impl<'a> Conn<'a> {
         Ok(())
     }
 
+    /// (11 nov., discord.rs) « presence » : montrer un titre sur Discord, l'effacer, ou dire l'etat.
+    fn on_presence(&mut self, action: &str, track: Option<crate::discord::RawTrack>) -> Result<(), Fatal> {
+        self.presence_used = true;
+        let p = &self.sh.presence;
+        let mut err: Option<(&str, String)> = None;
+        match (action, track) {
+            ("set", Some(raw)) => match crate::discord::Track::from_raw(&raw, now_ms()) {
+                Ok(t) => {
+                    if let Err(e) = p.show(self.presence_owner, t) {
+                        err = Some((crate::discord::CODE, e.to_string()));
+                    }
+                }
+                Err(e) => err = Some(("bad-track", e)),
+            },
+            ("set", None) => err = Some(("bad-track", "presence set needs a track".into())),
+            ("clear", _) => p.clear(self.presence_owner),
+            ("state", _) => {}
+            _ => err = Some(("bad-action", "presence action is set, clear or state".into())),
+        }
+        self.presence_gen = p.generation();
+        let mut m = json!({ "type": "presence" });
+        if let (Some(o), Some(s)) = (m.as_object_mut(), p.snapshot().json().as_object()) {
+            o.extend(s.clone());
+        }
+        if let Some((code, e)) = err {
+            m["code"] = json!(code);
+            m["error"] = json!(e);
+        }
+        self.send_text(m.to_string())
+    }
+
+    /// (11 nov.) La presence a change (permise ou retiree ici, Discord parti, affichee) : la page qui s'en sert le sait.
+    fn poll_presence(&mut self) -> Result<(), Fatal> {
+        if !self.presence_used {
+            return Ok(());
+        }
+        let g = self.sh.presence.generation();
+        if g == self.presence_gen {
+            return Ok(());
+        }
+        self.presence_gen = g;
+        let mut m = json!({ "type": "presence" });
+        if let (Some(o), Some(s)) = (m.as_object_mut(), self.sh.presence.snapshot().json().as_object()) {
+            o.extend(s.clone());
+        }
+        self.send_text(m.to_string())
+    }
+
     /// (29 oct.) Un plugin d'avant (protocole v1) a ete refuse : le studio le dit (« notice »), une fois par nouveau venu.
     fn poll_notices(&mut self) -> Result<(), Fatal> {
+        if self.presence_only {
+            return Ok(()); // (11 nov.) les avis des plugins : pour le Studio seulement
+        }
         let generation = crate::plugin_link::notices_generation();
         if generation == self.notices {
             return Ok(());
@@ -682,6 +797,10 @@ impl<'a> Conn<'a> {
     }
 
     fn on_message(&mut self, msg: ClientMsg, recv: f64) -> Result<(), Fatal> {
+        // (11 nov.) la page Music : la presence Discord et ping, rien d'autre
+        if self.presence_only && !matches!(msg, ClientMsg::Presence { .. } | ClientMsg::Ping { .. }) {
+            return self.send_text(protocol::error("presence-only", "this connection can only set the Discord presence"));
+        }
         match msg {
             ClientMsg::Hello { .. } => self.send_text(protocol::error("already-paired", "hello was already accepted")),
             ClientMsg::List => self.on_list(),
@@ -690,6 +809,7 @@ impl<'a> Conn<'a> {
             ClientMsg::Open { path } => self.on_editor(&path, true),
             ClientMsg::Close { path } => self.on_editor(&path, false),
             ClientMsg::Watch { id, fps, quality } => self.on_watch(id, fps, quality),
+            ClientMsg::View { view } => self.on_view(&view),
             ClientMsg::Unwatch => self.stop_watch(Some("unwatch")),
             ClientMsg::Ack { seq } => {
                 if seq <= self.seq && seq > self.acked {
@@ -766,6 +886,7 @@ impl<'a> Conn<'a> {
                 }
                 self.send_text(m.to_string())
             }
+            ClientMsg::Presence { action, track } => self.on_presence(&action, track),
             ClientMsg::Routes => {
                 // un fil par demande (jusqu'a 1,5 s si Live se tait) : comptes avec Open/Close, pour qu'une rafale ne
                 // fasse pas pousser les fils sans fin
@@ -1004,13 +1125,19 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         arm_gen: 0,
         rev_gen,
         audio_was: false,
+        presence_owner: crate::discord::new_owner(),
+        presence_gen: 0,
+        presence_used: false,
+        presence_only: false,
     };
     crate::log(&format!("studio connected from {origin}: waiting for the pairing proof"));
 
     // 1. l'appairage (29 oct., v2) : le defi tout de suite (rien d'autre ne part avant la preuve du studio), puis le
     //    premier message, dans les 10 s
     let nonce_c = security::new_nonce();
-    if c.send_text(json!({ "type": "challenge", "v": AUTH_VERSION, "nonce": security::hex(&nonce_c) }).to_string()).is_err() {
+    // (11 nov.) « presence » : ce compagnon connait le role presence (discord.rs) ; un relais de Music face a un compagnon
+    // d'avant s'arrete avant son hello (sinon ce compagnon le prendrait pour un studio, et l'armement ne se couperait plus)
+    if c.send_text(json!({ "type": "challenge", "v": AUTH_VERSION, "nonce": security::hex(&nonce_c), "presence": true }).to_string()).is_err() {
         return;
     }
     let t0 = Instant::now();
@@ -1027,7 +1154,10 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
             Ok(Message::Text(t)) => {
                 let parsed = protocol::parse(t.as_str());
                 let (version, token, v, nonce, proof) = match parsed {
-                    Ok(ClientMsg::Hello { version, token, v, nonce, proof }) => (version, token, v, nonce, proof),
+                    Ok(ClientMsg::Hello { version, token, v, nonce, proof, role }) => {
+                        c.presence_only = role.as_deref() == Some("presence");
+                        (version, token, v, nonce, proof)
+                    }
                     _ => {
                         crate::log("REFUSED: the first message is not hello");
                         let _ = c.send_text(protocol::error("not-paired", "the first message must be hello with the pairing proof"));
@@ -1097,7 +1227,30 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 if version.unwrap_or(0) != PROTOCOL_VERSION {
                     crate::log(&format!("note: the studio speaks protocol {:?}, the companion {PROTOCOL_VERSION}", version));
                 }
-                let (live_on, _) = c.windows();
+                // (11 nov.) la page Music (role presence) : un hello reduit, et elle ne compte pas comme un studio (ni pour
+                // l'armement, qui se coupe toujours apres 10 min sans studio, ni dans la fenetre d'etat)
+                if c.presence_only {
+                    c.presence_gen = sh.presence.generation();
+                    c.presence_used = true;
+                    c.arm_gen = sh.arming.generation(); // (relecture) l'armement ne la regarde pas : rien ne lui en est dit
+                    let mut hello = json!({
+                        "type": "hello", "version": PROTOCOL_VERSION, "companion": env!("CARGO_PKG_VERSION"),
+                        "role": "presence", "presence": sh.presence.snapshot().json(),
+                    });
+                    if let (Some((ns, _)), Some(k)) = (&studio, key) {
+                        hello["v"] = json!(AUTH_VERSION);
+                        hello["proof"] = json!(security::hex(&security::companion_proof_for_studio(&k, sh.port, ns, &nonce_c)));
+                    }
+                    if c.send_text(hello.to_string()).is_err() {
+                        return;
+                    }
+                    if v2 {
+                        note_v2(&sh, &current);
+                    }
+                    crate::log(&format!("Music connected from {origin} (Discord presence only)"));
+                    break;
+                }
+                let (run, _) = c.windows();
                 // (9 nov., audit F1) ce studio compte (les minutes sans studio s'arretent), puis l'etat de l'armement tel
                 // qu'il le lit ; tout changement ensuite lui est dit (« armed », poll_arming)
                 sh.arming.session_opened();
@@ -1107,7 +1260,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     "type": "hello", "version": PROTOCOL_VERSION, "companion": env!("CARGO_PKG_VERSION"),
                     "capture": if sh.demo { "demo" } else { sh.capture.as_deref().unwrap_or("wgc") },
                     "input": true, "modes": ["direct", "focus"], "tiles": true,
-                    "live": live_on, "liveChannel": sh.demo || live::available(), "demo": sh.demo,
+                    "liveChannel": sh.demo || live::available(), "demo": sh.demo,
                     // (24 oct.) le retour audio sans cable : la capture d'un processus marche-t-elle sur ce Windows ?
                     // (28 oct.) ou le son du plugin Uppwind Link Return, qui ne demande pas Windows (un Mac, par exemple)
                     "audio": sh.demo || crate::audio::available().is_ok() || crate::plugin_link::available(), "audioFormats": ["f32", "i16"],
@@ -1119,7 +1272,11 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     // (9 nov., audit F1) la capture, les gestes et le son : seulement armes dans le compagnon (« armed »
                     // suit chaque changement) ; (audit F2) « unpair » fait changer le code du compagnon
                     "arming": true, "armed": armed, "unpair": true,
+                    // (11 nov.) la presence Discord (discord.rs) : permise ici ou non, Discord la ou non
+                    "presence": sh.presence.snapshot().json(),
                 });
+                // « live » ; (10 nov.) sous macOS, « logic » et « titles » aussi ; (11 nov.) « access » (plugins::Running)
+                run.put(&mut hello);
                 // (29 oct., v2) la preuve du compagnon : le studio la verifie avant de rien envoyer d'autre
                 if let (Some((ns, _)), Some(k)) = (&studio, key) {
                     hello["v"] = json!(AUTH_VERSION);
@@ -1168,7 +1325,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                         continue; // trop de messages : ignores
                     }
                     match protocol::parse(t.as_str()) {
-                        Ok(ClientMsg::Input(raw)) if raw.kind == "pointer" && raw.action.as_deref() == Some("move") => {
+                        Ok(ClientMsg::Input(raw)) if !c.presence_only && raw.kind == "pointer" && raw.action.as_deref() == Some("move") => {
                             let merged = pending_move.as_ref().map(|p| p.2 + 1).unwrap_or(0);
                             pending_move = Some((raw, recv, merged));
                         }
@@ -1207,7 +1364,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 break;
             }
         }
-        if c.poll_arming().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
+        if c.poll_arming().is_err() || c.poll_presence().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
             break;
         }
         c.report_activity();
@@ -1219,17 +1376,39 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         std::thread::sleep(Duration::from_millis(if busy { 1 } else { 10 }));
     }
     c.log_inputs(true);
+    // (11 nov.) la page de Music est partie (fermee, rechargee) : ce qu'elle avait pose sur Discord s'efface
+    sh.presence.clear(c.presence_owner);
     let _ = c.stop_watch(None);
     if let Some(f) = c.audio.take() {
         crate::log(&format!("audio return stopped with the connection ({}, {} packets sent)", f.label, f.sent));
     }
     c.report_activity(); // (9 nov., F4) plus de son pour cette connexion
+    if c.presence_only {
+        crate::log(&format!("Music {origin} disconnected"));
+        return;
+    }
     crate::log(&format!("studio {origin} disconnected"));
     crate::tray::status::closed(&origin); // (24 oct.) la fenetre d'etat
     sh.arming.session_closed(); // (9 nov., audit F1) les minutes sans studio comptent a partir d'ici
 }
 
 /// De vraies connexions sur 127.0.0.1 (un port au hasard), le compagnon en mode demo : ce que le studio vivra.
+/// (11 nov.) macOS : la fenetre `id` est-elle une fenetre de Logic Pro → son pid et son cadre.
+#[cfg(target_os = "macos")]
+fn logic_window(id: u64) -> Option<(i32, [f64; 4])> {
+    let w = crate::macos::window(id)?;
+    let b = w.bounds;
+    crate::plugins::is_logic_app(&w.owner).then_some((w.pid, [b.origin.x, b.origin.y, b.size.width, b.size.height]))
+}
+
+/// (11 nov.) macOS : l'affichage de la fenetre de Logic Pro `id` (None : pas une fenetre de Logic, ou pas
+/// d'Accessibilite).
+#[cfg(target_os = "macos")]
+fn logic_view(id: u64) -> Option<crate::macos::LogicView> {
+    let (pid, frame) = logic_window(id)?;
+    crate::macos::ax_logic_view(pid, frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,6 +1455,7 @@ mod tests {
             state,
             arming: crate::arming::Arming::new(armed, !demo),
             revoked: AtomicU64::new(0),
+            presence: crate::discord::Presence::new(false),
         });
         let s = sh.clone();
         std::thread::spawn(move || serve(l, s, max));
@@ -1466,14 +1646,38 @@ mod tests {
     }
 
     #[test]
+    fn view_needs_a_shown_logic_window() {
+        // (11 nov.) « view » : seulement la fenetre montree, et seulement une fenetre de Logic Pro (la demo n'en est pas)
+        let port = server();
+        let (mut ws, _h) = pair_v2(port);
+        ws.send(Message::text(r#"{"type":"view","view":"controls"}"#.to_string())).unwrap();
+        let v = text_of(&mut ws, "view");
+        assert_eq!((v["ok"].as_bool(), v["error"].as_str()), (Some(false), Some("no plugin window is shown")), "{v}");
+        ws.send(Message::text(json!({"type": "watch", "id": DEMO_ID}).to_string())).unwrap();
+        let w = text_of(&mut ws, "watching");
+        assert!(w.get("logicView").is_none() && w.get("opaque").is_none(), "the demo is not a Logic Pro window: {w}");
+        ws.send(Message::text(r#"{"type":"view","view":"sideways"}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "view")["error"], "view is controls or editor");
+        ws.send(Message::text(r#"{"type":"view","view":"editor"}"#.to_string())).unwrap();
+        let v = text_of(&mut ws, "view");
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap_or("").contains("Logic Pro"), "{v}");
+    }
+
+    #[test]
     fn paired_studio_lists_watches_and_gets_frames() {
         let port = server();
         let (mut ws, h) = pair_v2(port);
         assert_eq!(h["type"], "hello");
         assert_eq!(h["input"], true);
+        // (10 nov.) la demo est un Live : ni « logic » ni « titles » (plugins::Running)
+        assert_eq!(h["live"], true);
+        assert!(h.get("logic").is_none() && h.get("titles").is_none() && h.get("access").is_none());
         ws.send(Message::text(r#"{"type":"list"}"#.to_string())).unwrap();
         let l = text(&mut ws);
         assert_eq!(l["windows"][0]["title"], "Demo Synth/1-Demo");
+        assert_eq!(l["live"], true);
+        assert!(l.get("logic").is_none() && l.get("titles").is_none() && l.get("access").is_none());
         // Follow track : « open » dit si la fenetre l'etait deja (la demo l'est toujours) ; un mauvais chemin : refuse
         ws.send(Message::text(r#"{"type":"open","path":"0.0"}"#.to_string())).unwrap();
         let o = text_of(&mut ws, "opened");
@@ -1934,5 +2138,74 @@ mod tests {
         assert_ne!(sh.token(), new);
         assert_eq!(crate::state_file::read(&state).unwrap()["token"].as_str(), Some(sh.token().as_str()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (11 nov., discord.rs) La page Music (hello role presence) : rien d'autre que la presence et ping ; elle ne garde
+    /// pas l'armement vivant ; ce qu'elle pose part chez Discord seulement si c'est permis ici, et s'efface quand elle part.
+    #[test]
+    fn a_presence_only_connection_sets_the_discord_presence_and_nothing_else() {
+        let (presence, seen) = crate::discord::fake::presence(false);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let sh = Arc::new(Shared {
+            port,
+            token: std::sync::RwLock::new(TOKEN.into()),
+            allow: Allowlist::new(true, &[]),
+            guard: Mutex::new(PairingGuard::new(5, Duration::from_secs(30))),
+            capture: None,
+            demo: false,
+            test_window: None,
+            pairing_v2: std::sync::atomic::AtomicBool::new(false),
+            state: None,
+            arming: crate::arming::Arming::new(true, true),
+            revoked: AtomicU64::new(0),
+            presence,
+        });
+        let s = sh.clone();
+        std::thread::spawn(move || serve(l, s, 4));
+
+        let (mut ws, nc) = opened(port);
+        let ns = security::new_nonce();
+        let proof = security::studio_proof(&key(), port, &nc, &ns);
+        ws.send(Message::text(json!({"type": "hello", "version": 1, "v": 2, "role": "presence", "nonce": security::hex(&ns), "proof": security::hex(&proof)}).to_string())).unwrap();
+        let h = text(&mut ws);
+        assert_eq!((h["type"].as_str(), h["role"].as_str()), (Some("hello"), Some("presence")), "{h}");
+        assert_eq!(hex32_of(&h["proof"]), security::companion_proof_for_studio(&key(), port, &ns, &nc), "the companion still proves it knows the token");
+        assert!(h["armed"].is_null() && h["windows"].is_null() && h["live"].is_null(), "a reduced hello: {h}");
+        assert_eq!(h["presence"]["allowed"], false);
+        assert!(sh.arming.idle_left().is_some(), "Music does not count as a studio: remote control still turns itself off");
+
+        for m in [r#"{"type":"list"}"#, r#"{"type":"watch","id":1}"#, r#"{"type":"audio","action":"start"}"#, r#"{"type":"unpair"}"#,
+                  r#"{"type":"input","kind":"pointer","action":"move","x":1,"y":1,"iw":10,"ih":10,"n":1}"#] {
+            ws.send(Message::text(m.to_string())).unwrap();
+            let e = text_of(&mut ws, "error");
+            assert_eq!(e["code"], "presence-only", "{m} → {e}");
+        }
+        assert_eq!(sh.revoked.load(Ordering::SeqCst), 0, "unpair was refused");
+
+        let set = json!({"type": "presence", "action": "set", "track": {"title": "Flashback", "artist": "Uppermost", "duration": 200, "position": 3,
+            "cover": "https://uppwind.lucasmoreau.fr/covers/a.jpg", "url": "https://evil.example/"}}).to_string();
+        ws.send(Message::text(set.clone())).unwrap();
+        let r = text_of(&mut ws, "presence");
+        assert_eq!((r["code"].as_str(), r["allowed"].as_bool()), (Some("disabled"), Some(false)), "{r}");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(seen.lock().unwrap().handshakes.is_empty(), "nothing reached Discord before it was allowed here");
+
+        // la personne le permet ici : la page l'apprend (« presence »), puis ce qu'elle envoie part
+        sh.set_presence(true, "test").unwrap();
+        let r = text_of(&mut ws, "presence");
+        assert_eq!(r["allowed"], true, "{r}");
+        ws.send(Message::text(set)).unwrap();
+        crate::discord::fake::until("shown", || sh.presence.snapshot().shown);
+        {
+            let s = seen.lock().unwrap();
+            let a = s.activities[0].as_ref().unwrap();
+            assert_eq!((a["type"].as_u64(), a["details"].as_str(), a["state"].as_str()), (Some(2), Some("Flashback"), Some("Uppermost")));
+            assert!(a["details_url"].is_null(), "a link to another site is dropped");
+        }
+        // la page part (onglet ferme) : la presence s'efface
+        drop(ws);
+        crate::discord::fake::until("cleared when Music left", || !sh.presence.snapshot().shown);
+        assert_eq!(seen.lock().unwrap().activities.last().unwrap(), &None);
     }
 }

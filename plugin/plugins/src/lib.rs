@@ -31,3 +31,9 @@ pub const EMAIL: &str = "";
 
 nice_export_clap!(LinkReturn, LinkNotes);
 nice_export_vst3!(LinkReturn, LinkNotes);
+
+// (9 nov., en essai) Logic Pro : les Audio Units (AUv2), avec l'option « auv2 » (macOS). clap-wrapper enveloppe l'export
+// CLAP ci-dessus : GetPluginFactoryAUV2_0 est Return, GetPluginFactoryAUV2_1 est Notes (l'ordre de nice_export_clap!).
+// Le type de chaque AU (effet, instrument, effet MIDI) vient du Info.plist du .component (uwl-bundle --auv2).
+#[cfg(all(target_os = "macos", feature = "auv2"))]
+clap_wrapper::export_auv2!();

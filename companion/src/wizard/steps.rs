@@ -86,22 +86,53 @@ pub struct PluginItem {
     pub selectable: bool,
     /// un DAW tient encore une ancienne copie
     pub held: bool,
+    /// (10 nov.) macOS : leurs Audio Units (Logic Pro), posees par la meme case ; None ailleurs, ou quand cet exe ne
+    /// les porte pas
+    pub au: Option<AuItem>,
+}
+
+/// (10 nov.) Les Audio Units des plugins (macOS, Logic Pro) : ou elles en sont, a cote du VST3 (la meme case).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AuItem {
+    /// missing, up-to-date, outdated, different, newer
+    pub status: String,
+    /// install, update, none, skip
+    pub action: String,
+    pub reason: String,
+    /// le dossier du bundle (…/Components/Uppwind Link.component)
+    pub folder: String,
 }
 
 impl PluginItem {
-    pub fn from_report(p: &crate::plugin_install::Report) -> PluginItem {
+    /// Le VST3, et sous macOS les Audio Units (`au`, setup::Report::component) : la case se coche des que l'un des deux
+    /// peut etre pose.
+    pub fn from_reports(p: &crate::plugin_install::Report, au: Option<&crate::plugin_install::Report>) -> PluginItem {
         let action = json_name(&p.action);
+        let au = au.filter(|a| a.supported && a.embedded).map(|a| AuItem {
+            status: json_name(&a.status),
+            action: json_name(&a.action),
+            reason: a.reason.clone(),
+            folder: a.folder.display().to_string(),
+        });
+        let au_selectable = au.as_ref().is_some_and(|a| a.action != "skip");
         PluginItem {
             available: p.supported && p.embedded,
             not_in_build: p.supported && !p.embedded,
             status: json_name(&p.status),
-            selectable: p.supported && p.embedded && action != "skip",
+            selectable: (p.supported && p.embedded && action != "skip") || au_selectable,
             action,
             reason: p.reason.clone(),
             folder: p.folder.display().to_string(),
             admin: p.admin,
             held: !p.held.is_empty(),
+            au,
         }
+    }
+
+    /// Quelque chose a poser ou a mettre a jour (le VST3, ou les Audio Units) : la console le demande.
+    pub fn changes(&self) -> bool {
+        let ch = |a: &str| matches!(a, "install" | "update");
+        self.selectable && (ch(&self.action) || self.au.as_ref().is_some_and(|a| ch(&a.action)))
     }
 }
 
@@ -123,7 +154,7 @@ pub struct Model {
     pub install_dir: String,
     pub daws: Vec<DawItem>,
     pub ports: Ports,
-    /// (29 oct.) les plugins Uppwind Link (VST3)
+    /// (29 oct.) les plugins Uppwind Link (VST3) ; (10 nov.) sous macOS, leurs Audio Units aussi (`au`)
     pub plugins: PluginItem,
 }
 
@@ -207,7 +238,7 @@ impl Model {
             install_dir,
             daws,
             ports: Ports { link, back, near, loopmidi_installed: r.midi.loopmidi.is_some(), loopmidi_running: r.midi.loopmidi_running },
-            plugins: PluginItem::from_report(&r.plugins),
+            plugins: PluginItem::from_reports(&r.plugins, r.component.as_ref()),
         }
     }
 
@@ -237,6 +268,15 @@ impl Choices {
             daws.push(PLUGINS.into());
         }
         Choices { daws, fl_settings: true, autostart: true, open_studio: true }
+    }
+
+    /// (10 nov.) L'installation dans la console (`--wizard` sans fenetre, et `--wizard --quiet`) : les choix par defaut,
+    /// sans ouvrir le studio. Sous macOS, ni les reglages MIDI de FL (FL Studio for Mac les prend a la main : la liste de
+    /// la fin le dit) ni le demarrage a l'ouverture de session (cette copie-la n'a pas de Terminal ou taper `arm`) ; la
+    /// question le propose quand meme.
+    pub fn for_console(m: &Model) -> Choices {
+        let mac = cfg!(target_os = "macos");
+        Choices { fl_settings: !mac, autostart: !mac, open_studio: false, ..Choices::defaults(m) }
     }
 
     /// Les choix que la page envoie : seulement des DAW connus et cochables (et les plugins s'ils le sont), sans doublon.
@@ -545,7 +585,54 @@ pub(crate) mod tests {
             admin: true,
             selectable: action != "skip",
             held: false,
+            au: None,
         }
+    }
+
+    fn report(what: &'static str, status: crate::plugin_install::Status, action: crate::plugin_install::Action, folder: &str) -> crate::plugin_install::Report {
+        crate::plugin_install::Report {
+            what,
+            supported: true,
+            embedded: true,
+            folder: folder.into(),
+            status,
+            files: vec![],
+            installed_by: None,
+            held: vec![],
+            action,
+            reason: String::new(),
+            admin: false,
+            simulated: false,
+            after: None,
+        }
+    }
+
+    #[test]
+    fn one_box_for_the_vst3_and_the_audio_units_each_says_where_it_stands() {
+        use crate::plugin_install::{Action as A, Status as S, COMPONENT_WHAT, PLUGINS_WHAT};
+        let vst3 = report(PLUGINS_WHAT, S::UpToDate, A::None, "/Users/x/Library/Audio/Plug-Ins/VST3/Uppwind Link.vst3");
+        let au = report(COMPONENT_WHAT, S::Missing, A::Install, "/Users/x/Library/Audio/Plug-Ins/Components/Uppwind Link.component");
+        // (10 nov.) le VST3 a jour, les Audio Units a poser : la case reste cochable, et la console le demande
+        let p = PluginItem::from_reports(&vst3, Some(&au));
+        assert!(p.selectable && p.changes());
+        assert_eq!((p.action.as_str(), p.au.as_ref().map(|a| a.action.as_str())), ("none", Some("install")));
+        assert!(p.au.as_ref().is_some_and(|a| a.status == "missing" && a.folder.ends_with("Components/Uppwind Link.component")));
+        assert!(Choices::defaults(&Model { plugins: p, ..model(vec![], true) }).wants_plugins(), "ticked by default");
+        // sans Audio Units (Windows, ou un exe sans elles) : comme avant
+        let p = PluginItem::from_reports(&vst3, None);
+        assert!(p.au.is_none() && p.selectable && !p.changes());
+        let mut dev = au.clone();
+        dev.embedded = false;
+        assert!(PluginItem::from_reports(&vst3, Some(&dev)).au.is_none());
+        // un VST3 d'un compagnon plus recent (laisse tel quel) : les Audio Units peuvent encore se poser
+        let mut newer = report(PLUGINS_WHAT, S::Newer, A::Skip, "/Users/x/Library/Audio/Plug-Ins/VST3/Uppwind Link.vst3");
+        newer.reason = "installed by a newer companion (9.9.9)".into();
+        let p = PluginItem::from_reports(&newer, Some(&au));
+        assert!(p.selectable && p.changes());
+        assert!(!PluginItem::from_reports(&newer, None).selectable);
+        // tout a jour : rien a demander
+        let done = report(COMPONENT_WHAT, S::UpToDate, A::None, "/Users/x/Library/Audio/Plug-Ins/Components/Uppwind Link.component");
+        assert!(!PluginItem::from_reports(&vst3, Some(&done)).changes());
     }
 
     #[test]

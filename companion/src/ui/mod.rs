@@ -313,7 +313,15 @@ mod win {
                 .with_inner_size(LogicalSize::new(w, h))
                 .with_min_inner_size(LogicalSize::new(520.0, 420.0))
                 .with_theme(Some(Theme::Dark))
+                // (11 nov.) la fenetre d'etat dessine sa barre de titre (Reduire, Agrandir, Fermer, la zone pour la
+                // deplacer) : sans le cadre de Windows, avec son ombre
+                .with_decorations(view.decorated())
                 .with_visible(false);
+            #[cfg(windows)]
+            if !view.decorated() {
+                use tao::platform::windows::WindowBuilderExtWindows;
+                wb = wb.with_undecorated_shadow(true);
+            }
             // l'icone des ressources de l'exe (Windows) ; macOS : celle du Dock, rien a donner a la fenetre
             #[cfg(windows)]
             if let Ok(icon) = Icon::from_resource(1, None) {
@@ -390,6 +398,7 @@ mod win {
                     }
                 }
                 Out::Close => close = true,
+                Out::Window(a) => window_action(&win.window, a, win),
                 Out::Exit(c) => {
                     *exit_code = c;
                     close = true;
@@ -407,6 +416,38 @@ mod win {
             }
         }
         close
+    }
+
+    /// (11 nov.) Les boutons de la barre de titre de la page. Fermer n'en est pas : c'est la commande « close » (la
+    /// fenetre se ferme, l'icone reste).
+    fn window_action(w: &Window, a: ipc::WinAction, ui: &UiWindow) {
+        use ipc::{Edge, WinAction};
+        use tao::window::ResizeDirection as D;
+        match a {
+            WinAction::Minimize => w.set_minimized(true),
+            WinAction::Maximize => {
+                let max = !w.is_maximized();
+                w.set_maximized(max);
+                ui.send(&serde_json::json!({ "type": "win", "maximized": max }));
+            }
+            WinAction::Drag => {
+                let _ = w.drag_window();
+            }
+            WinAction::Resize(e) => {
+                if !w.is_maximized() {
+                    let _ = w.drag_resize_window(match e {
+                        Edge::N => D::North,
+                        Edge::S => D::South,
+                        Edge::E => D::East,
+                        Edge::W => D::West,
+                        Edge::NE => D::NorthEast,
+                        Edge::NW => D::NorthWest,
+                        Edge::SE => D::SouthEast,
+                        Edge::SW => D::SouthWest,
+                    });
+                }
+            }
+        }
     }
 
     /// Une fenetre seule (l'installation, la desinstallation), jusqu'a sa fermeture → le code de sortie. `smoke` :

@@ -3,7 +3,7 @@
 //! Ce que chaque fenetre fait des gestes de sa page, sans fenetre : une demande (ipc.rs) → des effets (`Out`), et les
 //! travaux longs (`Job`, dans un fil) qui reviennent en `Done`. Les essais appellent ces fonctions directement.
 
-use super::ipc::{Link, Request};
+use super::ipc::{Link, Request, WinAction};
 use crate::tray::status::StatusModel;
 use crate::wizard::flow::{Removal, UninstallPlan};
 use crate::wizard::steps::{Choices, Effect, Event, Model, Outcome, Step, Wizard};
@@ -24,6 +24,8 @@ pub enum Out {
     Exit(i32),
     /// un travail dans un fil
     Run(Job),
+    /// (11 nov.) la barre de titre de la page : reduire, agrandir, deplacer, tirer un bord
+    Window(WinAction),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +44,14 @@ pub enum Job {
     Arm(bool),
     /// (9 nov., audit F2) un nouveau code d'appairage
     NewCode,
+    /// (11 nov.) permettre ou retirer la presence Discord
+    Discord(bool),
+    /// (11 nov., update.rs) lire la derniere version publiee
+    CheckUpdate,
+    /// telecharger, verifier et installer la version trouvee ; `show` : la fenetre de la nouvelle version s'ouvre
+    Update { show: bool },
+    /// la case « Update automatically »
+    AutoUpdate(bool),
 }
 
 #[derive(Debug)]
@@ -58,6 +68,13 @@ pub enum Done {
     Armed(Result<bool, String>),
     /// (9 nov.) le nouveau code (Err : il sert, mais n'a pas pu etre garde dans le fichier d'etat)
     NewCode(Result<(), String>),
+    /// (11 nov.) la presence Discord maintenant (Err : le choix vaut, mais n'a pas pu etre garde)
+    Discord(Result<bool, String>),
+    /// (11 nov.) ce que la verification a trouve ; `auto` : la case automatique l'a demandee (pas un clic)
+    UpdateChecked { auto: bool, result: Result<crate::update::Check, String> },
+    /// la nouvelle version est verifiee et lancee (elle remplace celle-ci) : la ligne pour la page
+    Updating(Result<String, String>),
+    AutoUpdate(Result<bool, String>),
 }
 
 /// Une fenetre, vue de sa page.
@@ -70,6 +87,10 @@ pub trait View {
     fn on_done(&mut self, d: Done) -> Vec<Out>;
     fn on_progress(&mut self, line: String) -> Vec<Out> {
         vec![Out::Send(json!({ "type": "progress", "line": line }))]
+    }
+    /// (11 nov.) false : la fenetre sans le cadre de Windows (la page dessine sa barre de titre et ses boutons)
+    fn decorated(&self) -> bool {
+        true
     }
 }
 
@@ -227,7 +248,10 @@ impl View for StatusPage {
         "Uppwind Link"
     }
     fn size(&self) -> (f64, f64) {
-        (680.0, 620.0)
+        (680.0, 640.0)
+    }
+    fn decorated(&self) -> bool {
+        false
     }
     fn on_request(&mut self, r: Request) -> Vec<Out> {
         match r {
@@ -247,8 +271,18 @@ impl View for StatusPage {
             Request::Autostart(on) => vec![Out::Run(Job::Autostart(on))],
             Request::SetupAgain => vec![Out::Run(Job::SetupAgain)],
             Request::Close => vec![Out::Close],
+            Request::Window(a) => vec![Out::Window(a)],
+            // (11 nov.) lire la derniere version : sans serveur aussi (l'essai de la fenetre)
+            Request::CheckUpdate => vec![Out::Run(Job::CheckUpdate)],
             // (9 nov., audit F1/F2) seulement sur un compagnon qui tourne (l'essai de la fenetre n'a pas de serveur)
-            Request::Arm(_) | Request::NewCode if !self.model.as_ref().is_some_and(|m| m.port > 0) => vec![error("Uppwind Link is not running.")],
+            Request::Arm(_) | Request::NewCode | Request::Discord(_) | Request::Update | Request::AutoUpdate(_) if !self.model.as_ref().is_some_and(|m| m.port > 0) => {
+                vec![error("Uppwind Link is not running.")]
+            }
+            // (11 nov.) seulement une version plus recente deja lue par « Check for updates »
+            Request::Update if !self.model.as_ref().is_some_and(|m| m.update.newer) => vec![error("Check for updates first.")],
+            Request::Update => vec![Out::Send(json!({ "type": "update", "text": "Downloading the new version…", "busy": true })), Out::Run(Job::Update { show: true })],
+            Request::AutoUpdate(on) => vec![Out::Run(Job::AutoUpdate(on))],
+            Request::Discord(on) => vec![Out::Run(Job::Discord(on))],
             Request::Arm(on) => vec![Out::Run(Job::Arm(on))],
             Request::NewCode => vec![Out::Run(Job::NewCode)],
             _ => vec![],
@@ -272,6 +306,14 @@ impl View for StatusPage {
                 out
             }
             Done::Armed(Err(e)) => vec![error(&e)],
+            Done::Discord(r) => {
+                let mut out = match r {
+                    Ok(_) => vec![],
+                    Err(e) => vec![error(&e)],
+                };
+                out.extend(self.refresh());
+                out
+            }
             Done::NewCode(r) => {
                 let mut out = vec![match r {
                     Ok(()) => Out::Send(json!({ "type": "newcode" })),
@@ -289,6 +331,32 @@ impl View for StatusPage {
                 self.refresh()
             }
             Done::Autostart(Err(e)) | Done::Launched(Err(e)) => vec![error(&e)],
+            // (11 nov.) la mise a jour : la ligne tout de suite, puis la fenetre relue (la case, la version lue)
+            Done::UpdateChecked { result, .. } => {
+                let mut out = vec![match result {
+                    Ok(c) if c.newer => Out::Send(json!({ "type": "update", "text": format!("Uppwind Link {} is available.", c.release.version) })),
+                    Ok(c) => Out::Send(json!({ "type": "update", "text": format!("Uppwind Link is up to date (the latest is {}).", c.release.version) })),
+                    Err(e) => error(&format!("Could not check for updates: {e}.")),
+                }];
+                out.extend(self.refresh());
+                out
+            }
+            Done::Updating(r) => {
+                let mut out = vec![match r {
+                    Ok(l) => Out::Send(json!({ "type": "update", "text": l, "busy": true })),
+                    Err(e) => error(&format!("Not updated: {e}.")),
+                }];
+                out.extend(self.refresh());
+                out
+            }
+            Done::AutoUpdate(r) => {
+                let mut out = match r {
+                    Ok(_) => vec![],
+                    Err(e) => vec![error(&e)],
+                };
+                out.extend(self.refresh());
+                out
+            }
             _ => vec![],
         }
     }
@@ -416,6 +484,10 @@ pub fn run_job(job: Job, progress: &dyn Fn(&str)) -> Done {
         })),
         Job::Arm(on) => Done::Armed(crate::tray::arm(on, "the status window")),
         Job::NewCode => Done::NewCode(crate::tray::new_code()),
+        Job::Discord(on) => Done::Discord(crate::tray::set_presence(on)),
+        Job::CheckUpdate => Done::UpdateChecked { auto: false, result: crate::update::check_now() },
+        Job::Update { show } => Done::Updating(crate::tray::start_update(show, false)),
+        Job::AutoUpdate(on) => Done::AutoUpdate(crate::tray::set_auto_update(on)),
     }
 }
 
@@ -486,6 +558,32 @@ mod tests {
         assert!(matches!(s.on_request(Request::Open(Link::VbCable))[0], Out::Open(Link::VbCable)));
         assert!(matches!(s.on_request(Request::Autostart(false))[0], Out::Run(Job::Autostart(false))));
         assert!(matches!(s.on_request(Request::Close)[0], Out::Close));
+    }
+
+    #[test]
+    fn the_status_page_updates_only_a_running_companion_and_only_to_a_newer_version() {
+        let mut s = StatusPage::new();
+        let probe = crate::setup::env::Probe::empty(crate::setup::env::Paths::in_root(std::path::Path::new("Z:\\nowhere")));
+        let r = crate::tray::status::report(&probe);
+        let off = crate::tray::status::model(&r, 0, "", Default::default(), Default::default(), Ok(1.0), true, None);
+        s.on_done(Done::Status(Ok(Box::new(off))));
+        assert!(matches!(s.on_request(Request::CheckUpdate)[0], Out::Run(Job::CheckUpdate)), "checking needs no server");
+        assert!(matches!(s.on_request(Request::Update)[0], Out::Send(ref v) if v["type"] == "error"), "no server: no update");
+        assert!(matches!(s.on_request(Request::AutoUpdate(true))[0], Out::Send(ref v) if v["type"] == "error"));
+        let mut m = crate::tray::status::model(&r, 47410, "abc", Default::default(), Default::default(), Ok(1.0), true, None);
+        s.on_done(Done::Status(Ok(Box::new(m.clone()))));
+        assert!(matches!(s.on_request(Request::Update)[0], Out::Send(ref v) if v["type"] == "error"), "nothing newer found yet");
+        m.update.newer = true;
+        s.on_done(Done::Status(Ok(Box::new(m))));
+        assert!(matches!(s.on_request(Request::Update).last(), Some(Out::Run(Job::Update { show: true }))));
+        assert!(matches!(s.on_request(Request::AutoUpdate(false))[0], Out::Run(Job::AutoUpdate(false))));
+        assert!(matches!(s.on_request(Request::Window(WinAction::Minimize))[0], Out::Window(WinAction::Minimize)));
+        let rel = crate::update::Release { tag: "v9.0.0".into(), version: "9.0.0".into(), exe_size: 1, exe_sha256: None };
+        let out = s.on_done(Done::UpdateChecked { auto: false, result: Ok(crate::update::Check { release: rel, newer: true }) });
+        assert_eq!(sends(&out)[0]["text"], "Uppwind Link 9.0.0 is available.");
+        let out = s.on_done(Done::Updating(Err("bad sum".into())));
+        assert_eq!(sends(&out)[0]["type"], "error");
+        assert!(!StatusPage::new().decorated() && WizardPage::new(Wizard::new(model(vec![], true))).decorated(), "only the status window draws its own title bar");
     }
 
     #[test]
