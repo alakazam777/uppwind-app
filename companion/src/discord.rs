@@ -143,12 +143,12 @@ impl Track {
         })
     }
 
-    /// Le nom affiche a la place de celui de l'application (11 nov. : la note de musique, l'artiste et le titre, au lieu
-    /// de « Uppwind ») : « 🎵 Uppermost - Eternal Love », ou « 🎵 Eternal Love » sans artiste.
+    /// Le nom affiche a la place de celui de l'application (11 nov. : l'artiste et le titre, au lieu de « Uppwind ») :
+    /// « Uppermost - Eternal Love », ou « Eternal Love » sans artiste. (12 nov.) Sans la note de musique devant.
     pub fn display_name(&self) -> String {
         match &self.artist {
-            Some(a) => clean(&format!("\u{1F3B5} {a} - {}", self.title)),
-            None => clean(&format!("\u{1F3B5} {}", self.title)),
+            Some(a) => clean(&format!("{a} - {}", self.title)),
+            None => clean(&self.title),
         }
     }
 
@@ -855,7 +855,7 @@ mod tests {
         let a = t.activity();
         assert_eq!(a["type"], 2, "Listening");
         assert_eq!(a["details"], "Flashback");
-        assert_eq!(a["name"], "\u{1F3B5} Uppermost - Flashback");
+        assert_eq!(a["name"], "Uppermost - Flashback");
         assert_eq!(a["status_display_type"], 0);
         assert_eq!(a["state"], "Uppermost");
         assert_eq!(a["timestamps"]["start"], 1_700_000_080_000u64);
@@ -867,7 +867,7 @@ mod tests {
         let r = Track::from_raw(&RawTrack { title: "Uppwind Radio".into(), cover: Some("https://evil.example/x.png".into()), url: Some("https://evil.example/".into()), duration: Some(0.0), ..Default::default() }, 5_000).unwrap();
         let a = r.activity();
         assert!(a["timestamps"]["end"].is_null() && a["assets"].is_null() && a["details_url"].is_null() && a["state"].is_null());
-        assert_eq!(a["name"], "\u{1F3B5} Uppwind Radio");
+        assert_eq!(a["name"], "Uppwind Radio");
         // des nombres absurdes : ignores
         let n = Track::from_raw(&RawTrack { title: "Ab".into(), duration: Some(f64::NAN), position: Some(-4.0), ..Default::default() }, 9_000).unwrap();
         assert_eq!((n.start_ms, n.end_ms), (9_000, None));
