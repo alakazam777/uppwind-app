@@ -384,7 +384,8 @@ pub fn follow_returns(hub: Option<&crate::plugin_link::Hub>, feed: &mut Option<F
             None
         }
         Err(e) => {
-            crate::log(&format!("audio return ended: the Return plugin left and the Windows capture did not start ({e})"));
+            // (12 nov. 2026) le meme texte sous Windows et sur un Mac (il disait « the Windows capture » sur les deux)
+            crate::log(&format!("audio return ended: the Return plugin left and the capture of the DAW did not start ({e})"));
             *feed = None;
             Some(json!({ "type": "audio", "state": "off", "error": format!("the Uppwind Link Return plugin left and the capture of the DAW did not start: {e}") }).to_string())
         }

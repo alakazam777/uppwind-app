@@ -57,6 +57,10 @@ pub const COUNTER_LEN: usize = 10;
 pub const MAX_SYSEX: usize = 512;
 /// Au plus tant de paquets lus dans une MIDIPacketList (CoreMIDI en met quelques-uns).
 pub const MAX_PACKETS: usize = 4096;
+/// (12 nov. 2026, relecture de securite de la 0.4.2) Au plus tant d'octets copies d'une MIDIPacketList : MAX_PACKETS
+/// paquets de 65 535 octets feraient 268 Mo par rappel. Ce que Logic envoie a la surface tient en quelques centaines
+/// d'octets (son plus long message : l'ecran entier, 119) ; le paquet qui depasserait, et ceux d'apres, sont laisses.
+pub const MAX_LIST_BYTES: usize = 64 * 1024;
 /// Une pression : le bouton enfonce, puis relache ce temps apres (comme la sonde du 11 nov.).
 pub const PRESS_HOLD: Duration = Duration::from_millis(100);
 /// Au plus tant de pressions par seconde, toutes connexions confondues.
@@ -281,18 +285,28 @@ pub fn next_packet(offset: usize, len: usize, aligned: bool) -> usize {
     }
 }
 
+/// Un paquet de `len` octets tient-il encore dans ce qu'une liste peut copier, `have` octets etant deja pris ?
+pub fn fits_in_list(have: usize, len: usize) -> bool {
+    have.saturating_add(len) <= MAX_LIST_BYTES
+}
+
 /// Les donnees de chaque paquet d'une MIDIPacketList tenue dans `buf` (les essais ; le rappel de CoreMIDI, mcu_port.rs,
-/// suit les memes pas sur sa memoire). Une liste coupee s'arrete la ou elle est coupee.
+/// suit les memes pas sur sa memoire, plafond compris). Une liste coupee s'arrete la ou elle est coupee.
 #[cfg(test)]
 pub fn packet_list(buf: &[u8], aligned: bool) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let Some(n) = buf.get(..4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize) else { return out };
     let mut off = 4;
+    let mut have = 0usize;
     for _ in 0..n.min(MAX_PACKETS) {
         let Some(h) = buf.get(off + 8..off + 10) else { break };
         let len = u16::from_ne_bytes([h[0], h[1]]) as usize;
+        if !fits_in_list(have, len) {
+            break;
+        }
         let Some(d) = buf.get(off + 10..off + 10 + len) else { break };
         out.push(d);
+        have += len;
         off = next_packet(off, len, aligned);
     }
     out
@@ -1101,6 +1115,22 @@ mod tests {
         let mut b = list_of(&packets, true);
         b[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert_eq!(packet_list(&b, true).len(), 3);
+    }
+
+    #[test]
+    fn a_packet_list_copies_at_most_max_list_bytes() {
+        // (12 nov. 2026) des paquets de 40 000 octets : le premier passe, le deuxieme depasserait, il est laisse (et ceux
+        // d'apres) ; avant, toute la liste etait copiee (jusqu'a 268 Mo par rappel)
+        let big = vec![0x41u8; 40_000];
+        let packets: [&[u8]; 3] = [&big, &big, &[0x90, 0x5E, 0x7F]];
+        for aligned in [true, false] {
+            let b = list_of(&packets, aligned);
+            let got = packet_list(&b, aligned);
+            assert_eq!(got.len(), 1, "aligned {aligned}");
+            assert!(got.iter().map(|p| p.len()).sum::<usize>() <= MAX_LIST_BYTES);
+        }
+        assert!(fits_in_list(0, MAX_LIST_BYTES) && !fits_in_list(1, MAX_LIST_BYTES) && !fits_in_list(usize::MAX, 1));
+        assert!(fits_in_list(MAX_LIST_BYTES - 119, 119), "Logic's longest message still fits at the very end");
     }
 
     #[test]

@@ -65,6 +65,10 @@ extern "C" fn read(list: *const c_void, _refcon: *mut c_void, _src: *mut c_void)
         for _ in 0..n.min(mcu::MAX_PACKETS) {
             let p = base.add(off);
             let len = std::ptr::read_unaligned(p.add(8) as *const u16) as usize;
+            // (12 nov. 2026, relecture de securite de la 0.4.2) jamais plus de mcu::MAX_LIST_BYTES par liste
+            if !mcu::fits_in_list(bytes.len(), len) {
+                break;
+            }
             bytes.extend_from_slice(std::slice::from_raw_parts(p.add(10), len));
             off = mcu::next_packet(off, len, aligned);
         }
