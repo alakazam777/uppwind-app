@@ -298,6 +298,31 @@ pub fn pairing_code(state: &Path) -> Option<String> {
     crate::pairing_code_of(&std::fs::read_to_string(state).ok()?)
 }
 
+/// Le temps laisse a un compagnon lance pour ecouter (son fichier d'etat).
+const START_WAIT: Duration = Duration::from_secs(8);
+/// (12 nov., relecture) la copie d'avant, relancee apres une mise a jour ratee : un peu plus (une machine chargee, un
+/// antivirus qui la relit), pour ne pas annoncer a tort qu'elle ne demarre pas
+const RESTART_WAIT: Duration = Duration::from_secs(15);
+
+/// Le fichier d'etat, des que le compagnon `pid` l'a ecrit (il l'ecrit des qu'il ecoute) ; None : pas dans le temps
+/// `within` (il ne demarre pas, ou il s'est arrete).
+pub fn wait_listening(state_file: &Path, pid: u32, within: Duration) -> Option<serde_json::Value> {
+    let t0 = Instant::now();
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(state_file) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if v["pid"].as_u64() == Some(pid as u64) {
+                    return Some(v);
+                }
+            }
+        }
+        if t0.elapsed() >= within {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Les effets reels de flow.rs : la progression (vers la fenetre), le compagnon qui tourne ferme proprement, le
 /// nouveau lance, le nettoyage apres coup.
 pub struct RealHooks<F: Fn(&str)> {
@@ -322,19 +347,10 @@ impl<F: Fn(&str)> flow::Hooks for RealHooks<F> {
     }
     fn start(&self, exe: &Path, args: &[String]) -> Result<Option<u16>, String> {
         let pid = spawn_detached(exe, args)?;
-        // il ecrit son fichier d'etat des qu'il ecoute
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(8) {
-            if let Ok(raw) = std::fs::read_to_string(&self.state_file) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if v["pid"].as_u64() == Some(pid as u64) {
-                        return Ok(v["port"].as_u64().map(|p| p as u16));
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        match wait_listening(&self.state_file, pid, START_WAIT) {
+            Some(v) => Ok(v["port"].as_u64().map(|p| p as u16)),
+            None => Err("Uppwind Link was installed but did not start: open it from the Start menu.".into()),
         }
-        Err("Uppwind Link was installed but did not start: open it from the Start menu.".into())
     }
     fn cleanup_later(&self, files: &[PathBuf], dirs: &[PathBuf], trees: &[PathBuf]) {
         cleanup_after_exit(files, dirs, trees);
@@ -465,6 +481,8 @@ fn self_update(show: bool) -> i32 {
     let had_previous = dst.is_file() && !firstrun::same_file(&exe, &dst);
     let have_backup = had_previous && std::fs::create_dir_all(&updates).is_ok() && std::fs::copy(&dst, &backup).is_ok();
     let reg = arp::ArpRegistry;
+    // (12 nov.) l'entree « Applications installees » d'avant : elle revient avec la copie d'avant
+    let arp_before = arp::snapshot(&reg, &p.arp_key);
     let env = p.env(&reg);
     let hooks = RealHooks { progress: |l: &str| println!("... {l}"), state_file: p.state_file.clone() };
     let o = flow::install(&env, &exe, &c, &hooks);
@@ -483,10 +501,22 @@ fn self_update(show: bool) -> i32 {
             Restore::Lost => errors.push("The previous Uppwind Link could not be put back: install it again from the release page.".into()),
             plan => {
                 let back = if plan == Restore::PutBackThenStart { install::replace_exe(&backup, &dst).map(|_| ()) } else { Ok(()) };
+                // (12 nov.) la copie d'avant est de nouveau celle installee : son entree aussi (essai du 12 nov. : sinon
+                // l'entree annonce la version qui n'a pas pris la place, et un double-clic sur celle-ci ouvrait l'ancienne
+                // au lieu de l'installer)
+                if back.is_ok() {
+                    match arp::restore(&reg, &p.arp_key, &arp_before) {
+                        Ok(l) => done.extend(l),
+                        Err(e) => errors.push(e),
+                    }
+                }
                 let mut args = vec!["--background".to_string()];
                 args.extend(p.extra_args.iter().cloned());
+                let previous = from.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
+                // (12 nov.) relancee, et vraiment repartie (son fichier d'etat) : sinon on le dit, au lieu de « relancee »
                 match back.and_then(|_| spawn_detached(&dst, &args)) {
-                    Ok(_) => done.push(format!("Started the previous Uppwind Link{} again.", from.as_deref().map(|v| format!(" ({v})")).unwrap_or_default())),
+                    Ok(pid) if wait_listening(&p.state_file, pid, RESTART_WAIT).is_some() => done.push(format!("Started the previous Uppwind Link{previous} again.")),
+                    Ok(_) => errors.push(format!("The previous Uppwind Link{previous} is back in place but did not start: open it from the Start menu.")),
                     Err(e) => errors.push(format!("The previous Uppwind Link could not be started again ({e}).")),
                 }
             }
@@ -505,9 +535,16 @@ fn self_update(show: bool) -> i32 {
         }
     }
     // l'exe telecharge (dans updates\) n'est plus utile : efface apres la sortie, s'il n'est pas la copie installee
+    let mut gone: Vec<PathBuf> = Vec::new();
     if !firstrun::same_file(&exe, &p.dirs.exe()) && exe.starts_with(&updates) {
-        cleanup_after_exit(std::slice::from_ref(&exe), &[], &[]);
+        gone.push(exe.clone());
     }
+    // (12 nov.) et la copie d'avant, mise de cote parce qu'elle tournait encore pendant l'echange : elle est arretee
+    // (essai du 12 nov. : 6,6 Mo restaient jusqu'a la mise a jour suivante)
+    if new_running {
+        gone.extend(install::asides(&p.dirs.app_dir()));
+    }
+    cleanup_after_exit(&gone, &[], &[]);
     if o.ok {
         0
     } else {
@@ -791,5 +828,23 @@ mod self_update_tests {
         assert_eq!(restore_plan(false, true, true, false), Restore::Start);
         assert_eq!(restore_plan(false, true, false, true), Restore::PutBackThenStart, "installed but did not start");
         assert_eq!(restore_plan(false, true, false, false), Restore::Lost);
+    }
+
+    /// (12 nov.) « relancee » seulement si le compagnon ecrit son fichier d'etat avec son pid (il ecoute).
+    #[test]
+    fn wait_listening_reads_the_state_file_of_that_pid_only() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let f = std::env::temp_dir().join(format!("uwc-wait-{}-{t}.json", std::process::id()));
+        let short = Duration::from_millis(250);
+        assert!(wait_listening(&f, 42, short).is_none(), "no state file");
+        std::fs::write(&f, r#"{"pid": 41, "port": 47411}"#).unwrap();
+        let t0 = Instant::now();
+        assert!(wait_listening(&f, 42, short).is_none(), "another companion's file");
+        assert!(t0.elapsed() >= short, "it waited");
+        std::fs::write(&f, r#"{"pid": 42, "port": 47411}"#).unwrap();
+        assert_eq!(wait_listening(&f, 42, short).unwrap()["port"].as_u64(), Some(47411));
+        std::fs::write(&f, "not json").unwrap();
+        assert!(wait_listening(&f, 42, Duration::ZERO).is_none());
+        let _ = std::fs::remove_file(&f);
     }
 }

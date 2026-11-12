@@ -108,6 +108,51 @@ pub fn remove(reg: &dyn Registry, key: &str) -> Result<Vec<String>, String> {
     Ok(vec![format!("Removed from Windows' Installed apps ({key}).")])
 }
 
+/// (12 nov.) Les valeurs de l'entree telles qu'elles sont (nom → donnee, rangees par nom) : `--self-update` les lit
+/// avant d'installer, pour les remettre s'il remet la copie d'avant. Vide : pas d'entree. La donnee passe par
+/// `RegValue` (texte, nombre, octets) : toutes celles qu'Uppwind Link ecrit sont du texte (REG_SZ) ou des nombres
+/// (REG_DWORD) et reviennent telles quelles ; une valeur posee par un autre programme dans un autre type (REG_EXPAND_SZ,
+/// REG_MULTI_SZ…) reviendrait dans le type le plus proche (relecture du 12 nov.).
+pub fn snapshot(reg: &dyn Registry, key: &str) -> Vec<(String, RegValue)> {
+    let mut v: Vec<(String, RegValue)> = reg.value_names(key).into_iter().filter_map(|n| reg.value(key, &n).map(|x| (n, x))).collect();
+    v.sort_by_key(|(n, _)| n.to_ascii_lowercase());
+    v
+}
+
+/// Deux photos de l'entree disent-elles la meme chose ? Les noms sans casse, comme Windows (relecture du 12 nov.).
+fn same_values(a: &[(String, RegValue)], b: &[(String, RegValue)]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|((na, va), (nb, vb))| na.eq_ignore_ascii_case(nb) && va == vb)
+}
+
+/// (12 nov.) Remet l'entree telle que `snapshot` l'a lue : ses valeurs (celles ajoutees depuis s'en vont), ou plus
+/// d'entree s'il n'y en avait pas. Sans changement depuis, rien. Sinon le premier lancement d'une version plus recente
+/// lirait la version qui n'a pas pris la place, et ouvrirait la copie installee au lieu de l'installer (essai du
+/// 12 nov. : une 0.4.1 qui ne demarrait pas, la 0.4.0 remise, l'entree disait 0.4.1). Les valeurs d'avant sont
+/// reecrites d'abord, la version en tete, puis celles ajoutees depuis s'en vont : une ecriture qui echoue en route
+/// laisse au moins la version d'avant. → ce qui a ete fait.
+pub fn restore(reg: &dyn Registry, key: &str, before: &[(String, RegValue)]) -> Result<Vec<String>, String> {
+    if same_values(&snapshot(reg, key), before) {
+        return Ok(vec![]);
+    }
+    if before.is_empty() {
+        return remove(reg, key);
+    }
+    let is_version = |n: &str| n.eq_ignore_ascii_case("DisplayVersion");
+    for (name, v) in before.iter().filter(|(n, _)| is_version(n)).chain(before.iter().filter(|(n, _)| !is_version(n))) {
+        reg.set_value(key, name, v)?;
+    }
+    for name in reg.value_names(key) {
+        if !before.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            reg.delete_value(key, &name)?;
+        }
+    }
+    if !same_values(&snapshot(reg, key), before) {
+        return Err(format!("{key} does not read back as it was before the update"));
+    }
+    let version = before.iter().find(|(n, _)| n.eq_ignore_ascii_case("DisplayVersion")).and_then(|(_, v)| v.as_str().map(str::to_string)).unwrap_or_default();
+    Ok(vec![format!("Windows' Installed apps lists \"{DISPLAY_NAME}\" {version} again ({key}).")])
+}
+
 /// La version et le dossier que l'entree annonce (le premier lancement compare la version).
 pub fn installed(reg: &dyn Registry, key: &str) -> Option<(String, String)> {
     let v = reg.str(key, "DisplayVersion")?;
@@ -328,5 +373,70 @@ mod tests {
         let e = reg.set_value(KEY, "DisplayName", &RegValue::Str("x".into())).unwrap_err();
         assert!(e.starts_with("refused"), "{e}");
         assert!(reg.delete_key(KEY).unwrap_err().starts_with("refused"));
+    }
+
+    /// (12 nov.) Une mise a jour qui remet la copie d'avant remet son entree : la version d'avant, ses valeurs telles
+    /// qu'elles etaient (celles ajoutees depuis s'en vont), ou plus d'entree s'il n'y en avait pas.
+    #[test]
+    fn restore_puts_the_entry_back_as_it_was() {
+        let r = FakeRegistry::default();
+        let k = r"HKCU\Software\UppwindLinkTest\Uninstall\UppwindLink";
+        let mut old = entry();
+        old.version = "0.4.0".into();
+        write(&r, k, &old).unwrap();
+        r.set_value(k, "Comments", &RegValue::Str("written by hand".into())).unwrap();
+        let before = snapshot(&r, k);
+        assert_eq!(before.len(), values(&old).len() + 1);
+        assert!(restore(&r, k, &before).unwrap().is_empty(), "unchanged: nothing to do");
+        // (relecture) le meme nom dans une autre casse est le meme nom, comme sous Windows
+        r.set_value(k, "COMMENTS", &RegValue::Str("written by hand".into())).unwrap();
+        assert!(restore(&r, k, &before).unwrap().is_empty(), "only the case of a name differs");
+        // la mise a jour ecrit la sienne, puis la copie d'avant revient
+        let mut new = entry();
+        new.version = "0.4.1".into();
+        new.size_kb = 9999;
+        write(&r, k, &new).unwrap();
+        r.set_value(k, "Extra", &RegValue::Num(1)).unwrap();
+        assert_eq!(installed(&r, k).unwrap().0, "0.4.1");
+        let did = restore(&r, k, &before).unwrap();
+        assert_eq!(did, vec![format!("Windows' Installed apps lists \"Uppwind Link\" 0.4.0 again ({k}).")]);
+        assert_eq!(installed(&r, k).unwrap().0, "0.4.0");
+        assert_eq!(snapshot(&r, k), before);
+        assert_eq!(r.str(k, "Comments").as_deref(), Some("written by hand"));
+        assert_eq!(r.value(k, "Extra"), None, "a value added since goes");
+        // pas d'entree avant (une reparation) : plus d'entree apres
+        let k2 = r"HKCU\Software\UppwindLinkTest\Uninstall\Other";
+        let none = snapshot(&r, k2);
+        assert!(none.is_empty());
+        write(&r, k2, &new).unwrap();
+        assert!(restore(&r, k2, &none).unwrap()[0].starts_with("Removed"));
+        assert!(!r.key_exists(k2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_on_the_real_registry_under_the_test_key() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let tree = format!(r"{TEST_KEY}\arp-restore-{}-{t}", std::process::id());
+        let k = format!(r"{tree}\UppwindLink");
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::setup::winsys::delete_test_tree(&self.0);
+            }
+        }
+        let _c = Cleanup(tree.clone());
+        let reg = ArpRegistry;
+        let mut old = entry();
+        old.version = "0.4.0".into();
+        write(&reg, &k, &old).unwrap();
+        let before = snapshot(&reg, &k);
+        assert!(!before.is_empty());
+        let mut new = entry();
+        new.version = "0.4.1".into();
+        write(&reg, &k, &new).unwrap();
+        restore(&reg, &k, &before).unwrap();
+        assert_eq!(installed(&reg, &k).unwrap().0, "0.4.0");
+        assert_eq!(snapshot(&reg, &k), before);
     }
 }

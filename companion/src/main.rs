@@ -41,11 +41,16 @@ mod input;
 mod install;
 mod link_relay;
 mod live;
+// (12 nov.) Logic Pro sans script : la surface Mackie Control (le decodage, l'etat, les pressions ; mcu_port.rs : ses ports)
+mod mcu;
 // (26 oct.) macOS : fenetres, capture, gestes, autorisations (CoreGraphics) ; ports MIDI virtuels (CoreMIDI)
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod midi_ports;
+// (12 nov.) macOS : les deux points de la surface Mackie Control (Logic Pro), ouverts seulement permise et armee
+#[cfg(target_os = "macos")]
+mod mcu_port;
 // (29 oct.) les plugins Uppwind Link (VST3) embarques, et leur installation (--install-plugins, --setup, l'assistant)
 mod plugin_install;
 mod plugin_link;
@@ -108,6 +113,8 @@ pub struct Shared {
     pub revoked: AtomicU64,
     /// (11 nov.) ce qu'on ecoute dans Music, sur le profil Discord : seulement si la personne l'a permis ici
     pub presence: discord::Presence,
+    /// (12 nov.) Logic Pro : la surface Mackie Control (mcu.rs) ; ses ports seulement si permise (« mackie on ») et armee
+    pub mcu: mcu::Hub,
 }
 
 impl Shared {
@@ -127,6 +134,20 @@ impl Shared {
         })
         .map(|_| on)
         .map_err(|e| format!("Discord presence is {} now, but {} could not keep it ({e})", if on { "on" } else { "off" }, shown_path(path)))
+    }
+
+    /// (12 nov.) Permettre ou retirer la surface Mackie Control de Logic Pro (la console ; jamais le studio) ; le fichier
+    /// d'etat le garde (« mackieSurface »). Ses ports s'ouvrent seulement une fois arme (mcu_port.rs). Err : le choix
+    /// vaut maintenant, mais n'a pas pu etre garde.
+    pub fn set_mackie(&self, on: bool, by: &str) -> Result<bool, String> {
+        self.mcu.set_allowed(on, by);
+        let Some(path) = &self.state else { return Ok(on) };
+        state_file::update(path, |v| {
+            v[mcu::STATE_KEY] = json!(on);
+            true
+        })
+        .map(|_| on)
+        .map_err(|e| format!("the Logic Pro surface is {} now, but {} could not keep it ({e})", if on { "allowed" } else { "off" }, shown_path(path)))
     }
 
     /// (9 nov., audit F2) Un nouveau code : un jeton neuf, tout de suite le seul accepte ; les studios appaires avec
@@ -446,11 +467,14 @@ fn logic_view_cli(what: &str) -> i32 {
             };
             match r {
                 Ok(v) => println!(
-                    "{:>12}  \"{}\"  {}{}",
+                    "{:>12}  \"{}\"  {}{}{}  [{}]",
                     w.id,
                     w.title,
                     if v.controls { "Controls" } else { "the plugin's own view" },
-                    if v.opaque { " (opaque to Accessibility: the studio's clicks do not reach it)" } else { "" }
+                    if v.opaque { " (opaque to Accessibility: the studio's clicks do not reach it)" } else { "" },
+                    // (12 nov., option a)
+                    if v.covered { " (partly covered by another Logic Pro window: the studio's clicks do not reach what is covered)" } else { "" },
+                    view_cost(&v.cost)
                 ),
                 Err(e) => {
                     println!("{:>12}  \"{}\"  {e}", w.id, w.title);
@@ -466,6 +490,22 @@ fn logic_view_cli(what: &str) -> i32 {
         eprintln!("--logic-view needs macOS (Logic Pro)");
         2
     }
+}
+
+/// (12 nov.) Ce qu'ont coute les deux sondes d'une fenetre (--logic-view) : la recherche du bouton de menu de
+/// l'affichage, puis le test « opaque », qui s'arrete au premier bouton trouve ou a son delai.
+#[cfg(target_os = "macos")]
+fn view_cost(c: &macos::ViewCost) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let stopped = if c.late { ", stopped by its time limit" } else { "" };
+    format!(
+        "view menu found in {:.1} ms; opaque test: {} of {} points ({} in this window) in {:.1} ms{stopped}",
+        ms(c.button),
+        c.probed,
+        c.points,
+        c.in_window,
+        ms(c.test)
+    )
 }
 
 /// --probe : filme une fenetre de plugin pendant quelques secondes et mesure (rien n'est envoye ni ecrit).
@@ -599,8 +639,21 @@ fn console_commands(sh: Arc<Shared>) {
                         Err(e) => eprintln!("warning: {e}"),
                     }
                 }
-                "help" | "?" => println!("Commands: arm (allow remote control), disarm (stop it), newcode (a new pairing code), discord on / discord off (show what you play in Music on Discord)."),
-                other => println!("Unknown command {:?}. Commands: arm, disarm, newcode, discord on, discord off, help.", other.chars().take(20).collect::<String>()),
+                // (12 nov.) la surface Mackie Control de Logic Pro (mcu.rs) : permise ici, jamais par le studio
+                "mackie on" | "mackie off" => {
+                    let on = line.trim().to_ascii_lowercase().ends_with("on");
+                    if !sh.mcu.available() {
+                        println!("The Logic Pro surface needs the companion on a Mac.");
+                    } else {
+                        match sh.set_mackie(on, "the console") {
+                            Ok(true) => println!("Logic Pro surface allowed. Once armed (arm), the companion opens the MIDI port \"{}\" and Logic Pro adds it by itself as a Mackie Control surface: the studio then shows Logic Pro's mixer, 8 tracks at a time, and can press Play and Stop.", mcu::PORT_NAME),
+                            Ok(false) => println!("Logic Pro surface off: the MIDI port \"{}\" closes. Logic Pro keeps the surface in Control Surface Setup until you delete it there.", mcu::PORT_NAME),
+                            Err(e) => eprintln!("warning: {e}"),
+                        }
+                    }
+                }
+                "help" | "?" => println!("Commands: arm (allow remote control), disarm (stop it), newcode (a new pairing code), discord on / discord off (show what you play in Music on Discord), mackie on / mackie off (Logic Pro's mixer, Play and Stop in the studio, through a Mackie Control surface)."),
+                other => println!("Unknown command {:?}. Commands: arm, disarm, newcode, discord on, discord off, mackie on, mackie off, help.", other.chars().take(20).collect::<String>()),
             }
         }
     });
@@ -847,6 +900,8 @@ fn main() {
     let pairing_v2 = state_file::read(&state).map(|v| state_file::pairing_v2(&v, &token)).unwrap_or(false);
     // (11 nov.) la presence Discord : off tant que la personne ne l'a pas permise ici ; son choix d'avant
     let discord_presence = state_file::read(&state).map(|v| v["discordPresence"] == json!(true)).unwrap_or(false);
+    // (12 nov.) la surface Mackie Control pour Logic Pro : off tant que la personne ne l'a pas permise ici (« mackie on »)
+    let mackie_surface = state_file::read(&state).map(|v| v[mcu::STATE_KEY] == json!(true)).unwrap_or(false);
     // (11 nov., update.rs) la case « Update automatically » : off tant que la personne ne l'a pas cochee ici
     let auto_update = state_file::read(&state).map(|v| v[update::STATE_KEY] == json!(true)).unwrap_or(false);
     // la machine elle-meme, et rien d'autre (un seul socket a l'ecoute, sur 127.0.0.1)
@@ -897,6 +952,9 @@ fn main() {
     }
     if discord_presence {
         st["discordPresence"] = json!(true);
+    }
+    if mackie_surface {
+        st[mcu::STATE_KEY] = json!(true);
     }
     if auto_update {
         st[update::STATE_KEY] = json!(true);
@@ -1004,6 +1062,8 @@ fn main() {
         arming: arming::Arming::new(args.demo, !args.demo),
         revoked: AtomicU64::new(0),
         presence: discord::Presence::new(discord_presence),
+        // (12 nov.) sur un Mac (et en --demo, une fausse table, sans port MIDI) ; permise si la personne l'a permise ici
+        mcu: mcu::Hub::new(cfg!(target_os = "macos") || args.demo, mackie_surface || args.demo),
     });
     println!(
         "Discord presence (what you play in Music, on your Discord profile): {}",
@@ -1016,6 +1076,19 @@ fn main() {
             "off (type « discord on » to allow it, or use the status window)"
         }
     );
+    // (12 nov.) Logic Pro : la surface Mackie Control ; ses ports seulement permise (« mackie on ») et armee
+    #[cfg(target_os = "macos")]
+    if !args.demo {
+        println!(
+            "Logic Pro surface (Mackie Control, MIDI port \"{}\"): {}",
+            mcu::PORT_NAME,
+            if mackie_surface { "allowed: its port opens once you type arm" } else { "off (type « mackie on » to allow it)" }
+        );
+        mcu_port::start(shared.clone());
+    }
+    if args.demo {
+        mcu::demo::start(shared.clone());
+    }
     // (9 nov., audit F1/F2) dans une console : « arm », « disarm », « newcode » (sans console, la fenetre d'etat et l'icone)
     if !to_log {
         console_commands(shared.clone());

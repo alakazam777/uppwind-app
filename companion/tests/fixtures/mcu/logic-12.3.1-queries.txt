@@ -1,0 +1,21 @@
+# Logic Pro 12.3.1 (macOS 26.6.2), 11 Nov. 2026, 19:00: what Logic sent to a new MIDI port "Uppwind Link MCU"
+# in its first 0.4 s (the companion's probe of Logic). Logic asks five surface models: Logic Control (10),
+# Logic Control XT (11), Mackie Control (14), Mackie Control XT (15) and Mackie C4 (17). Only 14 may be answered.
+# Format: seconds, direction (< Logic to the surface, > the surface to Logic), the bytes in hex.
+0.308611 < F0 00 00 66 10 00 F7
+0.308762 < F0 00 00 66 11 00 F7
+0.308990 < F0 00 00 66 17 00 F7
+0.309041 < F0 00 00 66 17 13 00 F7
+0.309314 < F0 00 00 66 14 00 F7
+0.309367 < F0 00 00 66 14 13 00 F7
+0.309629 < F0 00 00 66 15 00 F7
+0.309674 < F0 00 00 66 15 13 00 F7
+0.309972 < F0 00 00 66 14 00 F7
+0.309999 < F0 00 00 66 14 13 00 F7
+0.310279 < F0 00 00 66 15 00 F7
+0.310320 < F0 00 00 66 15 13 00 F7
+0.310594 < F0 00 00 66 14 00 F7
+0.310631 < F0 00 00 66 14 13 00 F7
+0.310914 < F0 00 00 66 15 00 F7
+0.310959 < F0 00 00 66 15 13 00 F7
+0.326217 < F0 00 00 66 11 02 55 57 4C 4D 43 55 31 05 05 7B 2F F7

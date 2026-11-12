@@ -32,6 +32,7 @@ pub fn daw_of_exe(exe: &str) -> Option<&'static str> {
 /// (9 nov.) Le service d'Apple qui fait tourner des Audio Units hors du processus de leur hote : Logic Pro 12 y met nos
 /// plugins (« AUHostingServiceXPC_arrow » ; « AUHostingServiceXPC », « AUHostingService » ailleurs). Le nom d'hote qu'un
 /// plugin donne n'est alors pas celui du DAW.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn is_au_hosting_service(exe: &str) -> bool {
     let e = exe.to_ascii_lowercase();
     let name = e.rsplit(['\\', '/']).next().unwrap_or(&e);

@@ -305,13 +305,29 @@ pub fn enumerate() -> Vec<RawWindow> {
         .collect()
 }
 
+/// (12 nov., option a) Les points ou l'on regarde si une autre fenetre de Logic couvre celle-ci : seize, quatre colonnes
+/// sur quatre rangees (12,5, 37,5, 62,5 et 87,5 % de la largeur et de la hauteur), sur TOUTE la fenetre, barre et pied
+/// compris : les gestes du studio y vont aussi. Mesure le 12 nov. : Return (526 × 200) sous Notes, l'E-Piano dont le
+/// haut est sous Return ; les douze points du test « opaque » ne voient pas ce haut, ceux-ci si.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn cover_probe_points(frame: [f64; 4]) -> Vec<(f64, f64)> {
+    let [x, y, w, h] = frame;
+    if w <= 0.0 || h <= 0.0 {
+        return Vec::new();
+    }
+    const AT: [f64; 4] = [0.125, 0.375, 0.625, 0.875];
+    AT.iter().flat_map(|fy| AT.iter().map(move |fx| (x + w * fx, y + h * fy))).collect()
+}
+
 /// (11 nov., 23 h) Les points ou le test « opaque » cherche un bouton : douze, quatre colonnes (20, 40, 60, 80 % de la
 /// largeur) sur trois rangees (20, 50, 80 % de la hauteur sous la barre de Logic, `header` points). Aucun sans place
 /// sous la barre.
+/// (12 nov.) Ni dans le pied de la fenetre (`footer` points), ou Logic ecrit le nom du plugin : il n'y a jamais de
+/// bouton la, et une fenetre couverte par une autre pouvait n'y montrer que ce nom, donc passer pour opaque.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn opaque_probe_points(frame: [f64; 4], header: f64) -> Vec<(f64, f64)> {
+pub fn opaque_probe_points(frame: [f64; 4], header: f64, footer: f64) -> Vec<(f64, f64)> {
     let [x, y, w, h] = frame;
-    let body = h - header;
+    let body = h - header - footer;
     if w <= 0.0 || body <= 0.0 {
         return Vec::new();
     }
@@ -324,12 +340,114 @@ pub fn opaque_probe_points(frame: [f64; 4], header: f64) -> Vec<(f64, f64)> {
     out
 }
 
-/// (11 nov., 23 h) Le dessin d'un plugin est-il opaque, d'apres ses points sondes ? `Some(true)` : un bouton a appuyer
-/// ou a tourner y est ; `Some(false)` : le point tombe dans la fenetre, mais rien n'y est ; `None` : le point n'est pas
-/// dans la fenetre (une autre la couvre). Opaque : au moins un point dans la fenetre, et aucun bouton nulle part.
+/// (12 nov.) Ce que le test « opaque » a conclu sous son delai d'ensemble (`opaque_within`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn opaque_of(found: &[Option<bool>]) -> bool {
-    found.iter().any(|f| f.is_some()) && !found.iter().any(|f| *f == Some(true))
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpaqueTest {
+    /// le verdict : vrai seulement si le test est alle au bout a temps, sans trouver un seul bouton, avec au moins la
+    /// moitie de ses points dans la fenetre
+    pub opaque: bool,
+    /// les points sondes : le test s'arrete au premier bouton trouve, ou a son delai
+    pub probed: usize,
+    /// (12 nov.) ceux qui sont tombes dans la fenetre (les autres : sur une fenetre posee devant)
+    pub in_window: usize,
+    /// arrete par son delai (alors jamais opaque)
+    pub late: bool,
+}
+
+/// (11 nov., 23 h) Le dessin d'un plugin est-il opaque, d'apres ses points sondes ? Chacun donne `Some(true)` : un
+/// bouton a appuyer ou a tourner y est ; `Some(false)` : le point tombe dans la fenetre, mais rien n'y est ; `None` : le
+/// point n'est pas dans la fenetre (une autre la couvre). Opaque : aucun bouton, et (12 nov.) au moins la moitie des
+/// points dans la fenetre. Avant, un seul suffisait : Return, couvert par Notes, passait pour opaque d'apres quatre
+/// points sur douze, tous sur le nom ecrit au pied de sa fenetre (mesure). Une fenetre surtout couverte n'en montre pas
+/// assez pour conclure.
+/// (12 nov.) Sous un delai d'ensemble. `probes` est paresseux : chaque point interroge Logic au moment ou il est lu.
+/// `late` dit si le delai est passe ; il est relu apres chaque point. Le test s'arrete au premier bouton trouve (pas
+/// opaque). Passe le delai, il conclut « pas opaque », sans compter le dernier point, dont les appels ont pu etre
+/// coupes. Ce signe ne sert qu'au texte du studio et au bouton Controls mis en avant : le donner a tort ferait croire
+/// que des clics qui marchent ne passent pas.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn opaque_within(probes: impl IntoIterator<Item = Option<bool>>, mut late: impl FnMut() -> bool) -> OpaqueTest {
+    let mut test = OpaqueTest::default();
+    for found in probes {
+        test.probed += 1;
+        if late() {
+            test.late = true;
+            return test;
+        }
+        match found {
+            Some(true) => {
+                test.in_window += 1;
+                return test;
+            }
+            Some(false) => test.in_window += 1,
+            None => {}
+        }
+    }
+    test.opaque = test.in_window > 0 && test.in_window * 2 >= test.probed;
+    test
+}
+
+/// (12 nov.) Ce qu'une recherche sous un delai d'ensemble a trouve (`first_within`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Search<T> {
+    Found(T),
+    /// rien : tout est parcouru, ou la limite d'elements est atteinte
+    Absent,
+    /// arretee par son delai : on n'en sait rien
+    Late,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl<T> Search<T> {
+    /// L'element trouve. Rien sinon, delai passe compris : une barriere qui cherche un signe echoue fermee.
+    pub fn found(self) -> Option<T> {
+        match self {
+            Search::Found(t) => Some(t),
+            Search::Absent | Search::Late => None,
+        }
+    }
+}
+
+/// (12 nov.) La recherche du bouton de menu de l'affichage (`macos::ax_view_button`), ecrite sans l'Accessibilite pour
+/// etre essayee. En largeur depuis `root`, sur `depth` niveaux d'enfants, `max` elements examines au plus : le premier
+/// qui `fits`. `late` (le delai d'ensemble) est relu avant chaque appel a `children` et a `fits`, qui interrogent Logic
+/// une ou deux fois chacun. Passe le delai : `Late`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn first_within<N>(
+    root: N,
+    depth: usize,
+    max: usize,
+    mut children: impl FnMut(&N) -> Vec<N>,
+    mut fits: impl FnMut(&N) -> bool,
+    mut late: impl FnMut() -> bool,
+) -> Search<N> {
+    let mut level = vec![root];
+    let mut seen = 0;
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for n in &level {
+            if late() {
+                return Search::Late;
+            }
+            for k in children(n) {
+                seen += 1;
+                if seen > max {
+                    return Search::Absent;
+                }
+                if late() {
+                    return Search::Late;
+                }
+                if fits(&k) {
+                    return Search::Found(k);
+                }
+                next.push(k);
+            }
+        }
+        level = next;
+    }
+    Search::Absent
 }
 
 /// (11 nov.) Le menu d'affichage d'une fenetre de plugin de Logic (mesure avec PSP VintageWarmer2 : « Controls », le
@@ -516,14 +634,37 @@ mod tests {
         assert_eq!(index_by_frame(&[], [0.0; 4]), None);
     }
 
+    /// (12 nov., option a) Ou l'on regarde si une autre fenetre de Logic couvre celle-ci : seize points sur toute la
+    /// fenetre, barre et pied compris, tous dedans.
+    #[test]
+    fn the_cover_test_looks_at_the_whole_window() {
+        let pts = cover_probe_points([0.0, 0.0, 800.0, 400.0]);
+        assert_eq!(pts.len(), 16);
+        assert_eq!((pts[0], pts[15]), ((100.0, 50.0), (700.0, 350.0)));
+        // l'E-Piano (mesure : 516 × 462 a 138,340, son haut sous Return et Notes jusqu'a 503) : la premiere rangee y
+        // tombe ; les douze points du test « opaque », entre la barre et le pied, commencent plus bas
+        let ep = cover_probe_points([138.0, 340.0, 516.0, 462.0]);
+        assert!(ep.iter().any(|&(_, y)| y < 503.0), "{ep:?}");
+        assert!(opaque_probe_points([138.0, 340.0, 516.0, 462.0], 100.0, 34.0).iter().all(|&(_, y)| y > 503.0));
+        assert!(ep.iter().all(|&(x, y)| x > 138.0 && x < 654.0 && y > 340.0 && y < 802.0), "inside");
+        assert!(cover_probe_points([0.0, 0.0, 0.0, 100.0]).is_empty());
+    }
+
     /// (11 nov., 23 h) Le test « opaque » : douze points sous la barre, et un seul bouton trouve suffit.
     #[test]
     fn a_view_is_opaque_only_if_no_probe_finds_a_control() {
-        let pts = opaque_probe_points([100.0, 50.0, 500.0, 500.0], 100.0);
+        let pts = opaque_probe_points([100.0, 50.0, 500.0, 500.0], 100.0, 0.0);
         assert_eq!(pts.len(), 12);
         assert_eq!((pts[0], pts[11]), ((200.0, 230.0), (500.0, 470.0)));
         assert!(pts.iter().all(|&(x, y)| x > 100.0 && x < 600.0 && y > 150.0 && y < 550.0), "under the header, inside");
-        assert!(opaque_probe_points([0.0, 0.0, 500.0, 90.0], 100.0).is_empty(), "no room under the header");
+        assert!(opaque_probe_points([0.0, 0.0, 500.0, 90.0], 100.0, 0.0).is_empty(), "no room under the header");
+        // (12 nov.) ni dans le pied : Return (526 × 200, mesure), dont le nom occupe les 34 derniers points
+        let ret = opaque_probe_points([45.0, 303.0, 526.0, 200.0], 100.0, 34.0);
+        assert_eq!(ret.len(), 12);
+        assert!(ret.iter().all(|&(_, y)| y > 403.0 && y < 469.0), "between the header and the footer: {ret:?}");
+        assert!(opaque_probe_points([0.0, 0.0, 500.0, 134.0], 100.0, 34.0).is_empty(), "no room between them");
+        // (12 nov.) le verdict seul, sans delai
+        let opaque_of = |found: &[Option<bool>]| opaque_within(found.iter().copied(), || false).opaque;
         // PSP VintageWarmer2 (mesure : la fenetre seule, partout) : opaque
         assert!(opaque_of(&[Some(false); 12]));
         // l'E-Piano a 50 % : le centre sur un decor, des boutons ailleurs : pas opaque
@@ -532,8 +673,127 @@ mod tests {
         assert!(!opaque_of(&epiano));
         // couvert par une autre fenetre : on ne conclut pas
         assert!(!opaque_of(&[None; 12]));
-        assert!(opaque_of(&[None, Some(false), None]));
         assert!(!opaque_of(&[]));
+        // (12 nov.) en partie couvert : au moins la moitie des points dans la fenetre pour conclure. Return sous Notes
+        // (mesure, avant que le pied soit laisse de cote) : huit points sur Notes, quatre sur son nom, aucun bouton
+        let mut ret = [None; 12];
+        ret[8..].fill(Some(false));
+        assert!(!opaque_of(&ret), "4 of 12 in the window: not enough");
+        ret[6..].fill(Some(false));
+        assert!(opaque_of(&ret), "6 of 12: enough");
+        assert!(!opaque_of(&[None, Some(false), None]) && opaque_of(&[None, Some(false), Some(false)]));
+    }
+
+    /// (12 nov.) Le test « opaque » sur des points simules, avec une horloge simulee : chaque point lu l'avance de
+    /// `cost` ms, et le delai est de `budget` ms. → le verdict, et le nombre de points vraiment demandes a « Logic ».
+    fn opaque_sim(found: &[Option<bool>], cost: u64, budget: u64) -> (OpaqueTest, usize) {
+        let (asked, clock) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let probes = found.iter().map(|f| {
+            asked.set(asked.get() + 1);
+            clock.set(clock.get() + cost);
+            *f
+        });
+        let test = opaque_within(probes, || clock.get() >= budget);
+        (test, asked.get())
+    }
+
+    /// (12 nov.) Le test « opaque » s'arrete au premier bouton : les points suivants ne sont jamais demandes.
+    #[test]
+    fn the_opaque_test_stops_at_the_first_control() {
+        let mut found = [Some(false); 12];
+        found[2] = Some(true);
+        found[7] = Some(true);
+        let (test, asked) = opaque_sim(&found, 0, 300);
+        assert_eq!(test, OpaqueTest { opaque: false, probed: 3, in_window: 3, late: false });
+        assert_eq!(asked, 3, "nothing is asked after the first control");
+        // aucun bouton : tous les points sont demandes, et c'est opaque (PSP VintageWarmer2)
+        let psp = OpaqueTest { opaque: true, probed: 12, in_window: 12, late: false };
+        assert_eq!(opaque_sim(&[Some(false); 12], 0, 300), (psp, 12));
+        // l'E-Piano a 50 % : le premier point sur un decor, un bouton au deuxieme
+        let mut epiano = [Some(false); 12];
+        epiano[1] = Some(true);
+        assert_eq!(opaque_sim(&epiano, 0, 300).0, OpaqueTest { opaque: false, probed: 2, in_window: 2, late: false });
+    }
+
+    /// (12 nov.) Passe son delai, le test « opaque » s'arrete et dit « pas opaque » : un Logic lent ne retient plus le
+    /// compagnon pendant douze points.
+    #[test]
+    fn the_opaque_test_is_not_opaque_past_its_deadline() {
+        // 100 ms par point, 300 ms de delai : trois points, puis l'arret, meme si rien n'a ete trouve
+        let (test, asked) = opaque_sim(&[Some(false); 12], 100, 300);
+        assert_eq!(test, OpaqueTest { opaque: false, probed: 3, in_window: 2, late: true });
+        assert_eq!(asked, 3, "the fourth point is never asked");
+        // le point fini apres le delai ne compte pas : compte, il aurait fait conclure « opaque » (deux points sur trois)
+        let cut = OpaqueTest { opaque: false, probed: 3, in_window: 1, late: true };
+        assert_eq!(opaque_sim(&[None, Some(false), Some(false)], 100, 300).0, cut);
+        assert!(opaque_sim(&[None, Some(false), Some(false)], 100, 301).0.opaque, "just in time");
+        // a temps : 20 ms par point, 240 ms en tout
+        let psp = OpaqueTest { opaque: true, probed: 12, in_window: 12, late: false };
+        assert_eq!(opaque_sim(&[Some(false); 12], 20, 300).0, psp);
+        // un bouton trouve avant le delai : pas opaque, et pas en retard
+        let mut found = [Some(false); 12];
+        found[1] = Some(true);
+        assert_eq!(opaque_sim(&found, 100, 300).0, OpaqueTest { opaque: false, probed: 2, in_window: 2, late: false });
+        // aucun point : rien a conclure
+        assert_eq!(opaque_sim(&[], 100, 300), (OpaqueTest::default(), 0));
+    }
+
+    /// (12 nov.) Un arbre d'elements simule pour la recherche du bouton de menu de l'affichage : le noeud n a pour
+    /// enfants 10n+1, 10n+2 et 10n+3 (le premier niveau : 1, 2, 3 ; le deuxieme : 11 a 33 ; le troisieme : 111 a 333),
+    /// ou `wide` enfants pour la racine (0) si `wide` n'est pas nul. Chaque appel a `children` ou a `fits` avance
+    /// l'horloge simulee de `cost` ms ; le delai est de `budget` ms. → ce que la recherche trouve, et ses appels.
+    fn search_sim(button: &[u32], wide: u32, cost: u64, budget: u64) -> (Search<u32>, u64) {
+        let (calls, clock) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let tick = || {
+            calls.set(calls.get() + 1);
+            clock.set(clock.get() + cost);
+        };
+        let children = |n: &u32| {
+            tick();
+            match (*n, wide) {
+                (0, w) if w > 0 => (1..=w).map(|k| 10_000 + k).collect(),
+                (n, _) if n < 1000 => (1..=3).map(|k| n * 10 + k).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let fits = |n: &u32| {
+            tick();
+            button.contains(n)
+        };
+        let found = first_within(0, 3, 400, children, fits, || clock.get() >= budget);
+        (found, calls.get())
+    }
+
+    /// (12 nov.) La recherche du bouton de menu de l'affichage : en largeur, sur trois niveaux, 400 elements au plus, le
+    /// premier trouve.
+    #[test]
+    fn the_view_menu_search_goes_by_level_and_is_bounded() {
+        assert_eq!(search_sim(&[123], 0, 0, 300).0, Search::Found(123), "on the third level");
+        assert_eq!(search_sim(&[111, 23], 0, 0, 300).0, Search::Found(23), "the second level before the third");
+        assert_eq!(search_sim(&[2, 1], 0, 0, 300), (Search::Found(1), 2), "the first one, at the first call");
+        assert_eq!(search_sim(&[1111], 0, 0, 300).0, Search::Absent, "not on a fourth level");
+        // 500 enfants sans bouton : 400 examines, puis l'arret (1 appel a `children`, 400 a `fits`)
+        assert_eq!(search_sim(&[], 500, 0, 300), (Search::Absent, 401));
+        assert_eq!(search_sim(&[10_400], 500, 0, 300).0, Search::Found(10_400), "the 400th is still examined");
+        assert_eq!(search_sim(&[10_401], 500, 0, 300).0, Search::Absent, "not the 401st");
+    }
+
+    /// (12 nov.) Passe son delai, la recherche s'arrete et ne trouve rien : la fenetre n'est pas prise pour une fenetre
+    /// de plugin (ni listee, ni pressee, ni changee d'affichage). La barriere echoue fermee.
+    #[test]
+    fn the_view_menu_search_fails_closed_past_its_deadline() {
+        // 10 ms par appel, 50 ms de delai : cinq appels, puis l'arret, avant le bouton du troisieme niveau
+        let (found, calls) = search_sim(&[123], 0, 10, 50);
+        assert_eq!((found, calls), (Search::Late, 5));
+        assert_eq!(search_sim(&[123], 0, 10, 50).0.found(), None);
+        // la meme fenetre, avec assez de temps : le bouton y est, au 24e appel (240 ms)
+        assert_eq!(search_sim(&[123], 0, 10, 1000), (Search::Found(123), 24));
+        // le delai deja passe : aucun appel a Logic
+        assert_eq!(search_sim(&[1], 0, 10, 0), (Search::Late, 0));
+        // la decision : sans le signe, jamais une fenetre de plugin
+        let sign = search_sim(&[123], 0, 10, 50).0.found().is_some();
+        assert!(!is_logic_plugin("Deluxe Classic", 3, true, sign));
+        assert!(is_logic_plugin("Deluxe Classic", 3, true, search_sim(&[123], 0, 10, 1000).0.found().is_some()));
     }
 
     /// (11 nov.) Le menu d'affichage d'une fenetre de Logic, tel que PSP VintageWarmer2 l'a montre.

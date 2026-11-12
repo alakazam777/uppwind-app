@@ -351,6 +351,10 @@ pub struct Injector {
     /// (11 nov.) macOS, Logic Pro : la molette pas encore tournee en crans (pixels du studio)
     #[cfg(target_os = "macos")]
     wheel_acc: f64,
+    /// (12 nov., option a) macOS, Logic Pro : ce que le dernier appui ou la derniere molette a trouve sous le pointeur,
+    /// une autre fenetre de Logic (Some(true)) ou non (Some(false)) ; repris par `take_covered` pour la reponse au studio
+    #[cfg(target_os = "macos")]
+    covered: Option<bool>,
 }
 
 /// (11 nov.) macOS, Logic Pro : un geste par l'Accessibilite, de l'appui au relachement.
@@ -376,12 +380,17 @@ impl Default for Injector {
             ax: None,
             #[cfg(target_os = "macos")]
             wheel_acc: 0.0,
+            #[cfg(target_os = "macos")]
+            covered: None,
         }
     }
 }
 
+// (12 nov.) Les fonctions pures des gestes de Logic Pro, jusqu'a wheel_steps : seul macOS s'en sert, mais elles sont
+// essayees partout. Hors de macOS, pas d'avertissement « never used » (14 ici, et is_au_hosting_service dans procs.rs).
 /// (11 nov.) Logic Pro : que faire d'un element de l'Accessibilite trouve sous le pointeur (role, valeur reglable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum AxStep {
     /// un bouton : l'appuyer
     Press,
@@ -393,6 +402,7 @@ pub enum AxStep {
     Stop,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn ax_step_of(role: &str, settable_value: bool) -> AxStep {
     match role {
         "AXSlider" | "AXIncrementor" if settable_value => AxStep::Knob,
@@ -404,24 +414,31 @@ pub fn ax_step_of(role: &str, settable_value: bool) -> AxStep {
 }
 
 /// Toute la course d'un bouton rotatif, en points tires vers le haut (dix fois plus avec Maj).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const KNOB_TRAVEL: f64 = 200.0;
 /// Sans bornes connues : un cran (AXIncrement) tous les KNOB_STEP points.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const KNOB_STEP: f64 = 8.0;
 /// La molette sur un bouton rotatif aux bornes connues : WHEEL_POINTS points tires par pixel du studio (une molette
 /// donne 100 pixels par cran : 10 points, 5 % de la course ; un trackpad, peu a la fois, qui s'accumulent).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const WHEEL_POINTS: f64 = 0.1;
 /// Sans bornes : un cran (AXIncrement, 10 % de la course sur l'E-Piano, mesure) tous les WHEEL_STEP pixels.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const WHEEL_STEP: f64 = 100.0;
 /// Un appui et un relachement a moins de CLICK_SLOP points : un clic.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const CLICK_SLOP: f64 = 6.0;
 
 /// La valeur d'un bouton rotatif tire de `dy_up` points vers le haut depuis `start` : bornee ; entiere quand ses valeurs
 /// le sont (l'E-Piano : VOLUME 0..80, BASS BOOST 0..100).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn knob_value(start: f64, min: f64, max: f64, dy_up: f64, fine: bool) -> f64 {
     knob_value_over(start, min, max, dy_up, KNOB_TRAVEL, fine)
 }
 
 /// Pareil, toute la course en `travel` points (un curseur couche : sa largeur, la poignee suit le pointeur).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn knob_value_over(start: f64, min: f64, max: f64, moved: f64, travel: f64, fine: bool) -> f64 {
     let span = max - min;
     if !span.is_finite() || span <= 0.0 || !start.is_finite() || !moved.is_finite() || !(travel > 0.0) {
@@ -437,6 +454,7 @@ pub fn knob_value_over(start: f64, min: f64, max: f64, moved: f64, travel: f64, 
 
 /// (11 nov.) La course d'un geste sur un bouton : un curseur couche (l'affichage « Controls » de Logic, 89 points de
 /// large) se tire de gauche a droite, toute sa course sur sa largeur ; un bouton rotatif, vers le haut, sur KNOB_TRAVEL.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn knob_travel(horizontal: bool, width: f64) -> f64 {
     if horizontal && width.is_finite() && width >= 20.0 {
         width
@@ -448,7 +466,9 @@ pub fn knob_travel(horizontal: bool, width: f64) -> f64 {
 /// (11 nov.) Le sens d'un geste sur un bouton, fige des qu'il a parcouru AXIS_LOCK points : l'axe le plus parcouru
 /// (Some(true) : de gauche a droite). Mesure : la case de valeur de l'affichage « Controls » de Logic se dit couchee a
 /// l'Accessibilite mais se tire de bas en haut ; c'est donc le geste qui decide, pas l'element.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const AXIS_LOCK: f64 = 4.0;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn knob_axis(dx: f64, dy: f64) -> Option<bool> {
     if dx.abs().max(dy.abs()) < AXIS_LOCK {
         None
@@ -457,11 +477,13 @@ pub fn knob_axis(dx: f64, dy: f64) -> Option<bool> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn is_click(down: (f64, f64), up: (f64, f64)) -> bool {
     (down.0 - up.0).hypot(down.1 - up.1) <= CLICK_SLOP
 }
 
 /// La molette accumulee → (crans a donner, vers le haut ?, le reste). Molette vers le haut (dy negatif) : plus.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn wheel_steps(acc: f64) -> (u32, bool, f64) {
     let n = (acc.abs() / WHEEL_STEP).floor();
     if n < 1.0 {
@@ -475,6 +497,20 @@ impl Injector {
         if m != self.mode {
             self.mode = m;
             self.forget();
+        }
+    }
+
+    /// (12 nov., option a) Logic Pro : le dernier geste cherchait-il sous une autre fenetre de Logic ? Some(true) : une
+    /// autre fenetre couvre celle du plugin a cet endroit, le geste n'y est pas passe ; Some(false) : non ; None : ce
+    /// geste n'a rien cherche (un glisser, un relachement, un autre DAW). Lu une fois par geste.
+    pub fn take_covered(&mut self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            self.covered.take()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
         }
     }
 
@@ -655,7 +691,7 @@ impl Injector {
     /// (11 nov.) Logic Pro : les gestes par l'Accessibilite, dans la fenetre suivie `w` (voir l'en-tete du module).
     #[cfg(target_os = "macos")]
     fn handle_logic(&mut self, w: &crate::macos::MacWindow, ev: &InputEvent) -> Result<Outcome, String> {
-        use crate::macos::{ax_press, ax_reach_value, ax_step, ax_target_at, AxTarget};
+        use crate::macos::{ax_press, ax_reach_value, ax_step, ax_target_at, AxAt, AxTarget};
         let (pid, b) = (w.pid, w.bounds);
         let frame = [b.origin.x, b.origin.y, b.size.width, b.size.height];
         let (cw, ch) = (b.size.width.round() as i32, b.size.height.round() as i32);
@@ -668,9 +704,12 @@ impl Injector {
                 match action {
                     PointerAction::Down | PointerAction::DblClick => {
                         self.wheel_acc = 0.0;
-                        self.ax = match ax_target_at(pid, at.0, at.1, frame)? {
-                            Some(AxTarget::Press(el)) => Some(AxGesture::Press { el, at }),
-                            Some(AxTarget::Knob { el, value, range, horizontal, width }) => Some(AxGesture::Knob {
+                        let found = ax_target_at(pid, at.0, at.1, frame)?;
+                        // (12 nov., option a) une autre fenetre de Logic sous le pointeur : la reponse au studio le dit
+                        self.covered = Some(matches!(found, AxAt::Covered));
+                        self.ax = match found {
+                            AxAt::Target(AxTarget::Press(el)) => Some(AxGesture::Press { el, at }),
+                            AxAt::Target(AxTarget::Knob { el, value, range, horizontal, width }) => Some(AxGesture::Knob {
                                 el,
                                 start: value,
                                 range,
@@ -682,7 +721,7 @@ impl Injector {
                                 last: value,
                                 steps: 0,
                             }),
-                            None => None,
+                            AxAt::Covered | AxAt::Nothing => None,
                         };
                     }
                     PointerAction::Move => {
@@ -736,10 +775,12 @@ impl Injector {
                 let at = screen(p);
                 self.wheel_acc += *dy;
                 let mut applied = false;
-                match ax_target_at(pid, at.0, at.1, frame)? {
+                let found = ax_target_at(pid, at.0, at.1, frame)?;
+                self.covered = Some(matches!(found, AxAt::Covered));
+                match found {
                     // la molette vers le haut (dy negatif) : plus ; les petits pas d'un trackpad s'accumulent jusqu'a
                     // changer la valeur (entiere sur l'E-Piano)
-                    Some(AxTarget::Knob { el, value, range: Some((lo, hi)), .. }) => {
+                    AxAt::Target(AxTarget::Knob { el, value, range: Some((lo, hi)), .. }) => {
                         let v = knob_value(value, lo, hi, -self.wheel_acc * WHEEL_POINTS, *mods & 1 != 0);
                         if v != value {
                             ax_reach_value(&el, v, (hi - lo) / 200.0)?;
@@ -749,7 +790,7 @@ impl Injector {
                             self.wheel_acc = 0.0; // en butee : rien ne s'accumule au-dela
                         }
                     }
-                    Some(AxTarget::Knob { el, range: None, .. }) => {
+                    AxAt::Target(AxTarget::Knob { el, range: None, .. }) => {
                         let (n, up, rest) = wheel_steps(self.wheel_acc);
                         self.wheel_acc = rest;
                         for _ in 0..n {
@@ -1469,6 +1510,20 @@ mod tests {
 
     fn pt(x: f64, y: f64, iw: Option<f64>, ih: Option<f64>) -> Pt {
         Pt { x, y, iw, ih }
+    }
+
+    /// (12 nov., option a) Ce que le dernier geste a trouve sous le pointeur (une autre fenetre de Logic ou non) n'est
+    /// lu qu'une fois, par la reponse a ce geste ; un geste qui n'a rien cherche n'en dit rien.
+    #[test]
+    fn covered_is_read_once_and_nothing_by_default() {
+        let mut inj = Injector::default();
+        assert_eq!(inj.take_covered(), None);
+        #[cfg(target_os = "macos")]
+        {
+            inj.covered = Some(true);
+            assert_eq!(inj.take_covered(), Some(true));
+            assert_eq!(inj.take_covered(), None);
+        }
     }
 
     #[test]

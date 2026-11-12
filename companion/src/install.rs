@@ -176,6 +176,22 @@ fn sweep_asides(dir: &Path) -> usize {
     n
 }
 
+/// (12 nov.) Les copies mises de cote dans `dir` (un exe qui tournait pendant l'echange), sans les effacer :
+/// `--self-update` les fait effacer apres sa sortie, une fois l'ancienne version arretee.
+pub fn asides(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut v: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with(ASIDE_PREFIX) && name.ends_with(".exe")
+        })
+        .map(|e| e.path())
+        .collect();
+    v.sort();
+    v
+}
+
 /// (11 nov.) Pose `src` a la place de `dst` sans jamais laisser `dst` absent s'il etait la : `src` est d'abord copie a
 /// cote de `dst` sous un nom provisoire (executable sous Unix), puis l'ancien `dst` est renomme a cote, la copie prend
 /// son nom, et l'ancien est efface (ou garde a cote s'il tourne, efface au prochain --install). Si une etape echoue
@@ -858,6 +874,29 @@ mod tests {
         assert_eq!(asides(), 0);
         uninstall(&d).unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (12 nov.) Les copies mises de cote, listees sans etre effacees (`--self-update` les fait effacer apres lui).
+    #[test]
+    fn asides_lists_only_the_copies_put_aside() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("uwc-asides-{}-{t}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [
+            "uppwind-companion.exe",
+            "uppwind-companion.old-1794439097-0.exe",
+            "uppwind-companion.old-1794439097-1.exe",
+            "uppwind-companion.new-1.tmp",
+            "uppwind-companion.old-x.txt",
+            "companion.log",
+        ] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let got: Vec<String> = asides(&dir).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(got, vec!["uppwind-companion.old-1794439097-0.exe", "uppwind-companion.old-1794439097-1.exe"]);
+        assert!(dir.join("uppwind-companion.old-1794439097-0.exe").exists(), "listed, not removed");
+        assert!(asides(&dir.join("absent")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Le dossier de l'application, sans les fichiers provisoires ou mis de cote.

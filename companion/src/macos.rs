@@ -22,6 +22,7 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
 use std::ffi::{c_char, c_void};
+use std::time::{Duration, Instant};
 
 pub type CFTypeRef = *const c_void;
 pub type CFArrayRef = *const c_void;
@@ -270,7 +271,8 @@ pub struct AxWin {
 
 impl AxWin {
     /// (11 nov., relecture M1) Porte-t-elle le bouton de menu de l'affichage (AXMenuButton decrit « view ») que Logic Pro
-    /// met en haut de chacune de ses fenetres de plugins ? (`ax_view_button` : trois niveaux, 400 elements au plus.)
+    /// met en haut de chacune de ses fenetres de plugins ? (`ax_view_button` : trois niveaux, 400 elements et 300 ms au
+    /// plus ; passe ce delai, non.)
     pub fn view_button(&self) -> bool {
         unsafe { ax_view_button(&self.el).is_some() }
     }
@@ -333,6 +335,49 @@ fn ax_timeout() {
     });
 }
 
+/// (12 nov.) Le delai d'ensemble d'une sonde de l'Accessibilite. Chaque appel est borne a un quart de seconde
+/// (`ax_timeout`), mais une sonde en enchaine des dizaines : la recherche du bouton de menu de l'affichage (jusqu'a 400
+/// elements, `ax_view_button`) et le test « opaque » (douze points, et pour chacun jusqu'a cinq parents,
+/// `ax_logic_view_of`) retiendraient le compagnon plus d'une minute face a un Logic lent. Le delai est relu entre deux
+/// appels ; passe le delai, la sonde s'arrete et conclut comme le disent `plugins::first_within` (pas de signe : la
+/// barriere echoue fermee) et `plugins::opaque_within` (pas opaque).
+const AX_PROBE_BUDGET: Duration = Duration::from_millis(300);
+
+/// Le terme d'une sonde (`AX_PROBE_BUDGET` apres son debut), ou aucun.
+#[derive(Debug, Clone, Copy)]
+struct Deadline(Option<Instant>);
+
+impl Deadline {
+    /// Aucun terme : les gestes (`ax_target_at`), dont la recherche reste bornee appel par appel.
+    const NONE: Deadline = Deadline(None);
+
+    fn after(budget: Duration) -> Deadline {
+        Deadline(Some(Instant::now() + budget))
+    }
+
+    fn late(self) -> bool {
+        self.0.is_some_and(|end| Instant::now() >= end)
+    }
+
+    /// Pour `?` entre deux appels : None une fois le delai passe.
+    fn check(self) -> Option<()> {
+        (!self.late()).then_some(())
+    }
+}
+
+/// (12 nov.) Une sonde arretee par son delai se dit dans le journal, une ligne toutes les 10 s au plus : le studio relit
+/// la liste des fenetres toutes les 2 s, et chaque lecture refait la recherche pour chaque fenetre de plugin.
+fn log_late(probe: &str, so: &str) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if let Ok(mut last) = LAST.lock() {
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    crate::log(&format!("Logic Pro: {probe} was stopped after {} ms, so {so}", AX_PROBE_BUDGET.as_millis()));
+}
+
 /// (11 nov.) Un element de l'Accessibilite garde d'un evenement a l'autre (l'appui, puis son relachement) ; libere a
 /// la fin.
 pub struct AxElement(CFTypeRef);
@@ -359,11 +404,12 @@ pub enum AxTarget {
 /// Logic trouve l'element la ou il est DESSINE (l'onglet DETAILS, le bouton VOLUME), meme quand les cadres annonces
 /// sont decales ; sous un bouton rotatif, c'est un AXSlider sans valeur dont le PARENT est le vrai (valeur reglable,
 /// AXIncrement/AXDecrement) : on remonte de quelques parents (input::ax_step_of dit quoi faire de chacun).
-/// None : rien a faire la (du decor, un menu), ou l'element d'une autre fenetre que `frame` (une fenetre de Logic
-/// couvre celle du plugin a cet endroit). Err : pas d'« Accessibilite ».
-pub fn ax_target_at(pid: i32, x: f64, y: f64, frame: [f64; 4]) -> Result<Option<AxTarget>, String> {
+/// Nothing : rien a faire la (du decor, un menu). (12 nov., option a) Covered : l'element d'une autre fenetre que
+/// `frame`, une fenetre de Logic qui couvre celle du plugin a cet endroit ; le geste n'y passe pas, et le studio le
+/// dit. Err : pas d'« Accessibilite ».
+pub fn ax_target_at(pid: i32, x: f64, y: f64, frame: [f64; 4]) -> Result<AxAt, String> {
     if pid <= 0 {
-        return Ok(None);
+        return Ok(AxAt::Nothing);
     }
     if !unsafe { AXIsProcessTrusted() } {
         return Err("allow Accessibility for the program that runs the companion (System Settings › Privacy & Security › Accessibility)".into());
@@ -372,57 +418,90 @@ pub fn ax_target_at(pid: i32, x: f64, y: f64, frame: [f64; 4]) -> Result<Option<
     unsafe {
         let app = AxElement(AXUIElementCreateApplication(pid));
         if app.0.is_null() {
-            return Ok(None);
+            return Ok(AxAt::Nothing);
         }
-        // l'element est-il dans la fenetre du plugin (son cadre) ?
-        let Some((cur, win)) = hit_in_window(app.0, x, y, frame) else { return Ok(None) };
+        // l'element est-il dans la fenetre du plugin (son cadre), ou une autre fenetre de Logic la couvre-t-elle la ?
+        let (cur, win) = match hit_at(app.0, x, y, frame, Deadline::NONE) {
+            Some(Hit::In(cur, win)) => (cur, win),
+            Some(Hit::Covered) => return Ok(AxAt::Covered),
+            None => return Ok(AxAt::Nothing),
+        };
         // (11 nov., relecture M1) et cette fenetre est-elle une fenetre de plugin (le bouton de menu de l'affichage) ?
         // Sinon, rien : un studio ne presse rien dans une autre fenetre de Logic, meme si on la lui montrait
         if !plugin_window_sign(pid, frame, &win) {
-            return Ok(None);
+            return Ok(AxAt::Nothing);
         }
-        Ok(gesture_target(cur))
+        Ok(gesture_target(cur, Deadline::NONE).map_or(AxAt::Nothing, AxAt::Target))
     }
 }
 
-/// L'element sous le point (x, y) de l'ecran, s'il est dans la fenetre au cadre `frame` (a 2 points pres), et cette
-/// fenetre. None : rien, ou l'element d'une autre fenetre (une fenetre de Logic couvre celle du plugin a cet endroit).
-unsafe fn hit_in_window(app: CFTypeRef, x: f64, y: f64, frame: [f64; 4]) -> Option<(AxElement, AxElement)> {
+/// (12 nov., option a) Ce qu'un geste du studio trouve sous un point d'une fenetre de plugin de Logic.
+pub enum AxAt {
+    /// un bouton a appuyer ou a tourner
+    Target(AxTarget),
+    /// une autre fenetre de Logic couvre celle du plugin a cet endroit : le geste n'y passe pas
+    Covered,
+    /// rien a faire la : du decor, un menu, ou une fenetre qui n'est pas celle d'un plugin
+    Nothing,
+}
+
+/// (12 nov., option a) Ce que l'Accessibilite trouve sous un point de l'ecran, pour la fenetre au cadre `frame`.
+enum Hit {
+    /// un element de cette fenetre (a 2 points pres), et la fenetre
+    In(AxElement, AxElement),
+    /// un element d'une autre fenetre de l'appli : elle couvre celle-ci a cet endroit (l'Accessibilite rend l'element
+    /// le plus haut ; mesure sur Logic Pro 12.3.1 : Notes posee sur Return)
+    Covered,
+}
+
+/// L'element sous le point (x, y) de l'ecran : dans la fenetre au cadre `frame`, ou dans une autre qui la couvre la.
+/// None : rien (pas d'element, ou un element sans fenetre). (12 nov.) Rien non plus une fois passe le delai `dl` (relu
+/// entre deux appels).
+unsafe fn hit_at(app: CFTypeRef, x: f64, y: f64, frame: [f64; 4], dl: Deadline) -> Option<Hit> {
+    dl.check()?;
     let mut hit: CFTypeRef = std::ptr::null();
     if AXUIElementCopyElementAtPosition(app, x as f32, y as f32, &mut hit) != 0 || hit.is_null() {
         return None;
     }
     let cur = AxElement(hit);
+    dl.check()?;
     let win = AxElement(ax_attr(cur.0, c"AXWindow"));
-    match ax_frame(win.0) {
-        Some(f) if f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0) => Some((cur, win)),
-        _ => None,
-    }
+    dl.check()?;
+    let f = ax_frame(win.0)?;
+    Some(if f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0) { Hit::In(cur, win) } else { Hit::Covered })
 }
 
 /// Ce qu'un geste du studio ferait de l'element `cur` (ou de l'un de ses cinq premiers parents) : un bouton a
-/// appuyer, un bouton rotatif a tourner, ou rien (input::ax_step_of dit quoi faire de chacun).
-unsafe fn gesture_target(mut cur: AxElement) -> Option<AxTarget> {
+/// appuyer, un bouton rotatif a tourner, ou rien (input::ax_step_of dit quoi faire de chacun). (12 nov.) Rien non plus
+/// une fois passe le delai `dl` (relu entre deux appels).
+unsafe fn gesture_target(mut cur: AxElement, dl: Deadline) -> Option<AxTarget> {
     for _ in 0..5 {
+        dl.check()?;
         let role = AxElement(ax_attr(cur.0, c"AXRole"));
         let role = if !role.0.is_null() && CFGetTypeID(role.0) == CFStringGetTypeID() { cf_string(role.0) } else { String::new() };
+        dl.check()?;
         let value = ax_number(cur.0, c"AXValue");
+        dl.check()?;
         let settable = value.is_some() && ax_settable(cur.0, c"AXValue");
         match crate::input::ax_step_of(&role, settable) {
             crate::input::AxStep::Press => return Some(AxTarget::Press(cur)),
             crate::input::AxStep::Knob => {
+                dl.check()?;
                 let range = match (ax_number(cur.0, c"AXMinValue"), ax_number(cur.0, c"AXMaxValue")) {
                     (Some(lo), Some(hi)) if hi > lo => Some((lo, hi)),
                     _ => None,
                 };
+                dl.check()?;
                 let orient = AxElement(ax_attr(cur.0, c"AXOrientation"));
                 let horizontal = !orient.0.is_null() && CFGetTypeID(orient.0) == CFStringGetTypeID() && cf_string(orient.0) == "AXHorizontalOrientation";
+                dl.check()?;
                 let width = ax_frame(cur.0).map(|f| f[2]).unwrap_or(0.0);
                 return Some(AxTarget::Knob { value: value.unwrap_or(0.0), range, horizontal, width, el: cur });
             }
             crate::input::AxStep::Stop => return None,
             crate::input::AxStep::Up => {}
         }
+        dl.check()?;
         let parent = ax_attr(cur.0, c"AXParent");
         if parent.is_null() {
             break;
@@ -509,6 +588,24 @@ fn ax_action(el: &AxElement, name: &std::ffi::CStr) -> Result<(), String> {
 pub struct LogicView {
     pub controls: bool,
     pub opaque: bool,
+    /// (12 nov., option a) une autre fenetre de Logic couvre l'un des points sondes : les gestes du studio n'atteignent
+    /// pas ce qui est couvert, et le studio le dit
+    pub covered: bool,
+    /// (12 nov.) ce qu'ont coute ses deux sondes (le diagnostic --logic-view)
+    pub cost: ViewCost,
+}
+
+/// (12 nov.) Le temps de la recherche du bouton de menu de l'affichage (`button`) et celui du test « opaque » (`test`),
+/// avec ce que ce test a fait : `probed` points sondes sur `points` (il s'arrete au premier bouton trouve), dont
+/// `in_window` tombes dans la fenetre, et `late` s'il a ete arrete par son delai.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ViewCost {
+    pub button: Duration,
+    pub test: Duration,
+    pub probed: usize,
+    pub points: usize,
+    pub in_window: usize,
+    pub late: bool,
 }
 
 /// La fenetre de l'appli dont le cadre est `frame` (a 2 points pres), par l'Accessibilite.
@@ -563,31 +660,36 @@ pub fn ax_plugin_window(pid: i32, frame: [f64; 4]) -> bool {
 
 /// Le bouton de menu de l'affichage dans la barre de Logic, au-dessus du plugin (AXMenuButton, AXDescription
 /// « view », titre « Editor » ou « Controls » : mesure du 11 nov.) ; cherche sur trois niveaux, 400 elements au plus.
+/// (12 nov.) Et en `AX_PROBE_BUDGET` au plus (`plugins::first_within`) : passe ce delai, rien. La fenetre n'est alors
+/// pas prise pour une fenetre de plugin (ni listee, ni pressee, ni changee d'affichage) : la barriere echoue fermee.
 unsafe fn ax_view_button(win: &AxElement) -> Option<AxElement> {
-    let mut level = vec![AxElement(CFRetain(win.0))];
-    let mut seen = 0;
-    for _ in 0..3 {
-        let mut next = Vec::new();
-        for e in &level {
-            let kids = AxElement(ax_attr(e.0, c"AXChildren"));
-            if kids.0.is_null() || CFGetTypeID(kids.0) != CFArrayGetTypeID() {
-                continue;
-            }
-            for i in 0..CFArrayGetCount(kids.0) {
-                seen += 1;
-                if seen > 400 {
-                    return None;
-                }
-                let k = CFArrayGetValueAtIndex(kids.0, i);
-                if ax_text(k, c"AXRole") == "AXMenuButton" && ax_text(k, c"AXDescription") == "view" {
-                    return Some(AxElement(CFRetain(k)));
-                }
-                next.push(AxElement(CFRetain(k)));
-            }
+    use crate::plugins::Search;
+    let dl = Deadline::after(AX_PROBE_BUDGET);
+    let search = crate::plugins::first_within(
+        AxElement(CFRetain(win.0)),
+        3,
+        400,
+        |e: &AxElement| ax_children(e.0),
+        |k: &AxElement| ax_text(k.0, c"AXRole") == "AXMenuButton" && ax_text(k.0, c"AXDescription") == "view",
+        || dl.late(),
+    );
+    match search {
+        Search::Found(button) => Some(button),
+        Search::Absent => None,
+        Search::Late => {
+            log_late("the search for a window's Editor / Controls menu", "this window is not taken for a plugin window this time");
+            None
         }
-        level = next;
     }
-    None
+}
+
+/// (12 nov.) Les enfants d'un element (AXChildren), gardes chacun ; aucun s'il n'en donne pas.
+unsafe fn ax_children(e: CFTypeRef) -> Vec<AxElement> {
+    let kids = AxElement(ax_attr(e, c"AXChildren"));
+    if kids.0.is_null() || CFGetTypeID(kids.0) != CFArrayGetTypeID() {
+        return Vec::new();
+    }
+    (0..CFArrayGetCount(kids.0)).map(|i| CFArrayGetValueAtIndex(kids.0, i)).filter(|k| !k.is_null()).map(|k| AxElement(CFRetain(k))).collect()
 }
 
 /// Le texte d'un attribut (AXRole, AXTitle…), ou vide.
@@ -604,21 +706,49 @@ unsafe fn ax_text(e: CFTypeRef, name: &std::ffi::CStr) -> String {
 /// un seul point, le centre sous la barre de Logic : sur l'E-Piano a 50 %, il tombe sur un decor sans element, et le
 /// studio disait a tort que ses clics n'y passaient pas. Maintenant, douze points sous la barre
 /// (`plugins::opaque_probe_points`) : opaque seulement si aucun ne trouve un bouton a appuyer ou a tourner, comme un
-/// geste du studio le chercherait (`gesture_target`), parmi ceux qui tombent bien dans cette fenetre
-/// (`plugins::opaque_of`).
+/// geste du studio le chercherait (`gesture_target`), parmi ceux qui tombent bien dans cette fenetre.
+/// (12 nov.) Le test s'arrete au premier bouton trouve, et a son delai (`AX_PROBE_BUDGET`, sans compter la recherche
+/// du bouton de menu, qui a le sien) : passe ce delai, pas opaque (`plugins::opaque_within`). Et il ne conclut
+/// « opaque » qu'avec au moins la moitie des points dans cette fenetre.
 unsafe fn ax_logic_view_of(app: CFTypeRef, win: &AxElement) -> Option<LogicView> {
+    let t0 = Instant::now();
     let button = ax_view_button(win)?;
+    let button_took = t0.elapsed();
     let controls = ax_text(button.0, c"AXTitle") == "Controls";
     let f = ax_frame(win.0)?;
-    let found: Vec<Option<bool>> = crate::plugins::opaque_probe_points(f, LOGIC_HEADER)
-        .into_iter()
-        .map(|(x, y)| hit_in_window(app, x, y, f).map(|(cur, _)| gesture_target(cur).is_some()))
-        .collect();
-    Some(LogicView { controls, opaque: crate::plugins::opaque_of(&found) })
+    let points = crate::plugins::opaque_probe_points(f, LOGIC_HEADER, LOGIC_FOOTER);
+    let n = points.len();
+    let t1 = Instant::now();
+    let dl = Deadline::after(AX_PROBE_BUDGET);
+    let found = points.into_iter().map(|(x, y)| match hit_at(app, x, y, f, dl) {
+        Some(Hit::In(cur, _)) => Some(gesture_target(cur, dl).is_some()),
+        Some(Hit::Covered) | None => None,
+    });
+    let test = crate::plugins::opaque_within(found, || dl.late());
+    let test_took = t1.elapsed();
+    if test.late {
+        log_late("the opaque test of a plugin window", "its view is not called opaque");
+    }
+    // (12 nov., option a) une autre fenetre de Logic couvre-t-elle une partie de celle-ci ? Seize points sur toute la
+    // fenetre, barre et pied compris (les gestes y vont aussi) ; seulement ce qui est dessus, sans chercher de bouton.
+    // Son propre delai : passe, on n'en sait rien, donc pas couverte (le studio le saura au premier geste qui y tombe).
+    let dl = Deadline::after(AX_PROBE_BUDGET);
+    let covered = crate::plugins::cover_probe_points(f).into_iter().any(|(x, y)| matches!(hit_at(app, x, y, f, dl), Some(Hit::Covered)));
+    if dl.late() {
+        log_late("the covered test of a plugin window", "it is not called covered");
+    }
+    let cost = ViewCost { button: button_took, test: test_took, probed: test.probed, points: n, in_window: test.in_window, late: test.late };
+    Some(LogicView { controls, opaque: test.opaque, covered, cost })
 }
 
 /// La hauteur de la barre de Logic au-dessus du dessin d'un plugin (points), que le test « opaque » laisse de cote.
 const LOGIC_HEADER: f64 = 100.0;
+
+/// (12 nov.) La hauteur du pied d'une fenetre de plugin de Logic (points), que le test « opaque » laisse aussi de cote :
+/// le nom du plugin, un AXStaticText de 29 points a 5 points du bord (mesure sur Logic Pro 12.3.1 : l'E-Piano, Notes et
+/// Return). Il n'y a jamais de bouton la. Mesure aussi : Return couvert par Notes ne montrait plus que son nom, et
+/// passait pour opaque.
+const LOGIC_FOOTER: f64 = 34.0;
 
 /// (11 nov.) L'affichage de la fenetre de plugin de Logic Pro au cadre `frame`. None : pas d'Accessibilite, ou pas de
 /// fenetre de plugin de Logic la.
@@ -907,5 +1037,17 @@ mod tests {
         if let Some(n) = super::responsible_exe(std::process::id()) {
             assert!(!n.is_empty() && !n.contains('/'), "{n}");
         }
+    }
+
+    /// (12 nov.) Le terme d'une sonde : jamais sans terme, tout de suite a zero, pas avant la fin du delai.
+    #[test]
+    fn a_probe_deadline_passes_at_its_end_only() {
+        use super::Deadline;
+        use std::time::Duration;
+        assert!(!Deadline::NONE.late() && Deadline::NONE.check().is_some());
+        let now = Deadline::after(Duration::ZERO);
+        assert!(now.late() && now.check().is_none());
+        let later = Deadline::after(Duration::from_secs(3600));
+        assert!(!later.late() && later.check().is_some());
     }
 }

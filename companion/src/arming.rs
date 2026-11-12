@@ -13,6 +13,8 @@
 //!   suite sa capture, ses gestes et son son.
 //! - Le reste du protocole ne change pas (la liste des fenetres, Open/Close dans Live, les notes vers les plugins
 //!   Uppwind Link, le lien du script de Live) : rien de cela ne filme l'ecran ni ne pilote le clavier et la souris.
+//! - (12 nov.) Sur un Mac, la surface Mackie Control de Logic Pro (mcu_port.rs) n'ouvre ses ports que permise
+//!   (« mackie on ») ET armee : desarme, Logic n'a rien a interroger, et la surface n'ecoute rien.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -105,7 +107,9 @@ impl Arming {
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
         if on {
-            crate::log(&format!("remote control: ARMED ({by}): the studio may capture plugin windows, send gestures to them and take the DAW's sound"));
+            // (12 nov.) sur un Mac, la surface Mackie Control de Logic Pro aussi, si elle est permise (mcu_port.rs)
+            let logic = if cfg!(target_os = "macos") { ", and, with mackie on, show Logic Pro's mixer and press Play and Stop" } else { "" };
+            crate::log(&format!("remote control: ARMED ({by}): the studio may capture plugin windows, send gestures to them and take the DAW's sound{logic}"));
         } else {
             crate::log(&format!("remote control: disarmed ({by})"));
         }

@@ -60,6 +60,9 @@ pub const INPUT_TO_CAPTURE: Duration = Duration::from_millis(4);
 /// PrintWindow le voyait 17-44 ms apres (mediane 35), une capture de 13-15 ms toutes les 16,7 ms.
 pub const GESTURE_POLL_CHEAP: Duration = Duration::from_millis(4);
 pub const INPUT_TO_CAPTURE_CHEAP: Duration = Duration::from_millis(1);
+/// (12 nov., mcu.rs) La table de Logic Pro part au plus une fois par ce temps (Logic envoie une trentaine de messages par
+/// seconde quand on bouge un fader) ; le dernier etat part toujours.
+pub const MIXER_EVERY: Duration = Duration::from_millis(100);
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -166,6 +169,8 @@ struct Conn<'a> {
     /// Le meme numero, partage avec le fil de capture (il le lit au debut de chaque capture).
     latest_input: Arc<AtomicU64>,
     last_input: Option<Instant>,
+    /// (12 nov., option a) le journal a deja dit qu'une autre fenetre de Logic couvre celle suivie (une fois par fenetre)
+    covered_said: bool,
     pointer: Option<(i32, i32)>,
     stats: InputStats,
     places: u64,
@@ -197,6 +202,14 @@ struct Conn<'a> {
     presence_used: bool,
     /// (11 nov.) hello {role:"presence"} : la page Music, qui ne peut que poser la presence Discord
     presence_only: bool,
+    /// (12 nov., mcu.rs) la surface Mackie Control de Logic Pro : la generation de ses booleens deja dite a ce studio
+    surface_gen: u64,
+    /// ce studio a demande la table (« mixer ») : il en recoit les changements, au plus un par MIXER_EVERY ; la
+    /// generation deja dite, quand, et ce qui est parti (jamais deux fois la meme table)
+    mixer_used: bool,
+    mixer_gen: u64,
+    mixer_at: Option<Instant>,
+    mixer_last: String,
 }
 
 enum Fatal {
@@ -408,7 +421,7 @@ impl<'a> Conn<'a> {
                     if let Some(w) = self.watch.as_mut() {
                         w.next = Instant::now();
                     }
-                    self.send_text(json!({ "type": "view", "ok": true, "view": if v.controls { "controls" } else { "editor" }, "opaque": v.opaque }).to_string())
+                    self.send_text(json!({ "type": "view", "ok": true, "view": if v.controls { "controls" } else { "editor" }, "opaque": v.opaque, "covered": v.covered }).to_string())
                 }
                 Err(e) => self.send_text(json!({ "type": "view", "ok": false, "error": e }).to_string()),
             }
@@ -456,6 +469,8 @@ impl<'a> Conn<'a> {
             if let Some(v) = logic_view(id) {
                 watching["logicView"] = json!(if v.controls { "controls" } else { "editor" });
                 watching["opaque"] = json!(v.opaque);
+                // (12 nov., option a) une autre fenetre de Logic couvre une partie de celle-ci : le studio le dit
+                watching["covered"] = json!(v.covered);
             }
         }
         self.send_text(watching.to_string())?;
@@ -463,6 +478,7 @@ impl<'a> Conn<'a> {
         let (resp_tx, resp_rx) = mpsc::channel::<Resp>();
         let worker = Worker::new(id, w.title.clone(), cap).with_latest_input(self.latest_input.clone());
         std::thread::spawn(move || worker.run(req_rx, resp_tx));
+        self.covered_said = false;
         self.watch = Some(Watch {
             id,
             title: w.title,
@@ -576,12 +592,22 @@ impl<'a> Conn<'a> {
 
     // ── les gestes ───────────────────────────────────────────────────────────────────────────────────────────
     fn input_ack(&mut self, raw: &RawInput, recv: f64, inj: f64, merged: u64, err: Option<&str>) -> Result<(), Fatal> {
+        self.input_ack_covered(raw, recv, inj, merged, err, None)
+    }
+
+    /// (12 nov., option a) L'accuse de reception d'un geste, avec `covered` quand le geste a cherche sous le pointeur
+    /// dans une fenetre de Logic Pro : true, une autre fenetre de Logic couvre celle du plugin a cet endroit (le geste
+    /// n'y est pas passe, le studio le dit) ; false, non.
+    fn input_ack_covered(&mut self, raw: &RawInput, recv: f64, inj: f64, merged: u64, err: Option<&str>, covered: Option<bool>) -> Result<(), Fatal> {
         let mut a = json!({ "type": "inputack", "n": raw.n, "t": raw.t, "recv": round3(recv), "inj": round3(inj), "ok": err.is_none(), "mode": self.inj.mode.name() });
         if merged > 0 {
             a["merged"] = json!(merged);
         }
         if let Some(e) = err {
             a["error"] = json!(e);
+        }
+        if let Some(c) = covered {
+            a["covered"] = json!(c);
         }
         self.send_text(a.to_string())
     }
@@ -627,6 +653,7 @@ impl<'a> Conn<'a> {
             let _ = pid;
             self.inj.handle(top, &ev)
         };
+        let covered = self.inj.take_covered();
         let inj = now_f();
         if crate::stream::trace() {
             crate::log(&format!("trace input n {:?} {} injected at {:.1} (studio event at {:.1}) ({:?})", raw.n, ev.kind(), inj % 100_000.0, raw.t.unwrap_or(0.0) % 100_000.0, outcome.as_ref().map(|o| o.applied)));
@@ -657,13 +684,18 @@ impl<'a> Conn<'a> {
                         w.next = w.next.min(Instant::now() + if w.cheap { INPUT_TO_CAPTURE_CHEAP } else { INPUT_TO_CAPTURE });
                     }
                 }
+                if covered == Some(true) && !self.covered_said {
+                    // une fois par fenetre suivie : le journal ne se remplit pas a chaque cran de molette
+                    self.covered_said = true;
+                    crate::log("input: another Logic Pro window covers this spot of the plugin window (the studio says so)");
+                }
                 self.log_inputs(false);
-                self.input_ack(&raw, recv, inj, merged, None)
+                self.input_ack_covered(&raw, recv, inj, merged, None, covered)
             }
             Err(e) => {
                 self.stats.refused += 1;
                 crate::log(&format!("input ({}) not delivered: {e}", ev.kind()));
-                self.input_ack(&raw, recv, inj, merged, Some(&e))
+                self.input_ack_covered(&raw, recv, inj, merged, Some(&e), covered)
             }
         }
     }
@@ -757,6 +789,92 @@ impl<'a> Conn<'a> {
             o.extend(s.clone());
         }
         self.send_text(m.to_string())
+    }
+
+    /// (12 nov., mcu.rs) La surface Mackie Control a change (permise ou non, ses ports, Logic branche) : le studio le sait.
+    fn poll_surface(&mut self) -> Result<(), Fatal> {
+        if self.presence_only {
+            return Ok(());
+        }
+        let g = self.sh.mcu.surface_generation();
+        if g == self.surface_gen {
+            return Ok(());
+        }
+        self.surface_gen = g;
+        let mut m = json!({ "type": "surface" });
+        if let (Some(o), Some(s)) = (m.as_object_mut(), self.sh.mcu.surface_json().as_object()) {
+            o.extend(s.clone());
+        }
+        self.send_text(m.to_string())
+    }
+
+    /// (12 nov.) La table de Logic Pro a change : un studio qui l'a demandee recoit la nouvelle, au plus une par
+    /// MIXER_EVERY, jamais deux fois la meme.
+    fn poll_mixer(&mut self) -> Result<(), Fatal> {
+        if !self.mixer_used || self.sh.mcu.mixer_generation() == self.mixer_gen || self.mixer_at.is_some_and(|t| t.elapsed() < MIXER_EVERY) {
+            return Ok(());
+        }
+        self.send_mixer()
+    }
+
+    fn send_mixer(&mut self) -> Result<(), Fatal> {
+        self.mixer_gen = self.sh.mcu.mixer_generation();
+        let s = self.sh.mcu.mixer_json().to_string();
+        self.mixer_at = Some(Instant::now());
+        if s == self.mixer_last {
+            return Ok(());
+        }
+        self.mixer_last = s.clone();
+        self.send_text(s)
+    }
+
+    /// (12 nov.) « mixer » : la table tout de suite (meme inchangee), puis ses changements.
+    fn on_mixer(&mut self) -> Result<(), Fatal> {
+        self.mixer_used = true;
+        self.mixer_last.clear();
+        self.send_mixer()
+    }
+
+    /// (12 nov., mcu.rs) Presser Play ou Stop sur Logic Pro, par la surface Mackie Control : arme seulement, comme les
+    /// gestes ; le Hub ne presse que quand Logic est branche, un bouton a la fois, 4 par seconde au plus.
+    fn on_transport(&mut self, action: &str) -> Result<(), Fatal> {
+        let Some(b) = crate::mcu::Button::parse(action) else {
+            return self.send_text(json!({ "type": "transport", "ok": false, "code": "bad-action", "error": "action is play or stop" }).to_string());
+        };
+        self.press_logic(json!({ "type": "transport", "action": b.name() }), b)
+    }
+
+    /// (12 nov., mcu.rs) Les 8 tranches precedentes ou suivantes de Logic Pro (BANK ◀ / ▶ sur la surface) : les memes
+    /// regles que Play et Stop.
+    fn on_bank(&mut self, dir: &str) -> Result<(), Fatal> {
+        let Some(b) = crate::mcu::Button::bank(dir) else {
+            return self.send_text(json!({ "type": "bank", "ok": false, "code": "bad-dir", "error": "dir is left or right" }).to_string());
+        };
+        self.press_logic(json!({ "type": "bank", "dir": dir }), b)
+    }
+
+    /// Presser un bouton de Logic Pro : arme seulement (comme les gestes), puis ce que le Hub permet. `reply` : le
+    /// message de reponse, sans ok ni code.
+    fn press_logic(&mut self, mut reply: serde_json::Value, b: crate::mcu::Button) -> Result<(), Fatal> {
+        if self.disarmed() {
+            crate::log(&format!("REFUSED {} on Logic Pro: remote control is off", b.name().to_uppercase()));
+            reply["ok"] = json!(false);
+            reply["error"] = json!(crate::arming::REFUSAL);
+            reply["code"] = json!(crate::arming::CODE);
+            return self.send_text(reply.to_string());
+        }
+        match self.sh.mcu.press(b) {
+            Ok(()) => {
+                crate::log(&format!("Logic Pro surface: {} pressed by the studio", b.name().to_uppercase()));
+                reply["ok"] = json!(true);
+            }
+            Err(r) => {
+                reply["ok"] = json!(false);
+                reply["code"] = json!(r.code);
+                reply["error"] = json!(r.error);
+            }
+        }
+        self.send_text(reply.to_string())
     }
 
     /// (29 oct.) Un plugin d'avant (protocole v1) a ete refuse : le studio le dit (« notice »), une fois par nouveau venu.
@@ -887,6 +1005,9 @@ impl<'a> Conn<'a> {
                 self.send_text(m.to_string())
             }
             ClientMsg::Presence { action, track } => self.on_presence(&action, track),
+            ClientMsg::Mixer => self.on_mixer(),
+            ClientMsg::Transport { action } => self.on_transport(&action),
+            ClientMsg::Bank { dir } => self.on_bank(&dir),
             ClientMsg::Routes => {
                 // un fil par demande (jusqu'a 1,5 s si Live se tait) : comptes avec Open/Close, pour qu'une rafale ne
                 // fasse pas pousser les fils sans fin
@@ -1111,6 +1232,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         input_n: 0,
         latest_input: Arc::new(AtomicU64::new(0)),
         last_input: None,
+        covered_said: false,
         pointer: None,
         stats: InputStats::default(),
         places: 0,
@@ -1129,6 +1251,11 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         presence_gen: 0,
         presence_used: false,
         presence_only: false,
+        surface_gen: 0,
+        mixer_used: false,
+        mixer_gen: 0,
+        mixer_at: None,
+        mixer_last: String::new(),
     };
     crate::log(&format!("studio connected from {origin}: waiting for the pairing proof"));
 
@@ -1256,6 +1383,8 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 sh.arming.session_opened();
                 c.arm_gen = sh.arming.generation();
                 let armed = sh.arming.armed();
+                // (12 nov.) la surface : sa generation avant son etat (un changement entre les deux repart, sans perte)
+                c.surface_gen = sh.mcu.surface_generation();
                 let mut hello = json!({
                     "type": "hello", "version": PROTOCOL_VERSION, "companion": env!("CARGO_PKG_VERSION"),
                     "capture": if sh.demo { "demo" } else { sh.capture.as_deref().unwrap_or("wgc") },
@@ -1274,6 +1403,8 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     "arming": true, "armed": armed, "unpair": true,
                     // (11 nov.) la presence Discord (discord.rs) : permise ici ou non, Discord la ou non
                     "presence": sh.presence.snapshot().json(),
+                    // (12 nov., mcu.rs) la surface Mackie Control de Logic Pro : sur un Mac, permise, ses ports, Logic branche
+                    "surface": sh.mcu.surface_json(),
                 });
                 // « live » ; (10 nov.) sous macOS, « logic » et « titles » aussi ; (11 nov.) « access » (plugins::Running)
                 run.put(&mut hello);
@@ -1364,7 +1495,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 break;
             }
         }
-        if c.poll_arming().is_err() || c.poll_presence().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
+        if c.poll_arming().is_err() || c.poll_presence().is_err() || c.poll_surface().is_err() || c.poll_mixer().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
             break;
         }
         c.report_activity();
@@ -1456,6 +1587,7 @@ mod tests {
             arming: crate::arming::Arming::new(armed, !demo),
             revoked: AtomicU64::new(0),
             presence: crate::discord::Presence::new(false),
+            mcu: crate::mcu::Hub::new(true, false),
         });
         let s = sh.clone();
         std::thread::spawn(move || serve(l, s, max));
@@ -1655,7 +1787,7 @@ mod tests {
         assert_eq!((v["ok"].as_bool(), v["error"].as_str()), (Some(false), Some("no plugin window is shown")), "{v}");
         ws.send(Message::text(json!({"type": "watch", "id": DEMO_ID}).to_string())).unwrap();
         let w = text_of(&mut ws, "watching");
-        assert!(w.get("logicView").is_none() && w.get("opaque").is_none(), "the demo is not a Logic Pro window: {w}");
+        assert!(w.get("logicView").is_none() && w.get("opaque").is_none() && w.get("covered").is_none(), "the demo is not a Logic Pro window: {w}");
         ws.send(Message::text(r#"{"type":"view","view":"sideways"}"#.to_string())).unwrap();
         assert_eq!(text_of(&mut ws, "view")["error"], "view is controls or editor");
         ws.send(Message::text(r#"{"type":"view","view":"editor"}"#.to_string())).unwrap();
@@ -1736,6 +1868,8 @@ mod tests {
         ws.send(Message::text(json!({"type": "input", "kind": "pointer", "action": "down", "x": 320, "y": 200, "iw": 640, "ih": 400, "buttons": 1, "n": 7, "t": t}).to_string())).unwrap();
         let a = text_of(&mut ws, "inputack");
         assert_eq!((a["n"].as_u64(), a["ok"].as_bool()), (Some(7), Some(true)));
+        // (12 nov., option a) covered ne vient que d'une fenetre de Logic Pro : pas de la demonstration
+        assert!(a.get("covered").is_none(), "{a}");
         let (recv, inj) = (a["recv"].as_f64().unwrap(), a["inj"].as_f64().unwrap());
         assert!(recv >= t - 1.0 && inj >= recv && inj - recv < 5.0, "received {recv}, injected {inj}");
         // les mouvements arrives ensemble sont fondus (le dernier gagne), le reste passe dans l'ordre
@@ -2099,6 +2233,103 @@ mod tests {
         assert_eq!(text_of(&mut ws, "inputack")["ok"], false, "no gesture either");
     }
 
+    /// Le prochain message d'un type donne qui remplit une condition (les autres passent).
+    fn text_where(ws: &mut Client, ty: &str, ok: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        loop {
+            let v = text_of(ws, ty);
+            if ok(&v) {
+                return v;
+            }
+        }
+    }
+
+    /// (12 nov., mcu.rs) La surface Mackie Control de Logic Pro : hello dit son etat ; la table seulement quand Logic est
+    /// branche, et seulement au studio qui l'a demandee ; Play et Stop seulement armes et Logic branche, une pression a la
+    /// fois ; desarme, plus rien. Ici sans CoreMIDI : le fil de la surface (mcu_port.rs) est joue a la main.
+    #[test]
+    fn the_logic_pro_surface_shows_the_mixer_and_presses_only_when_armed() {
+        use crate::mcu::{Button, Event};
+        let (port, sh) = server_shared(true, false, 50, MAX_CONNECTIONS, None, false);
+        let (mut ws, h) = pair_v2(port);
+        assert_eq!(h["surface"], json!({"available": true, "allowed": false, "ports": false, "online": false}), "{h}");
+        // un autre studio, qui ne demande jamais la table
+        let (mut other, _) = pair_v2(port);
+        // permise sur la machine (la console) : le studio l'apprend ; le studio, lui, ne peut pas la permettre
+        assert!(sh.mcu.set_allowed(true, "test"));
+        assert_eq!(text_of(&mut ws, "surface")["allowed"], true);
+        ws.send(Message::text(r#"{"type":"mackie","on":true}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "error")["code"], "bad-message");
+        // pas de port : la table ne dit que « hors ligne »
+        ws.send(Message::text(r#"{"type":"mixer"}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "mixer"), json!({"type": "mixer", "online": false}));
+        // desarme : Play est refuse, rien n'est presse
+        let play = r#"{"type":"transport","action":"play"}"#;
+        ws.send(Message::text(play.to_string())).unwrap();
+        let t = text_of(&mut ws, "transport");
+        assert_eq!((t["ok"].as_bool(), t["action"].as_str(), t["code"].as_str(), t["error"].as_str()), (Some(false), Some("play"), Some(crate::arming::CODE), Some(crate::arming::REFUSAL)), "{t}");
+
+        // arme : le fil de la surface ouvre ses ports ; Logic ne s'est pas encore branche
+        assert!(sh.arming.set(true, "test"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        sh.mcu.set_ports(Some(tx));
+        assert_eq!(text_where(&mut ws, "surface", |v| v["ports"] == true)["online"], false);
+        ws.send(Message::text(play.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "transport")["code"], "offline");
+        // Logic fait la poignee de main, puis ecrit l'ecran : le studio qui a demande la table la recoit
+        assert_eq!(sh.mcu.feed(&[0xF0, 0x00, 0x00, 0x66, 0x14, 0x13, 0x00, 0xF7]), vec![crate::mcu::version_reply()]);
+        assert_eq!(text_where(&mut ws, "surface", |v| v["online"] == true)["ports"], true);
+        let mut lcd = vec![0xF0, 0x00, 0x00, 0x66, 0x14, 0x12, 0x00];
+        lcd.extend(b"DelCls St Out Master <b>");
+        lcd.push(0xF7);
+        sh.mcu.feed(&lcd);
+        let m = text_where(&mut ws, "mixer", |v| v["strips"][3]["name"] == "<b>");
+        assert_eq!((m["online"].as_bool(), m["strips"][0]["name"].as_str(), m["strips"][2]["name"].as_str()), (Some(true), Some("DelCls"), Some("Master")), "{m}");
+        // Play : une seule pression part vers le fil de la surface ; Stop juste apres : un bouton est encore enfonce
+        ws.send(Message::text(play.to_string())).unwrap();
+        let t = text_of(&mut ws, "transport");
+        assert_eq!((t["ok"].as_bool(), t["action"].as_str()), (Some(true), Some("play")), "{t}");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Event::Press(Button::Play)));
+        ws.send(Message::text(r#"{"type":"transport","action":"stop"}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "transport")["code"], "busy");
+        // jamais Record, ni rien d'autre
+        for bad in [r#"{"type":"transport","action":"record"}"#, r#"{"type":"transport","action":"PLAY"}"#] {
+            ws.send(Message::text(bad.to_string())).unwrap();
+            let t = text_of(&mut ws, "transport");
+            assert_eq!((t["ok"].as_bool(), t["code"].as_str()), (Some(false), Some("bad-action")), "{bad} → {t}");
+        }
+        assert!(rx.try_recv().is_err(), "only the one Play");
+        // (12 nov.) BANK ▶ et ◀ : les memes regles ; une direction inconnue est refusee
+        std::thread::sleep(crate::mcu::PRESS_HOLD + Duration::from_millis(40));
+        ws.send(Message::text(r#"{"type":"bank","dir":"right"}"#.to_string())).unwrap();
+        let k = text_of(&mut ws, "bank");
+        assert_eq!((k["ok"].as_bool(), k["dir"].as_str()), (Some(true), Some("right")), "{k}");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Event::Press(Button::BankRight)));
+        ws.send(Message::text(r#"{"type":"bank","dir":"up"}"#.to_string())).unwrap();
+        let k = text_of(&mut ws, "bank");
+        assert_eq!((k["ok"].as_bool(), k["code"].as_str()), (Some(false), Some("bad-dir")), "{k}");
+        assert!(rx.try_recv().is_err(), "only the one BANK");
+        // une table inchangee ne repart pas ; le studio qui ne l'a pas demandee n'en a rien recu
+        sh.mcu.feed(&lcd);
+        let (_, texts) = drain(&mut ws, 300);
+        assert!(!texts.iter().any(|v| v["type"] == "mixer"), "the same table twice: {texts:?}");
+        let (_, texts) = drain(&mut other, 200);
+        assert!(!texts.iter().any(|v| v["type"] == "mixer"), "a studio that never asked: {texts:?}");
+        assert!(texts.iter().any(|v| v["type"] == "surface"), "but it knows the surface's state: {texts:?}");
+
+        // desarme : la session refuse, et quand le fil de la surface ferme ses ports, la table part hors ligne
+        assert!(sh.arming.set(false, "test"));
+        ws.send(Message::text(play.to_string())).unwrap();
+        assert_eq!(text_of(&mut ws, "transport")["code"], crate::arming::CODE);
+        ws.send(Message::text(r#"{"type":"bank","dir":"left"}"#.to_string())).unwrap();
+        let k = text_of(&mut ws, "bank");
+        assert_eq!((k["ok"].as_bool(), k["dir"].as_str(), k["code"].as_str()), (Some(false), Some("left"), Some(crate::arming::CODE)), "{k}");
+        sh.mcu.set_ports(None);
+        // (« surface » part avant « mixer » : text_of passe les autres types)
+        assert_eq!(text_where(&mut ws, "surface", |v| v["ports"] == false)["online"], false);
+        assert_eq!(text_where(&mut ws, "mixer", |v| v["online"] == false), json!({"type": "mixer", "online": false}));
+        assert!(rx.try_recv().is_err());
+    }
+
     /// (9 nov., audit F2) « Unpair » dans le studio change le code du compagnon : l'ancien ne marche plus nulle part, toutes
     /// les connexions appairees avec lui se ferment (4403), le fichier d'etat garde le nouveau, et le compagnon se
     /// desarme. Un nouveau code demande sur la machine (la fenetre d'etat, la console) fait de meme.
@@ -2160,6 +2391,7 @@ mod tests {
             arming: crate::arming::Arming::new(true, true),
             revoked: AtomicU64::new(0),
             presence,
+            mcu: crate::mcu::Hub::new(true, false),
         });
         let s = sh.clone();
         std::thread::spawn(move || serve(l, s, 4));
@@ -2175,7 +2407,9 @@ mod tests {
         assert_eq!(h["presence"]["allowed"], false);
         assert!(sh.arming.idle_left().is_some(), "Music does not count as a studio: remote control still turns itself off");
 
+        assert!(h["surface"].is_null(), "nothing of Logic Pro's surface for Music: {h}");
         for m in [r#"{"type":"list"}"#, r#"{"type":"watch","id":1}"#, r#"{"type":"audio","action":"start"}"#, r#"{"type":"unpair"}"#,
+                  r#"{"type":"mixer"}"#, r#"{"type":"transport","action":"play"}"#,
                   r#"{"type":"input","kind":"pointer","action":"move","x":1,"y":1,"iw":10,"ih":10,"n":1}"#] {
             ws.send(Message::text(m.to_string())).unwrap();
             let e = text_of(&mut ws, "error");

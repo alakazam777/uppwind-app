@@ -44,12 +44,14 @@
 //!   {"type":"emitted","id":"<id>"}                        → emitted : ou et quand il les a sorties (la mesure)
 //!   {"type":"unpair"}                                     → unpaired {ok, warning?} : (9 nov., audit F2) le compagnon
 //!                                                           change de code, puis ferme les connexions de l'ancien (4403)
-//!   {"type":"view","view":"controls|editor"}              → view {ok, view?, opaque?, error?} : (11 nov., macOS) la
-//!                                                           fenetre de Logic Pro montree passe a son affichage
-//!                                                           « Controls » (ses reglages en curseurs, accessibles) ou au
-//!                                                           dessin du plugin ; arme seulement. watching porte alors
-//!                                                           logicView (controls|editor) et opaque (le dessin ne montre
-//!                                                           rien a l'Accessibilite : les gestes n'y passent pas)
+//!   {"type":"view","view":"controls|editor"}              → view {ok, view?, opaque?, covered?, error?} : (11 nov.,
+//!                                                           macOS) la fenetre de Logic Pro montree passe a son
+//!                                                           affichage « Controls » (ses reglages en curseurs,
+//!                                                           accessibles) ou au dessin du plugin ; arme seulement.
+//!                                                           watching porte alors logicView (controls|editor), opaque
+//!                                                           (le dessin ne montre rien a l'Accessibilite : les gestes
+//!                                                           n'y passent pas) et (12 nov.) covered (une autre fenetre
+//!                                                           de Logic couvre une partie de celle-ci)
 //!   {"type":"presence","action":"set","track":{title, artist?, album?, cover?, url?, duration?, position?}}
 //!   {"type":"presence","action":"clear"} · {"type":"presence","action":"state"}
 //!                                                         → presence {allowed, discord: unknown|ok|absent, shown, error?,
@@ -57,10 +59,28 @@
 //!                                                           Discord (discord.rs) ; seulement si la personne l'a permis dans
 //!                                                           le compagnon ; « presence » suit chaque changement ; hello porte
 //!                                                           {"presence": {allowed, discord, shown}}
+//!   {"type":"mixer"}                                    → mixer : (12 nov., mcu.rs) la table de Logic Pro par la surface
+//!                                                         Mackie Control, tout de suite ; puis chaque changement (au plus
+//!                                                         un par 100 ms) : {online, strips[8] {n, name, value, fader,
+//!                                                         rec, solo, mute, select, kind}, master {fader}, assign,
+//!                                                         transport {play, stop, record, rewind, forward, cycle, click,
+//!                                                         solo}, counter, beats}. Hors ligne : {online:false} seulement
+//!   {"type":"transport","action":"play|stop"}            → transport {ok, action, code?, error?} : (12 nov.) presser Play
+//!                                                         ou Stop sur la surface ; arme seulement (code disarmed), Logic
+//!                                                         branche (offline), une pression a la fois et 4 par seconde au
+//!                                                         plus (busy) ; off : la surface n'est pas permise (mackie on)
+//!   {"type":"bank","dir":"left|right"}                    → bank {ok, dir, code?, error?} : (12 nov.) BANK ◀ / ▶ sur la
+//!                                                         surface (les 8 tranches precedentes ou suivantes) ; les memes
+//!                                                         regles que transport ; bad-dir : une autre direction
 //!   (11 nov.) hello {…, "role":"presence"} : la page Music ; tout message autre que presence et ping y est refuse
 //!   (error {code:"presence-only"}) ; son hello en retour ne porte que version, companion, la preuve et presence.
 //! Compagnon → studio (texte) : hello, windows, devices, opened, closed, watching, unwatched, pong, mode, inputack,
 //!   error. inputack : {n, t, recv, inj, ok, error?} (recv / inj : reception / injection, ms depuis 1970).
+//!   (12 nov.) Logic Pro : inputack porte covered quand le geste a cherche sous le pointeur (un appui, la molette) :
+//!   true, une autre fenetre de Logic couvre celle du plugin a cet endroit, et le geste n'y est pas passe.
+//!   (12 nov.) hello porte {"surface": {available, allowed, ports, online}} (la surface Mackie Control de Logic Pro :
+//!   sur un Mac ; permise par « mackie on » ; ses ports, ouverts seulement arme ; Logic branche) ; puis
+//!   {"type":"surface", …les memes} a chaque changement. Rien de Logic dedans : envoye meme desarme.
 //!   (9 nov., audit F1) l'armement : hello porte {"arming": true, "armed": bool, "unpair": true} ; puis
 //!   {"type":"armed","armed":bool} a chaque changement. Desarme, « watch » repond unwatched {code:"disarmed", reason},
 //!   « input » inputack {ok:false, error}, « audio start » audio {state:"off", code:"disarmed", error} ; desarmer
@@ -126,6 +146,13 @@ pub enum ClientMsg {
     View { view: String },
     /// (11 nov., discord.rs) set : montrer ce titre sur Discord ; clear : l'effacer ; state : l'etat seulement
     Presence { action: String, track: Option<crate::discord::RawTrack> },
+    /// (12 nov., mcu.rs) la table de Logic Pro par la surface Mackie Control → mixer, puis ses changements
+    Mixer,
+    /// (12 nov., mcu.rs) presser Play ou Stop sur Logic Pro, par la surface : arme seulement → transport
+    Transport { action: String },
+    /// (12 nov., mcu.rs) les 8 tranches precedentes (left) ou suivantes (right) de Logic Pro : BANK ◀ / ▶ sur la
+    /// surface ; les memes regles que transport → bank
+    Bank { dir: String },
 }
 
 /// (25 oct.) Un morceau SysEx du lien, en hexadecimal : F0 7D 55 57 … F7, 210 octets au plus (l'en-tete et 200
@@ -418,6 +445,13 @@ mod tests {
         // (11 nov.) l'affichage d'une fenetre de Logic Pro
         assert_eq!(parse(r#"{"type":"view","view":"controls"}"#), Ok(ClientMsg::View { view: "controls".into() }));
         assert!(parse(r#"{"type":"view"}"#).is_err());
+        // (12 nov.) la surface Mackie Control de Logic Pro
+        assert_eq!(parse(r#"{"type":"mixer"}"#), Ok(ClientMsg::Mixer));
+        assert_eq!(parse(r#"{"type":"transport","action":"play"}"#), Ok(ClientMsg::Transport { action: "play".into() }));
+        assert!(parse(r#"{"type":"transport"}"#).is_err(), "an action is needed");
+        assert!(parse(r#"{"type":"transport","action":5}"#).is_err());
+        assert_eq!(parse(r#"{"type":"bank","dir":"right"}"#), Ok(ClientMsg::Bank { dir: "right".into() }));
+        assert!(parse(r#"{"type":"bank"}"#).is_err(), "a direction is needed");
         assert!(parse(r#"{"type":"link","sysex":[1,2]}"#).is_err());
         assert!(!link_chunk_ok("f07d55570101010001"), "too short");
         assert!(link_chunk_ok("F07D555701010100017b7df7"));

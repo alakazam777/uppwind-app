@@ -32,6 +32,10 @@
 //! Vu sur macOS 26 : la liste des ports d'un processus reste celle de son premier appel a CoreMIDI, sauf s'il a un
 //! client et fait tourner la boucle du fil de ce client (CFRunLoop) : `open` le fait pendant son attente (Watch).
 //! *(a tester dans un vrai DAW)* : FL Studio pour Mac garde-t-il les ports apres un redemarrage du compagnon, sans Refresh.
+//!
+//! (12 nov.) Le port de la surface Mackie Control pour Logic Pro, « Uppwind Link MCU », n'est PAS au gardien : deux
+//! points qui ne bouclent pas, ouverts par le compagnon lui-meme quand il est arme (mcu_port.rs). Le gardien refuse ce
+//! nom ; la surface refuse les noms de PORTS.
 
 #![allow(non_upper_case_globals)]
 
@@ -44,28 +48,29 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-type MIDIObjectRef = u32;
-type OSStatus = i32;
-type CFStringRef = *const c_void;
-type NotifyProc = extern "C" fn(*const c_void, *mut c_void);
+// (12 nov.) partages avec mcu_port.rs (la surface Mackie Control : deux points qui ne bouclent pas)
+pub(crate) type MIDIObjectRef = u32;
+pub(crate) type OSStatus = i32;
+pub(crate) type CFStringRef = *const c_void;
+pub(crate) type NotifyProc = extern "C" fn(*const c_void, *mut c_void);
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, enc: u32) -> CFStringRef;
-    fn CFRelease(o: *const c_void);
+    pub(crate) fn CFRelease(o: *const c_void);
     static kCFRunLoopDefaultMode: CFStringRef;
     fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: u8) -> i32;
 }
 
 #[link(name = "CoreMIDI", kind = "framework")]
 extern "C" {
-    static kMIDIPropertyUniqueID: CFStringRef;
-    fn MIDIClientCreate(name: CFStringRef, notify: Option<NotifyProc>, refcon: *mut c_void, out: *mut MIDIObjectRef) -> OSStatus;
-    fn MIDIClientDispose(client: MIDIObjectRef) -> OSStatus;
-    fn MIDISourceCreate(client: MIDIObjectRef, name: CFStringRef, out: *mut MIDIObjectRef) -> OSStatus;
-    fn MIDIDestinationCreate(client: MIDIObjectRef, name: CFStringRef, read: extern "C" fn(*const c_void, *mut c_void, *mut c_void), refcon: *mut c_void, out: *mut MIDIObjectRef) -> OSStatus;
-    fn MIDIReceived(src: MIDIObjectRef, list: *const c_void) -> OSStatus;
-    fn MIDIObjectSetIntegerProperty(obj: MIDIObjectRef, prop: CFStringRef, v: i32) -> OSStatus;
+    pub(crate) static kMIDIPropertyUniqueID: CFStringRef;
+    pub(crate) fn MIDIClientCreate(name: CFStringRef, notify: Option<NotifyProc>, refcon: *mut c_void, out: *mut MIDIObjectRef) -> OSStatus;
+    pub(crate) fn MIDIClientDispose(client: MIDIObjectRef) -> OSStatus;
+    pub(crate) fn MIDISourceCreate(client: MIDIObjectRef, name: CFStringRef, out: *mut MIDIObjectRef) -> OSStatus;
+    pub(crate) fn MIDIDestinationCreate(client: MIDIObjectRef, name: CFStringRef, read: extern "C" fn(*const c_void, *mut c_void, *mut c_void), refcon: *mut c_void, out: *mut MIDIObjectRef) -> OSStatus;
+    pub(crate) fn MIDIReceived(src: MIDIObjectRef, list: *const c_void) -> OSStatus;
+    pub(crate) fn MIDIObjectSetIntegerProperty(obj: MIDIObjectRef, prop: CFStringRef, v: i32) -> OSStatus;
     static kMIDIPropertyDisplayName: CFStringRef;
     static kMIDIPropertyName: CFStringRef;
     fn MIDIObjectGetStringProperty(obj: MIDIObjectRef, prop: CFStringRef, out: *mut CFStringRef) -> OSStatus;
@@ -73,6 +78,10 @@ extern "C" {
     fn MIDIGetSource(i: usize) -> MIDIObjectRef;
     fn MIDIGetNumberOfDestinations() -> usize;
     fn MIDIGetDestination(i: usize) -> MIDIObjectRef;
+    // (12 nov.) la surface Mackie Control (mcu_port.rs) : ses points se defont au desarmement ; ses messages vers Logic
+    pub(crate) fn MIDIEndpointDispose(endpt: MIDIObjectRef) -> OSStatus;
+    pub(crate) fn MIDIPacketListInit(list: *mut c_void) -> *mut c_void;
+    pub(crate) fn MIDIPacketListAdd(list: *mut c_void, size: usize, cur: *mut c_void, time: u64, n: usize, data: *const u8) -> *mut c_void;
 }
 
 // la libc (libSystem) : ce que le gardien fait de son processus
@@ -159,7 +168,7 @@ pub fn unique_id(name: &str, end: &str) -> i32 {
     ((h & 0x3fff_ffff) | 0x1000_0000) as i32
 }
 
-fn cf(s: &str) -> CFStringRef {
+pub(crate) fn cf(s: &str) -> CFStringRef {
     let c = std::ffi::CString::new(s).unwrap_or_default();
     unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), UTF8) }
 }
@@ -244,6 +253,11 @@ fn names_from(raw: &[String]) -> Result<Option<Vec<String>>, String> {
     let names: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
     if names.len() > 8 || names.iter().any(|n| n.is_empty() || n.contains('\0')) {
         return Err("--names: 1 to 8 port names, separated by commas, none empty".into());
+    }
+    // (12 nov.) jamais le port de la surface Mackie Control : le gardien en ferait une boucle, et Logic recevrait ses
+    // propres voyants comme des pressions de boutons (mcu_port.rs)
+    if names.iter().any(|n| n.eq_ignore_ascii_case(crate::mcu::PORT_NAME)) {
+        return Err(format!("--names: never \"{}\" (the Mackie Control surface's port is never a loop)", crate::mcu::PORT_NAME));
     }
     let mut d = names.clone();
     d.sort();
@@ -872,6 +886,9 @@ mod tests {
         assert!(names_from(&s(&["--names", "--sandbox"])).is_err());
         assert!(names_from(&s(&["--names", "A,,B"])).is_err());
         assert!(names_from(&s(&["--names", "A,A"])).is_err());
+        // (12 nov.) jamais le port de la surface Mackie Control (une boucle renverrait a Logic ses propres voyants)
+        assert!(names_from(&s(&[KEEPER_FLAG, "--names", "UWL Test A,Uppwind Link MCU"])).is_err());
+        assert!(names_from(&s(&[KEEPER_FLAG, "--names", "uppwind link mcu"])).is_err());
         assert!(is_default(&default_names()) && !is_default(&s(&["UWL Test A", "UWL Test A Back"])));
     }
 
