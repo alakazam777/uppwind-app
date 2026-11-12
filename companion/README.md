@@ -1,6 +1,6 @@
 # Uppwind Link companion
 
-A small Windows program that lets [Uppwind Studio](https://uppwind.lucasmoreau.fr/atelier) (a web page) work with the DAW on the same computer:
+A small Windows program that lets [Uppwind Studio](https://beta.uppwind.com/atelier) (a web page) work with the DAW on the same computer:
 
 - **Plugin windows.** It finds the windows of the plugins open in Ableton Live, streams the one the studio shows (JPEG frames, only the changed part while you play), and passes your clicks, drags, wheel and keys back to that window.
 - **The DAW's sound, without a virtual cable.** It captures the sound of Ableton Live or FL Studio only (Windows' per-process loopback, the DAW and the plugins it runs) and streams it to the studio in 5 ms packets.
@@ -67,7 +67,8 @@ uppwind-companion.exe --self-update [--show]   (started by the status window's U
 uppwind-companion.exe --install                 copy to %LOCALAPPDATA%\Uppwind Link\ and add the Start Menu shortcut
 uppwind-companion.exe --autostart on            start with Windows, minimized (add --background: no window)
 uppwind-companion.exe --autostart off
-uppwind-companion.exe --stop                    stop the one with the icon, else the companion named in the state file (only an uppwind-companion*.exe)
+uppwind-companion.exe --stop                    stop the one with the icon, else the companion named in the state file (only an uppwind-companion*.exe),
+                                                then those started in a console; with --sandbox DIR, only the companion of DIR
 uppwind-companion.exe --pairing-code            print the pairing code (a background companion never logs it)
 uppwind-companion.exe --uninstall [--quiet]     see above
 uppwind-companion.exe --install-plugins         the Uppwind Link plugins (--dry-run: what it would do and the SHA-256 of the files

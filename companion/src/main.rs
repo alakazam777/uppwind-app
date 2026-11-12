@@ -807,9 +807,14 @@ fn main() {
             }
         }
         // (27 oct.) et ceux lances en console, qui ne prennent pas le verrou de l'icone
-        for m in install::stop_others() {
-            stopped |= m.starts_with("Stopped");
-            println!("{m}");
+        // (12 nov.) sauf en bac a sable (stops_other_companions)
+        if stops_other_companions(wizard::sandbox()) {
+            for m in install::stop_others() {
+                stopped |= m.starts_with("Stopped");
+                println!("{m}");
+            }
+        } else {
+            println!("Sandbox: the other companions of this Windows session are left running.");
         }
         std::process::exit(if stopped { 0 } else { 1 });
     }
@@ -1108,10 +1113,23 @@ fn main() {
     session::serve(listener, shared, session::MAX_CONNECTIONS);
 }
 
+/// (12 nov.) `--stop` arrete aussi les compagnons lances en console (install::stop_others), sauf en bac a sable :
+/// `--stop --sandbox DIR` n'arrete que le compagnon de ce dossier (son icone, son fichier d'etat). Avant, il arretait
+/// tous les autres de la session Windows, le compagnon installe de l'utilisateur compris (le 11 nov., pendant un essai).
+fn stops_other_companions(sandbox: Option<&std::path::Path>) -> bool {
+    sandbox.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn stop_in_a_sandbox_leaves_the_other_companions_running() {
+        assert!(stops_other_companions(None), "outside a sandbox, --stop also stops the companions started in a console");
+        assert!(!stops_other_companions(Some(Path::new(r"E:\tmp\bac"))), "--stop --sandbox DIR stops only the companion of DIR");
+    }
 
     #[test]
     fn the_pairing_code_comes_from_the_state_file() {
