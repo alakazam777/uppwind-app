@@ -9,8 +9,11 @@
 # by Apple (notarytool, which covers the bundle too) and stapled. The result is a workflow artifact
 # "uppwind-companion-macos" (the .dmg and its SHA-256); this workflow never publishes a release itself.
 #
-# Secrets (repository secrets, passed by the caller): MACOS_CERT_P12_BASE64 (the .p12 export of the certificate and
-# its key, base64), MACOS_CERT_PASSWORD, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (an app-specific password).
+# Secrets: MACOS_CERT_P12_BASE64 (the .p12 export of the certificate and its key, base64), MACOS_CERT_PASSWORD,
+# APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (an app-specific password). (13 Nov) They live in the "release"
+# environment, which waits for Lucas's approval before the job starts: a pushed branch or a stolen token can no
+# longer get a build signed by Apple on its own. The job names that environment, so its secrets win over any
+# value the caller passes (the caller still passes the repository ones until they are deleted).
 # They reach only the steps that use them, never a command line that is printed; the certificate lives in a
 # keychain made for this job (random password) and deleted at the end, whatever happens.
 name: macos-build
@@ -40,6 +43,7 @@ env:
 jobs:
   macos:
     name: macOS companion (universal, Developer ID, notarized)
+    environment: release
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
