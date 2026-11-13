@@ -21,11 +21,13 @@ use std::time::{Duration, Instant};
 use uwl_proto::auth;
 
 /// L'origine du studio en ligne (/atelier) : la seule que le compagnon accepte par defaut.
-pub const PROD_ORIGIN: &str = "https://uppwind.lucasmoreau.fr";
+pub const PROD_ORIGIN: &str = "https://beta.uppwind.com";
 /// (11 nov. 2026) Le meme site sous un autre nom : beta.uppwind.com (le meme serveur, qui suit le nom principal en cas
 /// de bascule). Acceptee avec le studio en ligne, seulement quand ce compagnon est celui du site (pas un studio a
 /// part, `UPPWIND_STUDIO_ORIGIN` ou --studio-origin). Le localStorage est par origine : on s'appaire sur chacune.
-pub const PROD_ALIASES: &[&str] = &["https://beta.uppwind.com"];
+/// (13 nov. 2026) L'ancien nom, beta.uppwind.com, est ferme : beta.uppwind.com est l'origine du studio, et il
+/// n'y a plus d'autre nom. La liste reste pour le jour ou le site passera sous uppwind.com.
+pub const PROD_ALIASES: &[&str] = &[];
 /// Les ports des serveurs de dev du studio : 5174 (un serveur de dev local), 5747 (les essais et tests du compagnon).
 /// Acceptes seulement avec --dev-origins (audit de publication : jamais par defaut dans un exe public).
 pub const DEV_PORTS: &[u16] = &[5174, 5747];
@@ -332,19 +334,20 @@ mod tests {
     #[test]
     fn origin_must_be_in_the_allowlist() {
         let a = Allowlist::new(true, &[]);
-        assert!(a.allows(Some("https://uppwind.lucasmoreau.fr")));
-        assert!(a.allows(Some("HTTPS://Uppwind.LucasMoreau.fr")), "case does not matter");
+        assert!(a.allows(Some("https://beta.uppwind.com")));
+        assert!(a.allows(Some("HTTPS://Beta.Uppwind.COM")), "case does not matter");
         assert!(a.allows(Some("http://localhost:5747")));
         assert!(a.allows(Some("http://127.0.0.1:5174")));
-        assert!(!a.allows(Some("http://uppwind.lucasmoreau.fr")), "http is not the studio");
-        assert!(!a.allows(Some("https://uppwind.lucasmoreau.fr.evil.example")));
+        assert!(!a.allows(Some("http://beta.uppwind.com")), "http is not the studio");
+        assert!(!a.allows(Some("https://beta.uppwind.com.evil.example")));
         assert!(!a.allows(Some("https://evil.example")));
         assert!(!a.allows(Some("http://localhost:8080")), "not a dev port");
         assert!(!a.allows(Some("null")), "file:// or a sandboxed iframe");
         assert!(!a.allows(Some("")));
         assert!(!a.allows(None), "no Origin (a local program)");
         let prod = Allowlist::new(false, &[]);
-        assert!(prod.allows(Some("https://uppwind.lucasmoreau.fr")));
+        assert!(prod.allows(Some("https://beta.uppwind.com")));
+        assert!(!prod.allows(Some("https://uppwind.lucasmoreau.fr")), "the old name is closed (13 Nov 2026)");
         assert!(!prod.allows(Some("http://localhost:5747")), "dev origins off");
         let extra = Allowlist::new(false, &["http://localhost:9999/".to_string()]);
         assert!(extra.allows(Some("http://localhost:9999")));
@@ -354,7 +357,7 @@ mod tests {
         assert_eq!(other.origins().len(), 1);
         let none = Allowlist::with_studio(None, false, &[]);
         assert!(none.origins().is_empty() && !none.allows(Some(PROD_ORIGIN)));
-        assert_eq!(Allowlist::new(false, &[]).origins(), &[PROD_ORIGIN.to_string(), "https://beta.uppwind.com".to_string()], "by default: the studio and its beta name, nothing else");
+        assert_eq!(Allowlist::new(false, &[]).origins(), &[PROD_ORIGIN.to_string()], "by default: the studio (beta.uppwind.com), nothing else");
         assert!(prod.allows(Some("https://beta.uppwind.com")) && !prod.allows(Some("https://uppwind.com")) && !prod.allows(Some("http://beta.uppwind.com")));
     }
 

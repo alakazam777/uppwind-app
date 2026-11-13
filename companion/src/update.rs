@@ -635,7 +635,7 @@ mod tests {
         for ok in [API_LATEST, "https://github.com/x", "https://release-assets.githubusercontent.com/github-production-release-asset/1?sig=a", "https://objects.githubusercontent.com/a"] {
             assert!(allowed_url(ok), "{ok}");
         }
-        for bad in ["http://github.com/x", "https://github.com.evil.example/x", "https://evil.example/github.com", "https://user@github.com/x", "https://github.com:444/x", "", "https://uppwind.lucasmoreau.fr/"] {
+        for bad in ["http://github.com/x", "https://github.com.evil.example/x", "https://evil.example/github.com", "https://user@github.com/x", "https://github.com:444/x", "", "https://beta.uppwind.com/"] {
             assert!(!allowed_url(bad), "{bad}");
         }
         assert!(API_LATEST.contains(OWNER_REPO) && DOWNLOAD_BASE.contains(OWNER_REPO) && RELEASES_PAGE.contains(OWNER_REPO));

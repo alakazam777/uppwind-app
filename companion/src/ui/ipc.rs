@@ -250,7 +250,7 @@ mod tests {
         assert!(parse(Page::Wizard, "not json").is_err());
         assert!(parse(Page::Wizard, r#"{"nocmd":1}"#).is_err());
         assert!(parse(Page::Wizard, &format!(r#"{{"cmd":"init","pad":"{}"}}"#, "x".repeat(MAX_LEN))).is_err(), "too long");
-        assert_eq!(Link::Studio.url(), "https://uppwind.lucasmoreau.fr/atelier");
+        assert_eq!(Link::Studio.url(), "https://beta.uppwind.com/atelier");
         assert!(!Link::Studio.url().contains('?'), "never a code in an address");
     }
 }

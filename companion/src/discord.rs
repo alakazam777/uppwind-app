@@ -42,9 +42,9 @@ pub const RETRY: Duration = Duration::from_secs(15);
 const MAX_FRAME: usize = 64 * 1024;
 
 /// Les hotes d'ou une pochette peut venir (Discord va la chercher lui-meme) : le site, sa copie R2, SoundCloud.
-pub const IMAGE_HOSTS: &[&str] = &["uppwind.lucasmoreau.fr", "beta.uppwind.com", "cdn.lucasmoreau.fr", "cdn.uppwind.com", "uppwind.com", "www.uppwind.com", ".sndcdn.com"];
+pub const IMAGE_HOSTS: &[&str] = &["beta.uppwind.com", "cdn.uppwind.com", "uppwind.com", "www.uppwind.com", ".sndcdn.com"];
 /// Les hotes vers lesquels le titre peut renvoyer.
-pub const LINK_HOSTS: &[&str] = &["uppwind.lucasmoreau.fr", "beta.uppwind.com", "uppwind.com", "www.uppwind.com", "soundcloud.com"];
+pub const LINK_HOSTS: &[&str] = &["beta.uppwind.com", "uppwind.com", "www.uppwind.com", "soundcloud.com"];
 
 /// Ce que la page envoie (« presence », protocol.rs) : des champs nommes, jamais une activite Discord toute faite.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -803,7 +803,7 @@ mod tests {
     use super::*;
 
     fn raw(title: &str) -> RawTrack {
-        RawTrack { title: title.into(), artist: Some("Uppermost".into()), album: Some("Origins".into()), cover: Some("https://uppwind.lucasmoreau.fr/covers/origins.jpg".into()), url: Some("https://uppwind.lucasmoreau.fr/?release=origins".into()), duration: Some(200.0), position: Some(20.0) }
+        RawTrack { title: title.into(), artist: Some("Uppermost".into()), album: Some("Origins".into()), cover: Some("https://beta.uppwind.com/covers/origins.jpg".into()), url: Some("https://beta.uppwind.com/?release=origins".into()), duration: Some(200.0), position: Some(20.0) }
     }
 
     #[test]
@@ -823,21 +823,23 @@ mod tests {
     #[test]
     fn only_https_urls_on_listed_hosts_pass() {
         let ok = |u: &str| https_url(u, IMAGE_HOSTS).is_some();
-        assert!(ok("https://uppwind.lucasmoreau.fr/covers/a.jpg"));
-        assert!(ok("https://cdn.lucasmoreau.fr/v/x.webp?v=2"));
+        assert!(ok("https://beta.uppwind.com/covers/a.jpg"));
+        assert!(ok("https://cdn.uppwind.com/v/x.webp?v=2"));
+        assert!(!ok("https://uppwind.lucasmoreau.fr/covers/a.jpg"), "the old name is closed (13 Nov 2026)");
+        assert!(!ok("https://cdn.lucasmoreau.fr/v/x.webp"), "the old bucket is gone");
         assert!(ok("https://i1.sndcdn.com/artworks-000-t500x500.jpg"));
         assert!(ok("https://UPPWIND.com/a.png"));
         for bad in [
-            "http://uppwind.lucasmoreau.fr/a.jpg",
+            "http://beta.uppwind.com/a.jpg",
             "https://evil.example/a.jpg",
-            "https://uppwind.lucasmoreau.fr.evil.example/a.jpg",
-            "https://evil.example/uppwind.lucasmoreau.fr/a.jpg",
-            "https://uppwind.lucasmoreau.fr@evil.example/a.jpg",
-            "https://uppwind.lucasmoreau.fr:8443/a.jpg",
+            "https://beta.uppwind.com.evil.example/a.jpg",
+            "https://evil.example/beta.uppwind.com/a.jpg",
+            "https://beta.uppwind.com@evil.example/a.jpg",
+            "https://beta.uppwind.com:8443/a.jpg",
             "https://sndcdn.com/a.jpg",
             "https://evilsndcdn.com/a.jpg",
-            "https://uppwind.lucasmoreau.fr/a b.jpg",
-            "https://uppwind.lucasmoreau.fr/a\".jpg",
+            "https://beta.uppwind.com/a b.jpg",
+            "https://beta.uppwind.com/a\".jpg",
             "javascript:alert(1)",
             "/covers/a.jpg",
             "",
@@ -860,9 +862,9 @@ mod tests {
         assert_eq!(a["state"], "Uppermost");
         assert_eq!(a["timestamps"]["start"], 1_700_000_080_000u64);
         assert_eq!(a["timestamps"]["end"], 1_700_000_280_000u64);
-        assert_eq!(a["assets"]["large_image"], "https://uppwind.lucasmoreau.fr/covers/origins.jpg");
+        assert_eq!(a["assets"]["large_image"], "https://beta.uppwind.com/covers/origins.jpg");
         assert_eq!(a["assets"]["large_text"], "Origins");
-        assert_eq!(a["details_url"], "https://uppwind.lucasmoreau.fr/?release=origins");
+        assert_eq!(a["details_url"], "https://beta.uppwind.com/?release=origins");
         // une radio : pas de fin ; une adresse refusee : omise, le reste passe
         let r = Track::from_raw(&RawTrack { title: "Uppwind Radio".into(), cover: Some("https://evil.example/x.png".into()), url: Some("https://evil.example/".into()), duration: Some(0.0), ..Default::default() }, 5_000).unwrap();
         let a = r.activity();

@@ -531,7 +531,7 @@ fn run_play(a: &[String]) -> Result<(), String> {
     if st["pluginPort"].is_null() {
         return Err("this companion does not take plugins: start the new companion build first".into());
     }
-    let origin = arg(a, "--origin").unwrap_or_else(|| "https://uppwind.lucasmoreau.fr".into());
+    let origin = arg(a, "--origin").unwrap_or_else(|| "https://beta.uppwind.com".into());
     let mut req = format!("ws://127.0.0.1:{port}/").into_client_request().map_err(|e| e.to_string())?;
     req.headers_mut().insert("Origin", origin.parse().map_err(|_| "bad origin")?);
     let s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("no companion on {port} ({e})"))?;
@@ -644,7 +644,7 @@ fn run_listen(a: &[String]) -> Result<(), String> {
     let st: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{}: {e} (is the companion running?)", path.display()))?).map_err(|e| e.to_string())?;
     let port = st["port"].as_u64().ok_or("no port in the state file")? as u16;
     let token = st["token"].as_str().ok_or("no token in the state file")?.to_string();
-    let origin = arg(a, "--origin").unwrap_or_else(|| "https://uppwind.lucasmoreau.fr".into());
+    let origin = arg(a, "--origin").unwrap_or_else(|| "https://beta.uppwind.com".into());
     let seconds = num(a, "--seconds", 10.0)?.clamp(1.0, 600.0);
     let target = arg(a, "--target").unwrap_or_else(|| "auto".into());
     let mut req = format!("ws://127.0.0.1:{port}/").into_client_request().map_err(|e| e.to_string())?;

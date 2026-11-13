@@ -1700,7 +1700,7 @@ mod tests {
         assert!(connect(port, &host, Some("https://evil.example")).unwrap_err().contains("403"));
         assert!(connect(port, &host, Some("http://localhost:8080")).unwrap_err().contains("403"));
         assert!(connect(port, &host, None).unwrap_err().contains("403"));
-        assert!(connect(port, &host, Some("https://uppwind.lucasmoreau.fr")).is_ok());
+        assert!(connect(port, &host, Some("https://beta.uppwind.com")).is_ok());
     }
 
     #[test]
@@ -2418,7 +2418,7 @@ mod tests {
         assert_eq!(sh.revoked.load(Ordering::SeqCst), 0, "unpair was refused");
 
         let set = json!({"type": "presence", "action": "set", "track": {"title": "Flashback", "artist": "Uppermost", "duration": 200, "position": 3,
-            "cover": "https://uppwind.lucasmoreau.fr/covers/a.jpg", "url": "https://evil.example/"}}).to_string();
+            "cover": "https://beta.uppwind.com/covers/a.jpg", "url": "https://evil.example/"}}).to_string();
         ws.send(Message::text(set.clone())).unwrap();
         let r = text_of(&mut ws, "presence");
         assert_eq!((r["code"].as_str(), r["allowed"].as_bool()), (Some("disabled"), Some(false)), "{r}");

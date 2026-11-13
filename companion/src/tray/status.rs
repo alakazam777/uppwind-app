@@ -335,7 +335,7 @@ mod tests {
     fn the_live_state_follows_the_sessions_and_the_audio_replies() {
         // l'etat global : les essais de session.rs s'y appairent aussi, en parallele ; on ne verifie que ce qu'ils ne
         // peuvent pas defaire
-        paired("https://uppwind.lucasmoreau.fr");
+        paired("https://beta.uppwind.com");
         let l = live();
         assert!(l.sessions >= 1 && l.paired_ever && l.last_paired.is_some());
         closed("x");

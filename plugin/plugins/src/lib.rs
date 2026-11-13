@@ -26,7 +26,7 @@ pub use notes::LinkNotes;
 pub use ret::LinkReturn;
 
 pub const VENDOR: &str = "Uppwind";
-pub const URL: &str = "https://uppwind.lucasmoreau.fr/atelier";
+pub const URL: &str = "https://beta.uppwind.com/atelier";
 pub const EMAIL: &str = "";
 
 nice_export_clap!(LinkReturn, LinkNotes);

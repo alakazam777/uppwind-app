@@ -151,7 +151,7 @@ fn status_model(trouble: bool) -> StatusModel {
         code: CODE.into(),
         // (9 nov., audit F1) l'apercu : desarme, un studio vient de demander (la vue la plus utile a relire)
         remote: crate::tray::status::Remote { armed: false, idle_left_min: None, asked_ago_s: Some(20), idle_disarm_min: 10 },
-        live: Live { sessions: 1, paired_ever: true, last_origin: Some("https://uppwind.lucasmoreau.fr".into()), last_paired: Some(1_792_852_800), audio_trouble: None, ..Live::default() },
+        live: Live { sessions: 1, paired_ever: true, last_origin: Some("https://beta.uppwind.com".into()), last_paired: Some(1_792_852_800), audio_trouble: None, ..Live::default() },
         daws: vec![
             DawLine {
                 daw: "ableton",
