@@ -13,7 +13,8 @@
 # APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (an app-specific password). (13 Nov) They live in the "release"
 # environment, which waits for Lucas's approval before the job starts: a pushed branch or a stolen token can no
 # longer get a build signed by Apple on its own. The job names that environment, so its secrets win over any
-# value the caller passes (13 Nov) The callers no longer pass any: the environment is the only source, and the repository has none.
+# value the caller passes (13 Nov) The callers pass them with `secrets: inherit`, which is what lets the environment's secrets
+# reach this job; once the repository's own are deleted, the environment is their only source.
 # They reach only the steps that use them, never a command line that is printed; the certificate lives in a
 # keychain made for this job (random password) and deleted at the end, whatever happens.
 name: macos-build

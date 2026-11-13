@@ -15,3 +15,6 @@ permissions:
 jobs:
   macos:
     uses: ./.github/workflows/macos-build.yml
+    # (13 Nov) inherit: without it a called workflow gets no secret at all, not even
+    # those of the "release" environment its job names (they reached it empty).
+    secrets: inherit
