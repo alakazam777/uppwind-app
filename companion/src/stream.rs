@@ -191,6 +191,10 @@ pub struct Worker {
     /// porte exactement les gestes injectes avant qu'elle soit prise (None : celui de la demande, les tests).
     latest_input: Option<Arc<AtomicU64>>,
     shown: Option<Frame>,
+    /// (19 nov.) la derniere image du plugin, sans menus, et l'empreinte de ce qui etait pose dessus (popups::signature) :
+    /// un menu qui s'ouvre, se ferme ou est garde refait l'image meme si le plugin ne s'est pas redessine
+    raw: Option<Frame>,
+    overlay: u64,
     blur: Option<Rect>,
     demo_n: u64,
     // mesures (le journal toutes les 10 s)
@@ -204,7 +208,7 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(id: u64, title: String, cap: Option<Box<dyn Capturer>>) -> Self {
-        Worker { id, title, cap, latest_input: None, shown: None, blur: None, demo_n: 0, sent: 0, tiles: 0, bytes: 0, skipped_same: 0, work: Duration::ZERO, since: Instant::now() }
+        Worker { id, title, cap, latest_input: None, shown: None, raw: None, overlay: 0, blur: None, demo_n: 0, sent: 0, tiles: 0, bytes: 0, skipped_same: 0, work: Duration::ZERO, since: Instant::now() }
     }
 
     pub fn with_latest_input(mut self, a: Arc<AtomicU64>) -> Self {
@@ -227,7 +231,19 @@ impl Worker {
                 Some(encode::synthetic(640, 400, self.demo_n))
             }
             // 21 oct. : les menus ouverts du plugin (des fenetres a part) poses sur son image
-            Some(c) => c.grab()?.map(|f| crate::popups::compose(self.id, f)),
+            Some(c) => {
+                let fresh = c.grab()?;
+                let sig = crate::popups::signature(self.id);
+                let redo = fresh.is_some() || (sig != self.overlay && self.raw.is_some());
+                self.overlay = sig;
+                if let Some(f) = fresh {
+                    self.raw = Some(f);
+                }
+                match (&self.raw, redo) {
+                    (Some(f), true) => Some(crate::popups::compose(self.id, Frame { w: f.w, h: f.h, bgra: f.bgra.clone() })),
+                    _ => None,
+                }
+            }
         };
         let Some(frame) = grabbed else { return Ok((None, self.blur.is_some())) };
         let (fw, fh) = (frame.w, frame.h);

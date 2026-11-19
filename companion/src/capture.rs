@@ -14,6 +14,7 @@
 //!
 //! Les deux rendent la ZONE CLIENT de la fenetre (sans sa barre de titre), en BGRA serre (w*4 octets par ligne).
 
+#[derive(Clone)]
 pub struct Frame {
     pub w: u32,
     pub h: u32,

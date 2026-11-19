@@ -14,6 +14,14 @@
 //!   (curseur, ordre des fenetres, Chrome au premier plan). Un clic ou un glisser est rejoue AU RELACHEMENT (tant que
 //!   le bouton est tenu, Windows donne la souris a Chrome) ; la molette tout de suite ; le survol est ignore ; le
 //!   clavier passe comme en direct.
+//!   (19 nov.) Les menus JUCE (TAL-U-NO-LX : « SINE ▾ », la barre des presets) se ferment des que le DAW n'est plus
+//!   au premier plan (le source de JUCE : `checkButtonState`, 20 fois par seconde ; mesure : 20 ms apres que Chrome a
+//!   repris la main). Le vrai clic suivant de l'utilisateur, dans Chrome, rend toujours la main a Chrome : garder le DAW
+//!   devant ne suffit pas. Un menu qui s'ouvre au geste et se ferme quand Chrome reprend la main est donc GARDE : son
+//!   image reste posee sur celle du plugin (popups::hold) ; un clic dessus rejoue, d'un seul geste et le DAW devant, le
+//!   clic qui l'a ouvert puis ce clic-la dans le menu rouvert (au moins MENU_SETTLE apres son ouverture : avant, JUCE
+//!   ne prend pas le clic). Un clic ailleurs ou Echap l'oublie (comme JUCE ferme le menu) ; la molette et les autres
+//!   touches sont refusees tant qu'il est garde (pas de clavier vers un menu sans proprietaire).
 //!
 //! Securite : l'injecteur ne vise que la fenetre suivie (verifiee par la session : une fenetre de plugin de Live ;
 //! (19 nov.) le panneau d'un plugin detache de FL Studio, jamais la barre de FL au-dessus) et
@@ -188,6 +196,35 @@ pub fn wheel_msgs(dx: f64, dy: f64, mods: u8, screen: (i32, i32)) -> Vec<WinMsg>
 /// Echap ne part donc que si un menu du plugin est ouvert (popups.rs) : il le ferme, comme avec Live.
 pub const FL_ESCAPE_REFUSED: &str = "Escape is not sent to a plugin in FL Studio unless one of its menus is open: FL Studio would close the plugin's window";
 
+/// (19 nov.) Un menu garde (mode Focus) : seuls un clic et Echap lui vont.
+pub const MENU_HELD: &str = "a menu of the plugin is open: click one of its items, or click elsewhere or press Escape to close it";
+/// (19 nov.) Au plus tant de gestes rejoues pour rouvrir un menu (un sous-menu dans un menu…).
+pub const MAX_MENU_CHAIN: usize = 4;
+/// (19 nov.) JUCE ne prend un clic dans un menu que 250 ms apres son ouverture (`windowCreationTime + 250`).
+pub const MENU_SETTLE_MS: u64 = 280;
+
+type Rect = (i32, i32, i32, i32);
+
+/// (19 nov.) Le menu rouvert est-il celui qui etait garde ? Chaque rectangle garde (par rapport a la zone client du
+/// plugin) a son pareil parmi les menus ouverts : meme taille (a 2 px pres), meme place (a 4 px pres).
+pub fn same_menus(held: &[Rect], live: &[Rect]) -> bool {
+    !held.is_empty()
+        && held.iter().all(|h| {
+            live.iter().any(|l| {
+                ((l.2 - l.0) - (h.2 - h.0)).abs() <= 2 && ((l.3 - l.1) - (h.3 - h.1)).abs() <= 2 && (l.0 - h.0).abs() <= 4 && (l.1 - h.1).abs() <= 4
+            })
+        })
+}
+
+/// Le point du premier appui d'un geste (sinon son premier point).
+pub fn first_point(steps: &[Step]) -> (i32, i32) {
+    steps
+        .iter()
+        .find_map(|s| if let Step::Down { p, .. } = s { Some(*p) } else { None })
+        .or_else(|| steps.iter().map(|s| match s { Step::Down { p, .. } | Step::Move { p } | Step::Up { p, .. } | Step::Wheel { p, .. } => *p }).next())
+        .unwrap_or((0, 0))
+}
+
 pub fn escape_refused(vk: u16, fl: bool, menu_open: bool) -> bool {
     vk == 0x1B && fl && !menu_open
 }
@@ -352,6 +389,10 @@ pub struct Injector {
     key_target: u64,
     /// FOCUS : le geste en cours, rejoue au relachement.
     pending: Vec<Step>,
+    /// (19 nov.) FOCUS : un menu garde (voir l'en-tete) — les gestes qui l'ouvrent, chacun avec les menus qu'il a
+    /// laisses ouverts (par rapport a la zone client), et la fenetre suivie a qui il est
+    held: Vec<(Vec<Step>, Vec<Rect>)>,
+    held_top: u64,
     /// macOS : le nombre de clics du dernier appui (2 apres un double clic), repris par le relachement
     #[allow(dead_code)]
     mac_clicks: i64,
@@ -385,6 +426,8 @@ impl Default for Injector {
             drag: None,
             key_target: 0,
             pending: Vec::new(),
+            held: Vec::new(),
+            held_top: 0,
             mac_clicks: 1,
             #[cfg(target_os = "macos")]
             ax: None,
@@ -537,6 +580,7 @@ impl Injector {
     pub fn forget(&mut self) {
         self.drag = None;
         self.pending.clear();
+        self.drop_held();
         #[cfg(target_os = "macos")]
         {
             self.ax = None;
@@ -544,10 +588,35 @@ impl Injector {
         }
     }
 
+    /// (19 nov.) Oublier le menu garde (son image quitte celle du plugin).
+    fn drop_held(&mut self) {
+        if self.held_top != 0 {
+            crate::popups::hold(self.held_top, Vec::new());
+        }
+        self.held.clear();
+        self.held_top = 0;
+    }
+
     /// Le geste, dans la fenetre `top` (deja verifiee par la session).
     #[cfg(windows)]
     pub fn handle(&mut self, top: u64, ev: &InputEvent) -> Result<Outcome, String> {
+        if self.held_top != 0 && (self.held_top != top || self.mode != Mode::Focus) {
+            self.drop_held();
+        }
         win::check_alive(top)?;
+        // (19 nov.) un menu garde : seuls un clic (focus_pointer) et Echap lui vont
+        if !self.held.is_empty() {
+            match ev {
+                InputEvent::Key { down, code, .. } if code == "Escape" => {
+                    if *down {
+                        self.drop_held();
+                    }
+                    return Ok(Outcome { applied: true, pointer: None });
+                }
+                InputEvent::Key { .. } | InputEvent::Text { .. } | InputEvent::Wheel { .. } => return Err(MENU_HELD.into()),
+                InputEvent::Pointer { .. } => {}
+            }
+        }
         match ev {
             InputEvent::Pointer { action, pt, button, buttons, mods } => {
                 let (cw, ch) = win::client_size(top);
@@ -579,7 +648,7 @@ impl Injector {
                 let (cw, ch) = win::client_size(top);
                 let p = map_point(pt, cw, ch);
                 if self.mode == Mode::Focus {
-                    win::focus_replay(top, &[Step::Wheel { p, dx: *dx, dy: *dy }])?;
+                    win::focus_replay(top, &[], &[Step::Wheel { p, dx: *dx, dy: *dy }], false)?;
                     return Ok(Outcome { applied: true, pointer: Some(p) });
                 }
                 let (target, _) = win::hit_with_popups(top, p);
@@ -592,6 +661,10 @@ impl Injector {
             InputEvent::Key { down, key, code, mods } => {
                 let Some((vk, ext)) = vk_of_code(code) else { return Err("this key is not sent to plugins".into()) };
                 if escape_refused(vk, win::in_fl_plugin_form(top), !crate::popups::list(top).is_empty()) {
+                    // (19 nov.) le relachement d'un Echap qui vient de fermer un menu garde : rien a dire
+                    if !*down {
+                        return Ok(Outcome { applied: false, pointer: None });
+                    }
                     return Err(FL_ESCAPE_REFUSED.into());
                 }
                 let target = win::key_target(top, self.key_target);
@@ -640,7 +713,32 @@ impl Injector {
                 }
                 // un double clic : le 1er clic arrive, le 2e suit en < 500 ms ; on attend un instant avant de rejouer
                 let steps = std::mem::take(&mut self.pending);
-                win::focus_replay(top, &steps)?;
+                if self.held.is_empty() {
+                    if let Some((rects, imgs)) = win::focus_replay(top, &[], &steps, true)? {
+                        self.held = vec![(steps, rects)];
+                        self.held_top = top;
+                        crate::popups::hold(top, imgs);
+                    }
+                    return Ok(Outcome { applied: true, pointer: Some(p) });
+                }
+                // (19 nov.) un menu garde : un clic ailleurs le ferme (comme JUCE, qui garde ce clic pour lui)
+                let in_menu = self.held.last().map(|(_, r)| crate::popups::hits(r, first_point(&steps))).unwrap_or(false);
+                if !in_menu || self.held.len() >= MAX_MENU_CHAIN {
+                    self.drop_held();
+                    return Ok(Outcome { applied: true, pointer: Some(p) });
+                }
+                let chain = self.held.clone();
+                match win::focus_replay(top, &chain, &steps, true) {
+                    Ok(Some((rects, imgs))) => {
+                        self.held.push((steps, rects));
+                        crate::popups::hold(top, imgs);
+                    }
+                    Ok(None) => self.drop_held(),
+                    Err(e) => {
+                        self.drop_held();
+                        return Err(e);
+                    }
+                }
                 Ok(Outcome { applied: true, pointer: Some(p) })
             }
         }
@@ -1292,13 +1390,81 @@ pub mod win {
         }
     }
 
+    fn class_of(w: u64) -> String {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        let mut c = [0u16; 64];
+        let n = unsafe { GetClassNameW(h(w), &mut c) }.max(0) as usize;
+        String::from_utf16_lossy(&c[..n])
+    }
+
+    /// Les menus ouverts du plugin, par rapport a l'origine de sa zone client.
+    fn menus_rel(top: u64) -> Vec<(i32, i32, i32, i32)> {
+        let o = client_to_screen(top, (0, 0));
+        crate::popups::list(top).iter().map(|p| (p.rect.0 - o.0, p.rect.1 - o.1, p.rect.2 - o.0, p.rect.3 - o.1)).collect()
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    /// Un geste avec le vrai curseur (la fenetre est deja devant) : avant chaque appui, la fenetre suivie (ou un de
+    /// ses menus) doit etre sous le point.
+    unsafe fn play(top: u64, steps: &[Step]) -> Result<(), String> {
+        // la zone client du plugin et ses menus, a l'ecran (apres l'eventuel deplacement) : un glisser n'en sort pas
+        let (cw, ch) = client_size(top);
+        let c0 = client_to_screen(top, (0, 0));
+        let client = (c0.0, c0.1, c0.0 + cw.max(1), c0.1 + ch.max(1));
+        let menus: Vec<(i32, i32, i32, i32)> = crate::popups::list(top).iter().map(|p| p.rect).collect();
+        for s in steps {
+            let p = match s { Step::Down { p, .. } | Step::Move { p } | Step::Up { p, .. } | Step::Wheel { p, .. } => *p };
+            let mut sp = client_to_screen(top, p);
+            if matches!(s, Step::Move { .. } | Step::Up { .. }) {
+                sp = super::keep_inside(sp, client, &menus);
+            }
+            let _ = SetCursorPos(sp.0, sp.1);
+            // la securite : sous le point, la fenetre suivie et rien d'autre
+            let under = id(WindowFromPoint(POINT { x: sp.0, y: sp.1 }));
+            if matches!(s, Step::Down { .. } | Step::Wheel { .. }) && !is_inside(top, under) && !in_popup(top, under) {
+                return Err("another window covers the plugin at that point: nothing clicked".to_string());
+            }
+            match s {
+                Step::Down { button, .. } => send_input(mouse(match button { 2 => MOUSEEVENTF_RIGHTDOWN, 1 => MOUSEEVENTF_MIDDLEDOWN, _ => MOUSEEVENTF_LEFTDOWN }, 0))?,
+                Step::Up { button, .. } => send_input(mouse(match button { 2 => MOUSEEVENTF_RIGHTUP, 1 => MOUSEEVENTF_MIDDLEUP, _ => MOUSEEVENTF_LEFTUP }, 0))?,
+                Step::Move { .. } => {}
+                Step::Wheel { dx, dy, .. } => {
+                    let v = wheel_delta(*dy);
+                    let hz = -wheel_delta(*dx);
+                    if v != 0 {
+                        send_input(mouse(MOUSEEVENTF_WHEEL, v))?;
+                    }
+                    if hz != 0 {
+                        send_input(mouse(MOUSEEVENTF_HWHEEL, hz))?;
+                    }
+                }
+            }
+            std::thread::sleep(ms(if matches!(s, Step::Move { .. }) { 4 } else { 12 }));
+        }
+        Ok(())
+    }
+
     /// Rejouer un geste avec le vrai curseur, puis tout remettre. Effets visibles : la fenetre du plugin passe devant
     /// Chrome le temps du geste (quelques dizaines de ms), Live est active puis Chrome reprend la main.
-    pub fn focus_replay(top: u64, steps: &[Step]) -> Result<(), String> {
+    /// (19 nov.) Les menus (voir l'en-tete) : `chain` rejoue d'abord les gestes qui ouvrent un menu garde, chacun dans
+    /// le menu rouvert par le precedent (le meme, MENU_SETTLE_MS apres son ouverture), puis `steps`. Avec `menus`,
+    /// rend les menus que le geste laisse ouverts s'ils se ferment des que Chrome reprend la main (leur place par
+    /// rapport a la zone client, leur image) : a garder. Un menu qui reste ouvert (Qt, possede par le plugin) n'est
+    /// pas garde : il se clique comme avant.
+    #[allow(clippy::type_complexity)]
+    pub fn focus_replay(
+        top: u64,
+        chain: &[(Vec<Step>, Vec<(i32, i32, i32, i32)>)],
+        steps: &[Step],
+        menus: bool,
+    ) -> Result<Option<(Vec<(i32, i32, i32, i32)>, Vec<crate::popups::Held>)>, String> {
         // le vrai bouton doit etre relache (sinon Windows donne la souris a Chrome)
         let t0 = std::time::Instant::now();
-        while buttons_held() && t0.elapsed() < std::time::Duration::from_millis(600) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        while buttons_held() && t0.elapsed() < ms(600) {
+            std::thread::sleep(ms(5));
         }
         unsafe {
             let saved_fg = GetForegroundWindow();
@@ -1310,7 +1476,7 @@ pub mod win {
             let mut wr = RECT::default();
             let _ = GetWindowRect(h(root), &mut wr);
             // le point vise doit etre a l'ecran : sinon on amene la fenetre sous le curseur, le temps du geste
-            let first = steps.iter().map(|s| match s { Step::Down { p, .. } | Step::Move { p } | Step::Up { p, .. } | Step::Wheel { p, .. } => *p }).next().unwrap_or((0, 0));
+            let first = super::first_point(chain.first().map(|c| c.0.as_slice()).unwrap_or(steps));
             let sp = client_to_screen(top, first);
             let moved = MonitorFromPoint(POINT { x: sp.0, y: sp.1 }, MONITOR_DEFAULTTONULL).is_invalid();
             if moved {
@@ -1319,60 +1485,79 @@ pub mod win {
             let _ = SetWindowPos(h(root), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             // (19 nov.) mesure sur FL Studio : 80 ms apres, la fenetre n'etait pas encore devant (la fenetre de FL
             // l'etait au point vise) ; a 200 ms, si. On attend qu'elle y soit, 300 ms au plus, avant la verification
-            // de securite plus bas (qui refuse le clic si une autre fenetre est sous le point)
+            // de securite (play) qui refuse le clic si une autre fenetre est sous le point
             let first_screen = client_to_screen(top, first);
             let t_up = std::time::Instant::now();
-            while t_up.elapsed() < std::time::Duration::from_millis(300) {
+            while t_up.elapsed() < ms(300) {
                 let under = id(WindowFromPoint(POINT { x: first_screen.0, y: first_screen.1 }));
                 if is_inside(top, under) || in_popup(top, under) {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(ms(10));
             }
-            // la zone client du plugin et ses menus, a l'ecran (apres l'eventuel deplacement) : un glisser n'en sort pas
-            let (cw, ch) = client_size(top);
-            let c0 = client_to_screen(top, (0, 0));
-            let client = (c0.0, c0.1, c0.0 + cw.max(1), c0.1 + ch.max(1));
-            let menus: Vec<(i32, i32, i32, i32)> = crate::popups::list(top).iter().map(|p| p.rect).collect();
-            let mut result = Ok(());
-            for s in steps {
-                let p = match s { Step::Down { p, .. } | Step::Move { p } | Step::Up { p, .. } | Step::Wheel { p, .. } => *p };
-                let mut sp = client_to_screen(top, p);
-                if matches!(s, Step::Move { .. } | Step::Up { .. }) {
-                    sp = super::keep_inside(sp, client, &menus);
-                }
-                let _ = SetCursorPos(sp.0, sp.1);
-                // la securite : sous le point, la fenetre suivie et rien d'autre
-                let under = id(WindowFromPoint(POINT { x: sp.0, y: sp.1 }));
-                if matches!(s, Step::Down { .. } | Step::Wheel { .. }) && !is_inside(top, under) && !in_popup(top, under) {
-                    result = Err("another window covers the plugin at that point: nothing clicked".to_string());
-                    break;
-                }
-                let r = match s {
-                    Step::Down { button, .. } => send_input(mouse(match button { 2 => MOUSEEVENTF_RIGHTDOWN, 1 => MOUSEEVENTF_MIDDLEDOWN, _ => MOUSEEVENTF_LEFTDOWN }, 0)),
-                    Step::Up { button, .. } => send_input(mouse(match button { 2 => MOUSEEVENTF_RIGHTUP, 1 => MOUSEEVENTF_MIDDLEUP, _ => MOUSEEVENTF_LEFTUP }, 0)),
-                    Step::Move { .. } => Ok(()),
-                    Step::Wheel { dx, dy, .. } => {
-                        let v = wheel_delta(*dy);
-                        let hz = -wheel_delta(*dx);
-                        let mut r = Ok(());
-                        if v != 0 {
-                            r = send_input(mouse(MOUSEEVENTF_WHEEL, v));
+            let mut result = Ok(None);
+            let mut held: Vec<crate::popups::Held> = Vec::new();
+            let mut held_rects = Vec::new();
+            'gestures: for (i, g) in chain.iter().map(|c| c.0.as_slice()).chain(std::iter::once(steps)).enumerate() {
+                if i > 0 {
+                    // le menu ouvert par le geste precedent doit etre la, le meme, depuis MENU_SETTLE_MS
+                    let want = &chain[i - 1].1;
+                    let t = std::time::Instant::now();
+                    let mut seen: Option<std::time::Instant> = None;
+                    while t.elapsed() < ms(1000) {
+                        if super::same_menus(want, &menus_rel(top)) {
+                            let s = *seen.get_or_insert_with(std::time::Instant::now);
+                            if s.elapsed() >= ms(super::MENU_SETTLE_MS) {
+                                break;
+                            }
+                        } else {
+                            seen = None;
                         }
-                        if hz != 0 && r.is_ok() {
-                            r = send_input(mouse(MOUSEEVENTF_HWHEEL, hz));
-                        }
-                        r
+                        std::thread::sleep(ms(10));
                     }
-                };
-                if let Err(e) = r {
-                    result = Err(e);
-                    break;
+                    if seen.map(|s| s.elapsed() < ms(super::MENU_SETTLE_MS)).unwrap_or(true) {
+                        result = Err("the plugin's menu did not open again the same way: nothing clicked in it (open the menu again)".to_string());
+                        break 'gestures;
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(if matches!(s, Step::Move { .. }) { 4 } else { 12 }));
+                let before: Vec<u64> = crate::popups::list(top).iter().map(|p| p.id).collect();
+                let last = i == chain.len();
+                // (19 nov.) mesure sur TAL-U-NO-LX dans FL : son menu s'ouvre 90 a 240 ms apres le clic
+                let wait = if !last || !menus || !steps.iter().any(|s| matches!(s, Step::Down { .. })) {
+                    0
+                } else if !chain.is_empty() {
+                    350 // un clic dans un menu rouvert : il se ferme (l'element est pris) ou un sous-menu s'ouvre
+                } else if class_of(id(WindowFromPoint(POINT { x: first_screen.0, y: first_screen.1 }))).starts_with("JUCE_") {
+                    300
+                } else {
+                    60
+                };
+                if let Err(e) = play(top, g) {
+                    result = Err(e);
+                    break 'gestures;
+                }
+                if wait > 0 {
+                    let t = std::time::Instant::now();
+                    let mut done = false;
+                    while t.elapsed() < ms(wait) {
+                        let now = crate::popups::list(top);
+                        done = if chain.is_empty() { now.iter().any(|p| !before.contains(&p.id)) } else { now.is_empty() };
+                        if done {
+                            break;
+                        }
+                        std::thread::sleep(ms(10));
+                    }
+                    let open = crate::popups::list(top);
+                    // garder seulement un menu sans proprietaire (JUCE) : un menu possede (Qt) reste ouvert sans aide
+                    if !open.is_empty() && open.iter().any(|p| !p.owned) && (!chain.is_empty() || done) {
+                        std::thread::sleep(ms(80)); // qu'il soit dessine
+                        held = crate::popups::grab_held(top);
+                        held_rects = held.iter().map(|h| h.rel).collect();
+                    }
+                }
             }
             // tout remettre
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::thread::sleep(ms(30));
             let _ = SetWindowPos(h(root), Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             if moved {
                 let _ = SetWindowPos(h(root), None, wr.left, wr.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1380,6 +1565,16 @@ pub mod win {
             let _ = SetCursorPos(saved_cur.x, saved_cur.y);
             if !saved_fg.is_invalid() {
                 force_foreground(id(saved_fg));
+            }
+            if result.is_ok() && !held.is_empty() {
+                // il se ferme quand Chrome reprend la main (20 ms mesures) : on le garde ; sinon il reste ouvert
+                let t = std::time::Instant::now();
+                while t.elapsed() < ms(250) && !crate::popups::list(top).is_empty() {
+                    std::thread::sleep(ms(10));
+                }
+                if crate::popups::list(top).is_empty() {
+                    result = Ok(Some((held_rects, held)));
+                }
             }
             result
         }
@@ -1396,6 +1591,80 @@ mod window_tests {
     fn at(x: f64, y: f64) -> Pt {
         Pt { x, y, iw: Some(testwin::CLIENT_W as f64), ih: Some(testwin::CLIENT_H as f64) }
     }
+
+    /// (19 nov.) L'essai sur un VRAI plugin JUCE (deplace le vrai curseur : jamais lance par defaut). UWC_REAL_TOP = la
+    /// fenetre suivie (hex), UWC_REAL_OPEN / UWC_REAL_ITEM = le bouton du menu et l'element, en pixels de sa zone client
+    /// (« x,y »). Ouvre le menu (il doit etre garde), clique l'element (il doit etre pris : plus rien de garde).
+    #[test]
+    #[ignore]
+    fn real_juce_menu_is_held_then_clicked() {
+        let top = u64::from_str_radix(&std::env::var("UWC_REAL_TOP").expect("UWC_REAL_TOP"), 16).unwrap();
+        let xy = |k: &str| -> (f64, f64) {
+            let v = std::env::var(k).expect(k);
+            let (a, b) = v.split_once(',').unwrap();
+            (a.trim().parse().unwrap(), b.trim().parse().unwrap())
+        };
+        let pt = |(x, y): (f64, f64)| Pt { x, y, iw: None, ih: None };
+        let click = |inj: &mut Injector, p: (f64, f64)| {
+            inj.handle(top, &InputEvent::Pointer { action: PointerAction::Down, pt: pt(p), button: 0, buttons: 1, mods: 0 }).unwrap();
+            inj.handle(top, &InputEvent::Pointer { action: PointerAction::Up, pt: pt(p), button: 0, buttons: 0, mods: 0 })
+        };
+        let mut inj = Injector::default();
+        inj.set_mode(Mode::Focus);
+        let t = Instant::now();
+        click(&mut inj, xy("UWC_REAL_OPEN")).unwrap();
+        eprintln!("open: {:?}, held {:?}", t.elapsed(), inj.held.iter().map(|h| h.1.clone()).collect::<Vec<_>>());
+        assert_eq!(inj.held.len(), 1, "the menu is held");
+        assert!(crate::popups::list(top).is_empty(), "the real menu closed once Chrome had the foreground back");
+        // UWC_REAL_SUB : un element qui ouvre un sous-menu (garde avec son menu), puis un clic hors des menus (oublie)
+        if std::env::var("UWC_REAL_SUB").is_ok() {
+            let t = Instant::now();
+            click(&mut inj, xy("UWC_REAL_SUB")).unwrap();
+            eprintln!("sub: {:?}, held {:?}", t.elapsed(), inj.held.iter().map(|h| h.1.clone()).collect::<Vec<_>>());
+            assert_eq!(inj.held.len(), 2, "the submenu is held with its menu");
+            assert_eq!(inj.held[1].1.len(), 2);
+        }
+        let t = Instant::now();
+        let r = click(&mut inj, xy("UWC_REAL_ITEM"));
+        eprintln!("item: {:?} {:?}, held {}", t.elapsed(), r.as_ref().map(|o| o.applied), inj.held.len());
+        r.unwrap();
+        assert!(inj.held.is_empty(), "the item was taken (or a click outside closed the menu): nothing held");
+    }
+
+    /// (19 nov.) un menu garde (mode Focus) : la molette, le texte et les touches sont refuses (pas de clavier vers un
+    /// menu sans proprietaire), Echap l'oublie (son image quitte celle du plugin), un autre mode ou une autre fenetre
+    /// aussi. Rien n'est injecte : ni curseur ni clic.
+    #[test]
+    fn a_held_menu_takes_only_clicks_and_escape() {
+        let w = testwin::open((-4000, -4000)).expect("test window");
+        let top = w.top;
+        let img = || vec![crate::popups::Held { rel: (10, 10, 50, 50), img: crate::capture::Frame { w: 40, h: 40, bgra: vec![9; 40 * 40 * 4] } }];
+        let mut inj = Injector::default();
+        inj.set_mode(Mode::Focus);
+        let hold = |inj: &mut Injector| {
+            inj.held = vec![(vec![Step::Down { button: 0, p: (5, 5) }, Step::Up { button: 0, p: (5, 5) }], vec![(10, 10, 50, 50)])];
+            inj.held_top = top;
+            crate::popups::hold(top, img());
+        };
+        hold(&mut inj);
+        let key = |code: &str| InputEvent::Key { down: true, key: code.into(), code: code.into(), mods: 0 };
+        assert_eq!(inj.handle(top, &key("KeyA")).unwrap_err(), MENU_HELD);
+        assert_eq!(inj.handle(top, &InputEvent::Text { text: "a".into() }).unwrap_err(), MENU_HELD);
+        assert_eq!(inj.handle(top, &InputEvent::Wheel { pt: at(20.0, 20.0), dx: 0.0, dy: 100.0, mods: 0 }).unwrap_err(), MENU_HELD);
+        assert!(inj.handle(top, &key("Escape")).unwrap().applied);
+        assert!(inj.held.is_empty() && inj.held_top == 0);
+        assert!(testwin::received(w.knob).iter().all(|r| r.msg != WM_KEYDOWN), "nothing reached the plugin");
+        // un autre mode : oublie
+        hold(&mut inj);
+        inj.set_mode(Mode::Direct);
+        assert!(inj.held.is_empty());
+        // la fenetre n'est plus suivie : oublie
+        inj.set_mode(Mode::Focus);
+        hold(&mut inj);
+        inj.forget();
+        assert!(inj.held.is_empty() && inj.held_top == 0);
+    }
+
     fn ptr(action: PointerAction, x: f64, y: f64, button: u8, buttons: u8) -> InputEvent {
         InputEvent::Pointer { action, pt: at(x, y), button, buttons, mods: 0 }
     }
@@ -1574,6 +1843,25 @@ mod tests {
 
     /// (12 nov., option a) Ce que le dernier geste a trouve sous le pointeur (une autre fenetre de Logic ou non) n'est
     /// lu qu'une fois, par la reponse a ce geste ; un geste qui n'a rien cherche n'en dit rien.
+    /// (19 nov.) le menu rouvert est-il celui qui etait garde ? (place a 4 px, taille a 2 px pres)
+    #[test]
+    fn a_reopened_menu_must_be_the_held_one() {
+        let held = [(385, 288, 460, 392)];
+        assert!(same_menus(&held, &[(385, 288, 460, 392)]));
+        assert!(same_menus(&held, &[(10, 10, 20, 20), (388, 286, 464, 391)]));
+        assert!(!same_menus(&held, &[(385, 288, 460, 420)]), "another size: another menu");
+        assert!(!same_menus(&held, &[(395, 288, 470, 392)]), "elsewhere");
+        assert!(!same_menus(&held, &[]) && !same_menus(&[], &[(385, 288, 460, 392)]));
+        // un sous-menu garde avec son menu : les deux doivent revenir
+        let two = [(385, 288, 460, 392), (460, 300, 560, 360)];
+        assert!(!same_menus(&two, &[(385, 288, 460, 392)]));
+        assert!(same_menus(&two, &[(460, 300, 560, 360), (385, 288, 460, 392)]));
+        let g = [Step::Move { p: (1, 1) }, Step::Down { button: 0, p: (5, 6) }, Step::Up { button: 0, p: (7, 8) }];
+        assert_eq!(first_point(&g), (5, 6));
+        assert_eq!(first_point(&g[..1]), (1, 1));
+        assert_eq!(first_point(&[]), (0, 0));
+    }
+
     #[test]
     fn covered_is_read_once_and_nothing_by_default() {
         let mut inj = Injector::default();

@@ -11,6 +11,11 @@
 //! ouvrir ou enregistrer un preset, un message —, une fenetre a barre de titre, une fenetre qui contient une vue de
 //! l'Explorateur), ni ce qui en depend (le menu contextuel d'une boite « Ouvrir ») : le studio ne doit pas pouvoir
 //! parcourir des dossiers ou des fichiers par la. Le clavier ne va qu'a un menu possede par le plugin.
+//! (19 nov.) Jamais non plus une fenetre « transparente aux clics » (WS_EX_TRANSPARENT) : les ombres des menus JUCE
+//! (4 par menu, mesure sur TAL-U-NO-LX), qu'on ne peut pas cliquer, etaient prises pour des menus.
+//! (19 nov.) Les menus « gardes » (input.rs, mode Focus) : un menu JUCE se ferme des que le DAW n'est plus au premier
+//! plan (le source de JUCE : `checkButtonState`, 20 fois par seconde) ; le compagnon garde alors son image (`hold`),
+//! posee sur l'image du plugin jusqu'au geste suivant, qui le rouvre et le clique d'un seul geste.
 
 use crate::capture::Frame;
 
@@ -25,6 +30,8 @@ pub struct Cand {
     pub tool_or_topmost: bool,
     /// une barre de titre (WS_CAPTION) : une vraie fenetre, pas un menu
     pub caption: bool,
+    /// (19 nov.) transparente aux clics (WS_EX_TRANSPARENT) : une ombre, pas un menu
+    pub transparent: bool,
     pub class: String,
     pub title: String,
     /// rectangle a l'ecran (pixels physiques) : gauche, haut, droite, bas
@@ -76,6 +83,9 @@ pub fn is_plugin_popup_of(c: &Cand, top: u64, owner: u64, top_rect: (i32, i32, i
     }
     if is_window_like(c) {
         return false; // une boite de dialogue ou une fenetre a barre de titre : pas un menu
+    }
+    if c.transparent {
+        return false; // (19 nov.) une ombre de menu (JUCE) : les clics la traversent
     }
     if c.owners.contains(&top) || c.owners.contains(&owner) {
         return true;
@@ -148,8 +158,53 @@ pub fn place(popup: (i32, i32, i32, i32), client_origin: (i32, i32), scale: f64)
     (x, y, w, h)
 }
 
+// ── (19 nov.) Les menus gardes ───────────────────────────────────────────────────────────────────────────────
+/// Un menu garde : sa place par rapport a l'origine de la zone client du plugin (pixels physiques) et son image.
+#[derive(Clone)]
+pub struct Held {
+    pub rel: (i32, i32, i32, i32),
+    pub img: Frame,
+}
+
+fn held_store() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<Held>>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<Held>>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+static HELD_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Garder les menus `menus` du plugin `top` (le plus haut d'abord) ; vide : les oublier.
+pub fn hold(top: u64, menus: Vec<Held>) {
+    let mut m = held_store().lock().unwrap_or_else(|e| e.into_inner());
+    if menus.is_empty() {
+        if m.remove(&top).is_none() {
+            return;
+        }
+    } else {
+        m.insert(top, menus);
+    }
+    HELD_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn held_of(top: u64) -> Vec<Held> {
+    held_store().lock().unwrap_or_else(|e| e.into_inner()).get(&top).cloned().unwrap_or_default()
+}
+
+/// Le point `p` (zone client) tombe-t-il dans un des rectangles `rects` (memes coordonnees) ?
+pub fn hits(rects: &[(i32, i32, i32, i32)], p: (i32, i32)) -> bool {
+    rects.iter().any(|r| p.0 >= r.0 && p.0 < r.2 && p.1 >= r.1 && p.1 < r.3)
+}
+
+/// Les menus gardes poses sur l'image (`scale` : largeur de l'image / largeur physique de la zone client).
+pub fn paste_held(frame: &mut Frame, held: &[Held], scale: f64) {
+    for h in held.iter().rev() {
+        let (x, y, w, hh) = place(h.rel, (0, 0), scale);
+        let img = resize(&h.img, w, hh);
+        paste(frame, &img, x, y);
+    }
+}
+
 #[cfg(windows)]
-pub use win::{compose, list};
+pub use win::{compose, grab_held, list, signature};
 
 #[cfg(not(windows))]
 pub fn list(_top: u64) -> Vec<Popup> {
@@ -159,10 +214,16 @@ pub fn list(_top: u64) -> Vec<Popup> {
 pub fn compose(_top: u64, f: Frame) -> Frame {
     f
 }
+/// Ce qui est pose sur l'image a change (un menu ouvert ou ferme, un menu garde ou oublie) : la capture refait
+/// l'image meme si le plugin ne s'est pas redessine.
+#[cfg(not(windows))]
+pub fn signature(_top: u64) -> u64 {
+    HELD_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 #[cfg(windows)]
 mod win {
-    use super::{paste, place, resize, select_of, Cand, Popup};
+    use super::{held_of, paste, paste_held, place, resize, select_of, Cand, Held, Popup, HELD_GEN};
     use crate::capture::Frame;
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
@@ -174,7 +235,7 @@ mod win {
     const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
     fn h(id: u64) -> HWND {
@@ -235,6 +296,7 @@ mod win {
                     popup_style: style & WS_POPUP.0 != 0,
                     tool_or_topmost: ex & (WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0) != 0,
                     caption: style & WS_CAPTION.0 == WS_CAPTION.0,
+                    transparent: ex & WS_EX_TRANSPARENT.0 != 0,
                     class: String::from_utf16_lossy(&cls[..n]),
                     title: String::from_utf16_lossy(&t[..tn]),
                     rect: rect_of(w),
@@ -312,10 +374,39 @@ mod win {
         }
     }
 
+    /// (19 nov.) Une empreinte de ce qui est pose sur l'image du plugin `top` (ses menus ouverts, leur place, les menus
+    /// gardes) : quand elle change, la capture refait l'image meme si le plugin ne s'est pas redessine (stream.rs).
+    pub fn signature(top: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        HELD_GEN.load(std::sync::atomic::Ordering::SeqCst).hash(&mut s);
+        for p in list(top) {
+            (p.id, p.rect).hash(&mut s);
+        }
+        s.finish()
+    }
+
+    /// (19 nov.) Les menus ouverts du plugin a garder : leur image et leur place par rapport a l'origine de la zone
+    /// client de `top`. Vide si l'un d'eux ne se laisse pas capturer (rien a montrer de faux).
+    pub fn grab_held(top: u64) -> Vec<Held> {
+        let mut o = POINT { x: 0, y: 0 };
+        unsafe {
+            let _ = ClientToScreen(h(top), &mut o);
+        }
+        let mut out = Vec::new();
+        for p in list(top) {
+            let Some(img) = grab(&p) else { return Vec::new() };
+            out.push(Held { rel: (p.rect.0 - o.x, p.rect.1 - o.y, p.rect.2 - o.x, p.rect.3 - o.y), img });
+        }
+        out
+    }
+
     /// L'image du plugin, avec ses menus ouverts poses dessus (rien a faire sans menu : l'image revient telle quelle).
+    /// (19 nov.) Sans menu ouvert, les menus gardes (input.rs) a leur place.
     pub fn compose(top: u64, mut frame: Frame) -> Frame {
         let pops = list(top);
-        if pops.is_empty() {
+        let held = if pops.is_empty() { held_of(top) } else { Vec::new() };
+        if pops.is_empty() && held.is_empty() {
             return frame;
         }
         let mut cr = RECT::default();
@@ -326,6 +417,10 @@ mod win {
         }
         let cw = (cr.right - cr.left).max(1) as f64;
         let scale = frame.w as f64 / cw;
+        if !held.is_empty() {
+            paste_held(&mut frame, &held, scale);
+            return frame;
+        }
         // du plus bas au plus haut : le plus haut finit dessus
         for p in pops.iter().rev() {
             if let Some(img) = grab(p) {
@@ -343,7 +438,7 @@ mod tests {
     use super::*;
 
     fn cand(id: u64, owners: Vec<u64>, popup: bool, tool: bool, class: &str, title: &str, rect: (i32, i32, i32, i32)) -> Cand {
-        Cand { id, visible: true, owners, popup_style: popup, tool_or_topmost: tool, caption: false, class: class.into(), title: title.into(), rect }
+        Cand { id, visible: true, owners, popup_style: popup, tool_or_topmost: tool, caption: false, transparent: false, class: class.into(), title: title.into(), rect }
     }
 
     #[test]
@@ -409,6 +504,46 @@ mod tests {
         let got: Vec<u64> = select(&cands, top, tr).iter().map(|p| p.id).collect();
         assert_eq!(got, vec![14]);
         assert!(is_window_like(&cands[1]) && is_window_like(&cands[2]) && is_window_like(&cands[3]) && !is_window_like(&cands[4]));
+    }
+
+    /// (19 nov., mesure sur TAL-U-NO-LX dans FL) un menu JUCE : une fenetre sans proprietaire, outil et au-dessus
+    /// (ex-style 0x88), et ses 4 ombres, transparentes aux clics (0x800A8). Seul le menu est pris.
+    #[test]
+    fn juce_menu_shadows_are_not_menus() {
+        let (panel, form) = (20, 2);
+        let tr = (574, 920, 1724, 1352);
+        let shadow = |id, rect| Cand { transparent: true, ..cand(id, vec![], true, true, "JUCE_1a1f3bfba3b", "", rect) };
+        let cands = vec![
+            shadow(41, (959, 1312, 1034, 1324)),
+            shadow(42, (947, 1196, 959, 1324)),
+            shadow(43, (959, 1196, 1034, 1208)),
+            shadow(44, (1034, 1196, 1046, 1324)),
+            cand(45, vec![], true, true, "JUCE_1a1f3bfba3b", "", (959, 1208, 1034, 1312)),
+        ];
+        let got = select_of(&cands, panel, form, tr);
+        assert_eq!(got.iter().map(|p| (p.id, p.owned)).collect::<Vec<_>>(), vec![(45, false)]);
+    }
+
+    /// (19 nov.) un menu garde : pose a sa place (par rapport a la zone client), a l'echelle de l'image ; un point
+    /// tombe dedans ou non.
+    #[test]
+    fn held_menus_are_pasted_and_hit() {
+        let mut dst = Frame { w: 10, h: 8, bgra: vec![0; 10 * 8 * 4] };
+        let held = vec![Held { rel: (4, 2, 8, 6), img: Frame { w: 4, h: 4, bgra: vec![200; 4 * 4 * 4] } }];
+        paste_held(&mut dst, &held, 0.5); // l'image a la moitie de la zone client : en (2, 1), 2×2
+        let px = |f: &Frame, x: u32, y: u32| f.bgra[((y * f.w + x) * 4) as usize];
+        assert_eq!((px(&dst, 2, 1), px(&dst, 3, 2), px(&dst, 4, 1), px(&dst, 1, 1)), (200, 200, 0, 0));
+        let rects = [held[0].rel];
+        assert!(hits(&rects, (4, 2)) && hits(&rects, (7, 5)));
+        assert!(!hits(&rects, (8, 5)) && !hits(&rects, (3, 3)) && !hits(&[], (4, 2)));
+        // garder puis oublier : l'empreinte change a chaque fois, un oubli de rien ne change rien
+        let g0 = HELD_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        hold(777_001, held.clone());
+        hold(777_001, Vec::new());
+        let g1 = HELD_GEN.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(g1 >= g0 + 2);
+        hold(777_001, Vec::new());
+        assert!(held_of(777_001).is_empty());
     }
 
     #[test]
