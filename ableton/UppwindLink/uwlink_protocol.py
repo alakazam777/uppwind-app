@@ -60,11 +60,13 @@ ADDED = 0x43
 REMOVE = 0x44
 TEMPO = 0x50
 TEMPO_CHANGED = 0x51
+EDITOR = 0x60
+EDITOR_ACK = 0x61
 PING = 0x70
 PONG = 0x71
 ERROR = 0x7F
 
-CAPS = ("list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes")
+CAPS = ("list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes", "editor")
 # (25 oct.) BIND.via : 'port' (le port loopMIDI « Uppwind Link », canal n) ou 'plugin' (cap 'notes' : la piste prend
 # ses notes du plugin Uppwind Link Notes, sans port MIDI) ; BIND_ACK.via le redit, BIND_ACK.notes = le numero du Notes
 VIAS = ("port", "plugin")
@@ -156,6 +158,8 @@ COMMANDS = {
     REMOVE: ("REMOVE", "studio", None, "remove", _obj([("id", _req(_ID))])),
     TEMPO: ("TEMPO", "studio", None, "tempo", _obj([("bpm", _req(_BPM))])),
     TEMPO_CHANGED: ("TEMPO_CHANGED", "daw", None, None, _obj([("bpm", _req(_BPM))])),
+    EDITOR: ("EDITOR", "studio", EDITOR_ACK, "editor", _obj([("id", _req(_ID)), ("open", _req(_BOOL))])),
+    EDITOR_ACK: ("EDITOR_ACK", "daw", None, None, _obj([("id", _req(_ID)), ("open", _req(_BOOL))])),
     PING: ("PING", "studio", PONG, None, _obj([("t", _req(_num(-1e14, 1e14)))])),
     PONG: ("PONG", "daw", None, None, _obj([("t", _req(_num(-1e14, 1e14)))])),
     ERROR: ("ERROR", "any", None, None, _obj([("code", _req(_str(32, 1))), ("msg", _str(200))])),

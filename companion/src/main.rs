@@ -518,7 +518,7 @@ fn probe(name: &str, seconds: f64, force: Option<&str>, any: bool) -> i32 {
         wins = all
             .iter()
             .filter(|w| w.visible && !w.title.is_empty())
-            .map(|w| plugins::PluginWindow { id: w.hwnd, title: w.title.clone(), plugin: String::new(), track: String::new(), w: w.w, h: w.h, minimized: w.minimized })
+            .map(|w| plugins::PluginWindow { id: w.hwnd, title: w.title.clone(), plugin: String::new(), track: String::new(), w: w.w, h: w.h, minimized: w.minimized, host: None })
             .collect();
     }
     let needle = name.to_lowercase();

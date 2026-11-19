@@ -55,9 +55,20 @@ fn overlaps(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
     a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
 }
 
-/// La regle : `c` est-il un menu du plugin `top` (dont la fenetre est en `top_rect`) ?
+/// La regle : `c` est-il un menu du plugin `top` (dont la fenetre est en `top_rect`) ? (19 nov.) Le compagnon passe
+/// par `is_plugin_popup_of` ; celle-ci reste pour les tests (Live : `owner` = `top`).
+#[cfg(test)]
 pub fn is_plugin_popup(c: &Cand, top: u64, top_rect: (i32, i32, i32, i32)) -> bool {
-    if c.id == top || !c.visible || c.rect.2 <= c.rect.0 || c.rect.3 <= c.rect.1 {
+    is_plugin_popup_of(c, top, top, top_rect)
+}
+
+/// (19 nov.) FL Studio : `top` est le panneau du plugin, une sous-fenetre, et `owner` la fenetre detachee du plugin qui
+/// le contient. Windows donne pour proprietaire a un menu la fenetre de PREMIER NIVEAU de celle qui l'ouvre : un menu
+/// du plugin (Qt, Kontakt) est donc possede par `owner`. Mesure du 19 nov. : les menus de FL lui-meme (le menu de la
+/// fenetre, TQuickPopupMenuWindow) sont possedes par la fenetre PRINCIPALE de FL, jamais par celle du plugin : ils ne
+/// sont pas pris. Pour Live, `owner` = `top`.
+pub fn is_plugin_popup_of(c: &Cand, top: u64, owner: u64, top_rect: (i32, i32, i32, i32)) -> bool {
+    if c.id == top || c.id == owner || !c.visible || c.rect.2 <= c.rect.0 || c.rect.3 <= c.rect.1 {
         return false;
     }
     if c.class == LIVE_MAIN_CLASS || crate::plugins::split_title(&c.title).is_some() {
@@ -66,7 +77,7 @@ pub fn is_plugin_popup(c: &Cand, top: u64, top_rect: (i32, i32, i32, i32)) -> bo
     if is_window_like(c) {
         return false; // une boite de dialogue ou une fenetre a barre de titre : pas un menu
     }
-    if c.owners.contains(&top) {
+    if c.owners.contains(&top) || c.owners.contains(&owner) {
         return true;
     }
     c.popup_style && c.tool_or_topmost && c.owners.is_empty() && overlaps(c.rect, top_rect)
@@ -74,14 +85,20 @@ pub fn is_plugin_popup(c: &Cand, top: u64, top_rect: (i32, i32, i32, i32)) -> bo
 
 /// Les candidats retenus, dans l'ordre de la pile des fenetres (le plus haut d'abord). Une fenetre dont la chaine des
 /// proprietaires passe, avant le plugin, par une vraie fenetre (le menu contextuel d'une boite « Ouvrir ») est ecartee.
+#[cfg(test)]
 pub fn select(cands: &[Cand], top: u64, top_rect: (i32, i32, i32, i32)) -> Vec<Popup> {
+    select_of(cands, top, top, top_rect)
+}
+
+/// (19 nov.) `select` avec la fenetre de premier niveau du plugin (`owner`, voir `is_plugin_popup_of`).
+pub fn select_of(cands: &[Cand], top: u64, owner: u64, top_rect: (i32, i32, i32, i32)) -> Vec<Popup> {
     let windows: Vec<u64> = cands.iter().filter(|c| is_window_like(c)).map(|c| c.id).collect();
     cands
         .iter()
-        .filter(|c| is_plugin_popup(c, top, top_rect))
-        .filter(|c| !c.owners.iter().take_while(|o| **o != top).any(|o| windows.contains(o)))
+        .filter(|c| is_plugin_popup_of(c, top, owner, top_rect))
+        .filter(|c| !c.owners.iter().take_while(|o| **o != top && **o != owner).any(|o| windows.contains(o)))
         .take(MAX_POPUPS)
-        .map(|c| Popup { id: c.id, rect: c.rect, owned: c.owners.contains(&top) })
+        .map(|c| Popup { id: c.id, rect: c.rect, owned: c.owners.contains(&top) || c.owners.contains(&owner) })
         .collect()
 }
 
@@ -145,7 +162,7 @@ pub fn compose(_top: u64, f: Frame) -> Frame {
 
 #[cfg(windows)]
 mod win {
-    use super::{paste, place, resize, select, Cand, Popup};
+    use super::{paste, place, resize, select_of, Cand, Popup};
     use crate::capture::Frame;
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
@@ -248,7 +265,17 @@ mod win {
 
     /// Les menus ouverts du plugin `top`, le plus haut d'abord.
     pub fn list(top: u64) -> Vec<Popup> {
-        select(&candidates(top), top, rect_of(h(top))).into_iter().filter(|p| !hosts_shell_view(h(p.id))).collect()
+        // (19 nov.) la fenetre de premier niveau du plugin (FL Studio : `top` est le panneau, une sous-fenetre)
+        let owner = {
+            use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+            let r = id(unsafe { GetAncestor(h(top), GA_ROOT) });
+            if r == 0 {
+                top
+            } else {
+                r
+            }
+        };
+        select_of(&candidates(top), top, owner, rect_of(h(top))).into_iter().filter(|p| !hosts_shell_view(h(p.id))).collect()
     }
 
     /// L'image d'un menu (PrintWindow, toute la fenetre), recadree a sa taille logique si elle est « DPI unaware ».
@@ -340,6 +367,28 @@ mod tests {
         let mut hidden = cands[0].clone();
         hidden.visible = false;
         assert!(!is_plugin_popup(&hidden, top, tr));
+    }
+
+    /// (19 nov.) FL Studio : le studio suit le panneau (`top`, une sous-fenetre) de la fenetre detachee du plugin
+    /// (`owner`). Un menu Qt du plugin, possede par cette fenetre, est pris ; le menu de FL (possede par la fenetre
+    /// principale de FL), la fenetre principale, une autre fenetre de plugin de FL et la fenetre du plugin elle-meme non.
+    #[test]
+    fn fl_plugin_menus_are_owned_by_the_detached_window() {
+        let (panel, form, fl_main) = (20, 2, 1);
+        let tr = (423, 373, 1573, 805);
+        let cands = vec![
+            cand(form, vec![fl_main], true, false, "TPluginForm", "TAL (Master)", (415, 333, 1581, 813)),
+            cand(31, vec![form], true, true, "Qt661QWindowPopupDropShadowSaveBits", "", (600, 500, 800, 700)), // menu du plugin : oui
+            cand(32, vec![fl_main], true, true, "TQuickPopupMenuWindow", "", (418, 369, 1468, 1430)),          // menu de FL : non
+            cand(fl_main, vec![], true, false, "TFruityLoopsMainForm", "FL Studio 2026", (0, 0, 3840, 2120)),
+            cand(4, vec![fl_main], true, false, "TPluginForm", "Kontakt 8 (Master)", (500, 400, 1500, 1100)),
+            cand(33, vec![], true, true, "JUCE_1a1", "", (900, 600, 1100, 900)), // un menu JUCE sans proprietaire, sur le panneau : oui
+        ];
+        let got = select_of(&cands, panel, form, tr);
+        assert_eq!(got.iter().map(|p| p.id).collect::<Vec<_>>(), vec![31, 33]);
+        assert_eq!(got.iter().map(|p| p.owned).collect::<Vec<_>>(), vec![true, false], "the owned menu gets the keyboard");
+        // sans `owner` (comme pour Live), le menu Qt possede par la fenetre detachee n'etait pas pris
+        assert_eq!(select(&cands, panel, tr).iter().map(|p| p.id).collect::<Vec<_>>(), vec![33]);
     }
 
     /// (audit de publication) une boite « Ouvrir » / « Enregistrer » que le plugin ouvre est possedee par lui, mais ce

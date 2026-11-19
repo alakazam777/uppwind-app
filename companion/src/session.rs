@@ -259,15 +259,15 @@ impl<'a> Conn<'a> {
     // (10 nov.) avec ce qui tourne (plugins::Running : Live ; sous macOS, Logic Pro et les titres)
     fn windows(&self) -> (plugins::Running, Vec<plugins::PluginWindow>) {
         if self.sh.demo {
-            let w = plugins::PluginWindow { id: DEMO_ID, title: "Demo Synth/1-Demo".into(), plugin: "Demo Synth".into(), track: "1-Demo".into(), w: 640, h: 400, minimized: false };
-            return (plugins::Running { live: true, logic: None, titles: None, access: None }, vec![w]);
+            let w = plugins::PluginWindow { id: DEMO_ID, title: "Demo Synth/1-Demo".into(), plugin: "Demo Synth".into(), track: "1-Demo".into(), w: 640, h: 400, minimized: false, host: None };
+            return (plugins::Running { live: true, logic: None, titles: None, access: None, fl: None }, vec![w]);
         }
         let all = plugins::enumerate();
         let mut wins = plugins::plugin_windows(&all);
         // --test-window : la fenetre d'essai du compagnon lui-meme (testwin.rs), proposee comme un plugin
         if let Some(t) = self.sh.test_window {
             if let Some(raw) = all.iter().find(|w| w.hwnd == t && w.visible) {
-                wins.push(plugins::PluginWindow { id: t, title: raw.title.clone(), plugin: "Uppwind Test".into(), track: "0-Test".into(), w: raw.w, h: raw.h, minimized: raw.minimized });
+                wins.push(plugins::PluginWindow { id: t, title: raw.title.clone(), plugin: "Uppwind Test".into(), track: "0-Test".into(), w: raw.w, h: raw.h, minimized: raw.minimized, host: None });
             }
         }
         (plugins::Running::of(&all, plugins::screen_recording(), plugins::accessibility()), wins)
@@ -441,7 +441,8 @@ impl<'a> Conn<'a> {
         }
         let t0 = Instant::now();
         self.stop_watch(None)?;
-        // seulement une fenetre de plugin (de Live ; sous macOS, de Logic Pro aussi), jamais une autre fenetre
+        // seulement une fenetre de plugin (de Live ; sous macOS, de Logic Pro aussi ; (19 nov.) sous Windows, le panneau
+        // d'une fenetre detachee de FL Studio), jamais une autre fenetre
         let (_, wins) = self.windows();
         let Some(w) = wins.into_iter().find(|w| w.id == id) else {
             return self.send_text(json!({ "type": "unwatched", "id": id, "reason": "not a plugin window (closed?)" }).to_string());

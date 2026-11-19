@@ -85,11 +85,12 @@ What the script does with each kind of event:
 | Deleting a channel | Its link is dropped. |
 | Tempo | The studio and FL share one tempo (since version 1.1.0). The studio's tempo sets FL's (`general.processRECEvent(midi.REC_Tempo, …)`); a tempo change in FL is read every 50 ms and sent to the studio, which follows. The tempo the studio set is never sent back. |
 | Loading another project | All links are cleared. Its tempo goes to the studio. |
+| Plugin windows (version 1.3.0) | With the Uppwind Link companion, selecting a plugin track in the studio shows that plugin's window there. If FL has no window open for that channel, the studio asks the script to open it (`channels.showEditor(index, 1)`, capability `editor`), once per track selection. Tick *Detached* in a plugin's window menu once and save the project: FL then reopens it detached (in our test, *Options › General settings › Detach all plugins* did not change a plugin the project had saved attached). The studio only shows detached windows of VST plugins (not FL's own instruments). The script never closes a window: once, in our test (19 Nov 2026), closing a detached window this way froze FL Studio 2026. Opening never froze it. A window the studio opened stays open in FL until you close it. |
 | Disconnect, unbind, studio reload | FL gets back the channel's own volume, pan and mute. |
 
 ## What FL's scripting API cannot do
 
-FL's MIDI scripting API has no function to load a plugin, list the installed plugins, delete a channel or set a channel's MIDI ports. So the script reports only these capabilities: `list`, `bind`, `set`, `audition`, `tempo` and `notes` (it can route a channel's notes through an Uppwind Link Notes that is already there). The studio then says *"Add the plugin in FL's channel rack; it appears here instantly."* The *Uppwind Link Notes* channels are not listed: they are not instruments.
+FL's MIDI scripting API has no function to load a plugin, list the installed plugins, delete a channel or set a channel's MIDI ports. So the script reports only these capabilities: `list`, `bind`, `set`, `audition`, `tempo`, `notes` and (1.3.0) `editor` (it can route a channel's notes through an Uppwind Link Notes that is already there). The studio then says *"Add the plugin in FL's channel rack; it appears here instantly."* The *Uppwind Link Notes* channels are not listed: they are not instruments.
 
 ## Troubleshooting
 

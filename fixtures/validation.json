@@ -970,6 +970,81 @@
    "out": {
     "bpm": 999
    }
+  },
+  {
+   "name": "editor-ok",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6,
+    "open": true
+   },
+   "ok": true,
+   "out": {
+    "id": 6,
+    "open": true
+   }
+  },
+  {
+   "name": "editor-close",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6,
+    "open": false
+   },
+   "ok": true,
+   "out": {
+    "id": 6,
+    "open": false
+   }
+  },
+  {
+   "name": "editor-no-open",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "editor-open-not-bool",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6,
+    "open": 1
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "editor-from-daw",
+   "cmd": 96,
+   "from": "daw",
+   "data": {
+    "id": 6,
+    "open": true
+   },
+   "ok": false,
+   "code": "wrong_direction"
+  },
+  {
+   "name": "editor-ack-ok",
+   "cmd": 97,
+   "from": "daw",
+   "data": {
+    "id": 6,
+    "open": true,
+    "extra": "x"
+   },
+   "ok": true,
+   "out": {
+    "id": 6,
+    "open": true
+   }
   }
  ]
 }

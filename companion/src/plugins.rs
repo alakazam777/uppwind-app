@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Uppwind
-//! Les fenetres de plugins d'Ableton Live ; (10 nov.) sous macOS, aussi celles de Logic Pro.
+//! Les fenetres de plugins d'Ableton Live ; (10 nov.) sous macOS, aussi celles de Logic Pro ; (19 nov.) sous Windows,
+//! aussi les fenetres DETACHEES de FL Studio (voir « FL Studio » plus bas).
 //!
 //! Mesure du 20 oct. (Live 12.4.6, Windows 10) : une fenetre de plugin est une fenetre de premier niveau du
 //! processus de Live, POSSEDEE par sa fenetre principale, de style WS_EX_TOOLWINDOW, titree « <Plugin>/<Piste> »
@@ -41,12 +42,23 @@ pub struct RawWindow {
     pub h: i32,
     /// macOS : le niveau de la fenetre (kCGWindowLayer : 0 normal, 3 flottant…) ; 0 sous Windows
     pub layer: i32,
+    /// (19 nov.) Windows, FL Studio : pour une fenetre de plugin de FL (TPluginForm), le panneau visible qui contient le
+    /// dessin du plugin (TVSTPanel, TVST3Panel), sans la barre de FL. Lu seulement pour ces fenetres-la.
+    pub panel: Option<Panel>,
     /// (11 nov., relecture M1) macOS, Logic Pro : la fenetre porte le bouton de menu de l'affichage (AXMenuButton
     /// decrit « view » : Editor / Controls) que Logic met en haut de chacune de ses fenetres de plugins. Mesure : la
     /// fenetre de PSP VintageWarmer2 l'a ; celle du projet et « Control Surface Setup » (niveau 3, comme un plugin
     /// flottant) non. Lu par l'Accessibilite, seulement pour une fenetre que le reste n'exclut pas deja ; false sans
     /// elle, ou ailleurs que sous macOS.
     pub view_button: bool,
+}
+
+/// (19 nov.) Le panneau d'une fenetre de plugin de FL Studio : une sous-fenetre, et sa zone client (pixels physiques).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Panel {
+    pub hwnd: u64,
+    pub w: i32,
+    pub h: i32,
 }
 
 /// Une fenetre de plugin, telle que le studio la voit (`list`).
@@ -59,6 +71,11 @@ pub struct PluginWindow {
     pub w: i32,
     pub h: i32,
     pub minimized: bool,
+    /// (19 nov.) le logiciel de la fenetre quand ce n'est pas Live (ni Logic) : « fl » pour une fenetre detachee de
+    /// FL Studio. Live et FL tournent souvent en meme temps : un Kontakt de Live et un canal « Kontakt 8 » de FL ont
+    /// le meme nom ; le studio ne prend pour une piste reliee a FL que les fenetres de FL. Absent du message sinon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<&'static str>,
 }
 
 /// Un processus d'Ableton Live ? (« Ableton Live 12 Suite.exe », « Ableton Live 12 Beta.exe », « Ableton Live 11 … »)
@@ -96,8 +113,85 @@ pub fn plugin_windows(all: &[RawWindow]) -> Vec<PluginWindow> {
         v.extend(logic_plugin_windows(all));
         v
     } else {
-        plugin_windows_win(all)
+        let mut v = plugin_windows_win(all);
+        v.extend(fl_plugin_windows(all));
+        v
     }
+}
+
+// ── (19 nov.) FL Studio (Windows) ──────────────────────────────────────────────────────────────────────────────
+// Mesure du 19 nov. (FL Studio 2026, Windows 10) : une fenetre de plugin de FL (classe TPluginForm) est, par defaut,
+// une fenetre ENFANT de la fenetre principale (TFruityLoopsMainForm) : on ne la filme pas seule, et ce qui la couvre
+// dans FL (Playlist, Mixer, un autre plugin) couvre aussi l'image. « Detached » (le menu de sa fenetre, ou Options ›
+// General settings › Detach all plugins) en fait une fenetre de premier niveau POSSEDEE par la fenetre principale,
+// style WS_POPUP, sans WS_EX_TOOLWINDOW ; sa surface DWM se lit comme celle d'une fenetre de Live (1,6 ms, meme
+// couverte). Seules celles-la sont proposees. Le titre : « <nom du canal>\u{E5A0} (<piste du mixer>)\u{E5FF} » (deux
+// icones privees de FL). Dedans : TNewCaption (la barre de FL : menu, presets, fermer) puis le panneau du plugin
+// (TVSTPanel en VST2, TVST3Panel en VST3) et la fenetre du plugin lui-meme. Le studio ne voit que ce PANNEAU : son id
+// est celui du panneau, l'image est decoupee dessus (capture.rs) et les gestes ne descendent que dedans (input.rs).
+// Le handle de la fenetre change a chaque bascule attachee / detachee.
+
+pub const FL_PLUGIN_CLASS: &str = "TPluginForm";
+pub const FL_MAIN_CLASS: &str = "TFruityLoopsMainForm";
+/// Les panneaux qui portent le dessin d'un plugin dans FL (mesures : VST2, VST3). Ni les instruments de FL lui-meme
+/// (Sytrus, FLEX…) ni les CLAP, pas encore mesures.
+pub const FL_PANEL_CLASSES: &[&str] = &["TVSTPanel", "TVST3Panel"];
+
+/// Un processus de FL Studio ? (« FL64.exe » ; « FL.exe » pour les anciennes versions 32 bits)
+pub fn is_fl_exe(exe: &str) -> bool {
+    let e = exe.to_ascii_lowercase();
+    let name = e.rsplit(['\\', '/']).next().unwrap_or(&e);
+    name == "fl64.exe" || name == "fl.exe"
+}
+
+/// « TAL U-No-LX-V2 #2\u{E5A0} (Master)\u{E5FF} » → (« TAL U-No-LX-V2 #2 », « Master »). Sans piste entre parentheses :
+/// (« nom », « »). Les icones de FL (zone d'usage prive) et les caracteres de controle sont retires.
+pub fn fl_title(raw: &str) -> Option<(String, String)> {
+    let t: String = raw.chars().filter(|c| !('\u{E000}'..='\u{F8FF}').contains(c) && !c.is_control()).collect();
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(head) = t.strip_suffix(')') {
+        if let Some(i) = head.rfind(" (") {
+            let (name, track) = (head[..i].trim(), head[i + 2..].trim());
+            if !name.is_empty() {
+                return Some((name.to_string(), track.to_string()));
+            }
+        }
+    }
+    Some((t.to_string(), String::new()))
+}
+
+/// Le titre montre par le studio : « nom (piste) », sans les icones de FL.
+pub fn fl_display_title(name: &str, track: &str) -> String {
+    if track.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} ({track})")
+    }
+}
+
+/// Les fenetres de plugins DETACHEES de FL Studio : du processus de FL, de classe TPluginForm, visibles, possedees par
+/// la fenetre principale de FL (meme processus), avec un panneau de plugin visible. L'id est celui du panneau.
+pub fn fl_plugin_windows(all: &[RawWindow]) -> Vec<PluginWindow> {
+    let mut out: Vec<PluginWindow> = all
+        .iter()
+        .filter(|w| is_fl_exe(&w.exe) && w.class == FL_PLUGIN_CLASS && w.visible && w.owner != 0)
+        .filter(|w| all.iter().any(|o| o.hwnd == w.owner && o.pid == w.pid && o.class == FL_MAIN_CLASS))
+        .filter_map(|w| {
+            let p = w.panel.filter(|p| p.hwnd != 0 && p.hwnd != w.hwnd && p.w > 0 && p.h > 0)?;
+            let (plugin, track) = fl_title(&w.title)?;
+            Some(PluginWindow { id: p.hwnd, title: fl_display_title(&plugin, &track), plugin, track, w: p.w, h: p.h, minimized: w.minimized, host: Some("fl") })
+        })
+        .collect();
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
+    out
+}
+
+/// FL Studio tourne-t-il (une fenetre de son processus, quelle qu'elle soit) ?
+pub fn fl_running(all: &[RawWindow]) -> bool {
+    all.iter().any(|w| is_fl_exe(&w.exe))
 }
 
 /// macOS : l'appli Logic Pro telle que CGWindowList la nomme (kCGWindowOwnerName) : « Logic Pro » (11, 12), « Logic Pro
@@ -148,7 +242,7 @@ pub fn logic_plugin_windows(all: &[RawWindow]) -> Vec<PluginWindow> {
     let mut out: Vec<PluginWindow> = all
         .iter()
         .filter(|w| is_logic_app(&w.exe) && is_logic_plugin(&w.title, w.layer, w.visible, w.view_button))
-        .map(|w| PluginWindow { id: w.hwnd, title: w.title.clone(), plugin: String::new(), track: w.title.trim().to_string(), w: w.w, h: w.h, minimized: w.minimized })
+        .map(|w| PluginWindow { id: w.hwnd, title: w.title.clone(), plugin: String::new(), track: w.title.trim().to_string(), w: w.w, h: w.h, minimized: w.minimized, host: None })
         .collect();
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
     out
@@ -163,7 +257,7 @@ pub fn plugin_windows_win(all: &[RawWindow]) -> Vec<PluginWindow> {
         .filter(|w| all.iter().any(|o| o.hwnd == w.owner && o.pid == w.pid))
         .filter_map(|w| {
             let (plugin, track) = split_title(&w.title)?;
-            Some(PluginWindow { id: w.hwnd, title: w.title.clone(), plugin, track, w: w.w, h: w.h, minimized: w.minimized })
+            Some(PluginWindow { id: w.hwnd, title: w.title.clone(), plugin, track, w: w.w, h: w.h, minimized: w.minimized, host: None })
         })
         .collect();
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
@@ -180,7 +274,7 @@ pub fn plugin_windows_mac(all: &[RawWindow]) -> Vec<PluginWindow> {
         .filter(|w| !w.title.contains(" - Ableton Live"))
         .filter_map(|w| {
             let (plugin, track) = split_title(&w.title)?;
-            Some(PluginWindow { id: w.hwnd, title: w.title.clone(), plugin, track, w: w.w, h: w.h, minimized: w.minimized })
+            Some(PluginWindow { id: w.hwnd, title: w.title.clone(), plugin, track, w: w.w, h: w.h, minimized: w.minimized, host: None })
         })
         .collect();
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
@@ -209,6 +303,8 @@ pub struct Running {
     /// (11 nov.) macOS : « Accessibilite » est-elle accordee ? Logic Pro ne nomme ses fenetres de plugins que pour elle
     /// (sans elle, sa liste reste vide), et ses gestes passent par elle.
     pub access: Option<bool>,
+    /// (19 nov.) Windows : FL Studio tourne-t-il ? (le studio dit alors de detacher le plugin dans FL) ; None ailleurs
+    pub fl: Option<bool>,
 }
 
 impl Running {
@@ -216,7 +312,14 @@ impl Running {
     /// (accessibility)
     pub fn of(all: &[RawWindow], screen: bool, access: bool) -> Running {
         let mac = cfg!(target_os = "macos");
-        Running { live: live_running(all), logic: mac.then(|| logic_running(all)), titles: mac.then_some(screen), access: mac.then_some(access) }
+        let win = cfg!(windows);
+        Running {
+            live: live_running(all),
+            logic: mac.then(|| logic_running(all)),
+            titles: mac.then_some(screen),
+            access: mac.then_some(access),
+            fl: win.then(|| fl_running(all)),
+        }
     }
 
     /// Les champs d'un message : « live », et ceux que ce systeme connait (« logic », « titles », « access »).
@@ -230,6 +333,9 @@ impl Running {
         }
         if let Some(a) = self.access {
             v["access"] = a.into();
+        }
+        if let Some(f) = self.fl {
+            v["fl"] = f.into();
         }
     }
 }
@@ -300,6 +406,7 @@ pub fn enumerate() -> Vec<RawWindow> {
                 h: b.size.height.round() as i32,
                 layer: w.layer,
                 view_button,
+                panel: None,
             }
         })
         .collect()
@@ -493,8 +600,8 @@ mod win {
     use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
     use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        GWL_EXSTYLE, GW_OWNER,
+        EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, GWL_EXSTYLE, GW_OWNER,
     };
 
     unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
@@ -545,6 +652,7 @@ mod win {
                 h: r.bottom - r.top,
                 layer: 0,
                 view_button: false,
+                panel: None,
             }
         }
     }
@@ -557,7 +665,43 @@ mod win {
             let _ = EnumWindows(Some(collect), LPARAM(&mut handles as *mut Vec<isize> as isize));
         }
         let mut exes: HashMap<u32, String> = HashMap::new();
-        handles.into_iter().map(|h| describe(HWND(h as *mut core::ffi::c_void), &mut exes)).collect()
+        handles
+            .into_iter()
+            .map(|h| {
+                let mut w = describe(HWND(h as *mut core::ffi::c_void), &mut exes);
+                // (19 nov.) FL Studio : le panneau du plugin, seulement pour une fenetre de plugin de FL visible
+                if w.visible && w.class == super::FL_PLUGIN_CLASS && super::is_fl_exe(&w.exe) {
+                    w.panel = fl_panel(HWND(h as *mut core::ffi::c_void));
+                }
+                w
+            })
+            .collect()
+    }
+
+    /// (19 nov.) Le premier panneau de plugin VISIBLE (TVSTPanel, TVST3Panel) sous une fenetre de plugin de FL ; les
+    /// onglets caches de son wrapper (reglages, enveloppes) ne le sont pas.
+    fn fl_panel(form: HWND) -> Option<super::Panel> {
+        unsafe extern "system" fn each(c: HWND, lp: LPARAM) -> BOOL {
+            let found = &mut *(lp.0 as *mut Option<isize>);
+            let mut cls = [0u16; 64];
+            let n = GetClassNameW(c, &mut cls).max(0) as usize;
+            let name = String::from_utf16_lossy(&cls[..n]);
+            if super::FL_PANEL_CLASSES.contains(&name.as_str()) && IsWindowVisible(c).as_bool() {
+                *found = Some(c.0 as isize);
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+        let mut found: Option<isize> = None;
+        unsafe {
+            let _ = EnumChildWindows(Some(form), Some(each), LPARAM(&mut found as *mut Option<isize> as isize));
+        }
+        let c = HWND(found? as *mut core::ffi::c_void);
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetClientRect(c, &mut r);
+        }
+        Some(super::Panel { hwnd: c.0 as isize as u64, w: r.right - r.left, h: r.bottom - r.top })
     }
 }
 
@@ -582,6 +726,7 @@ mod tests {
             h: 500,
             layer: 0,
             view_button: false,
+            panel: None,
         }
     }
 
@@ -875,7 +1020,7 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!((r.logic, r.titles, r.access), (Some(true), Some(false), Some(false)));
             assert_eq!((v["logic"].clone(), v["titles"].clone(), v["access"].clone()), (serde_json::json!(true), serde_json::json!(false), serde_json::json!(false)));
-            assert_eq!(Running::of(&fake_desktop(), true, true), Running { live: true, logic: Some(false), titles: Some(true), access: Some(true) });
+            assert_eq!(Running::of(&fake_desktop(), true, true), Running { live: true, logic: Some(false), titles: Some(true), access: Some(true), fl: None });
         } else {
             // Windows : rien sur Logic, les titres ni l'Accessibilite (le studio ne parle que de Live)
             assert_eq!((r.logic, r.titles, r.access), (None, None, None));
@@ -939,6 +1084,96 @@ mod tests {
         assert_eq!(split_title("Diva"), None);
         assert_eq!(split_title("/2-Diva"), None);
         assert_eq!(expected_title("Diva", "2-Diva"), "Diva/2-Diva");
+    }
+
+    // ── (19 nov.) FL Studio ──
+    const FL: &str = "FL64.exe";
+
+    fn fl_win(hwnd: u64, pid: u32, exe: &str, class: &str, title: &str, owner: u64, panel: Option<u64>) -> RawWindow {
+        RawWindow {
+            hwnd,
+            pid,
+            exe: exe.into(),
+            title: title.into(),
+            class: class.into(),
+            owner,
+            visible: true,
+            w: 1166,
+            h: 480,
+            panel: panel.map(|p| Panel { hwnd: p, w: 1150, h: 432 }),
+            ..Default::default()
+        }
+    }
+
+    /// Mesure du 19 nov. : TAL detache (premier niveau, possede par la fenetre de FL), son titre avec les icones de FL.
+    fn fl_desktop() -> Vec<RawWindow> {
+        vec![
+            fl_win(1, 300, FL, FL_MAIN_CLASS, "FL Studio 2026", 0, None),
+            fl_win(2, 300, FL, FL_PLUGIN_CLASS, "TAL U-No-LX-V2 #2\u{E5A0} (Master)\u{E5FF}", 1, Some(20)),
+            fl_win(3, 300, FL, FL_PLUGIN_CLASS, "Kontakt 8\u{E5A0} (Insert 3)\u{E5FF}", 1, Some(30)),
+            fl_win(4, 300, FL, FL_PLUGIN_CLASS, "Sytrus\u{E5A0} (Master)\u{E5FF}", 1, None), // sans panneau VST : pas encore
+            fl_win(5, 300, FL, "TQuickPopupMenuWindow", "", 1, None),                         // le menu de FL
+            fl_win(6, 300, FL, FL_PLUGIN_CLASS, "Diva\u{E5A0} (Master)\u{E5FF}", 9, Some(60)), // possedee par une fenetre d'un autre processus
+            fl_win(7, 300, FL, FL_PLUGIN_CLASS, "Serum\u{E5A0} (Master)\u{E5FF}", 0, Some(70)), // sans proprietaire
+            fl_win(8, 400, "chrome.exe", FL_PLUGIN_CLASS, "TAL U-No-LX-V2 #2 (Master)", 9, Some(80)), // un autre processus
+            fl_win(9, 400, "chrome.exe", FL_MAIN_CLASS, "FL Studio 2026", 0, None),
+            {
+                let mut w = fl_win(10, 300, FL, FL_PLUGIN_CLASS, "Pro-Q 4\u{E5A0} (Master)\u{E5FF}", 1, Some(100));
+                w.visible = false; // fermee
+                w
+            },
+            fl_win(11, 300, FL, FL_PLUGIN_CLASS, "Pigments", 1, Some(110)), // sans piste
+            fl_win(12, 300, FL, FL_PLUGIN_CLASS, "Bad\u{E5A0} (Master)\u{E5FF}", 1, Some(12)), // le panneau, c'est elle-meme
+        ]
+    }
+
+    #[test]
+    fn finds_detached_fl_plugin_windows_only_by_their_panel() {
+        let got = fl_plugin_windows(&fl_desktop());
+        let ids: Vec<u64> = got.iter().map(|w| w.id).collect();
+        assert_eq!(ids, vec![30, 110, 20], "{got:?}");
+        assert_eq!((got[2].plugin.as_str(), got[2].track.as_str(), got[2].title.as_str()), ("TAL U-No-LX-V2 #2", "Master", "TAL U-No-LX-V2 #2 (Master)"));
+        assert_eq!((got[2].w, got[2].h), (1150, 432), "the panel's size, not the window's");
+        assert_eq!((got[1].plugin.as_str(), got[1].track.as_str()), ("Pigments", ""));
+        assert!(got.iter().all(|w| w.host == Some("fl")), "every FL window says so");
+        let live = &plugin_windows_win(&fake_desktop())[0];
+        assert_eq!(live.host, None);
+        let v = serde_json::to_value(live).unwrap();
+        assert!(v.get("host").is_none(), "a Live window's message is unchanged: {v}");
+        assert_eq!(serde_json::to_value(&got[2]).unwrap()["host"], "fl");
+        if cfg!(windows) {
+            // Live et FL ensemble : les deux listes
+            let mut both = fake_desktop();
+            both.extend(fl_desktop());
+            assert_eq!(plugin_windows(&both).len(), 6);
+        }
+    }
+
+    #[test]
+    fn fl_titles_and_exe_names() {
+        assert_eq!(fl_title("Kontakt 8\u{E5A0} (Master)\u{E5FF}"), Some(("Kontakt 8".into(), "Master".into())));
+        assert_eq!(fl_title("Lead (copy)\u{E5A0} (Insert 2)\u{E5FF}"), Some(("Lead (copy)".into(), "Insert 2".into())));
+        assert_eq!(fl_title("Pigments"), Some(("Pigments".into(), String::new())));
+        assert_eq!(fl_title("\u{E5A0} \u{E5FF}"), None);
+        assert_eq!(fl_display_title("Kontakt 8", "Master"), "Kontakt 8 (Master)");
+        assert!(is_fl_exe("FL64.exe") && is_fl_exe("C:\\Program Files\\Image-Line\\FL Studio 2026\\FL64.exe") && is_fl_exe("fl.exe"));
+        assert!(!is_fl_exe("FLEngine_x64.dll") && !is_fl_exe("ilbridge.exe") && !is_fl_exe(""));
+        assert!(fl_running(&fl_desktop()) && !fl_running(&fake_desktop()));
+    }
+
+    #[test]
+    fn says_fl_runs_on_windows_only() {
+        let r = Running::of(&fl_desktop(), true, true);
+        let mut v = serde_json::json!({});
+        r.put(&mut v);
+        if cfg!(windows) {
+            assert_eq!(r.fl, Some(true));
+            assert_eq!(v["fl"], true);
+            assert_eq!(Running::of(&fake_desktop(), true, true).fl, Some(false));
+        } else {
+            assert_eq!(r.fl, None);
+            assert!(v.get("fl").is_none());
+        }
     }
 
     #[test]

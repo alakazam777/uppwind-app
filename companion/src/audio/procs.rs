@@ -44,6 +44,9 @@ pub struct Proc {
     pub pid: u32,
     pub parent: u32,
     pub exe: String,
+    /// (19 nov.) a-t-il une fenetre visible ? Un FL64 bloque a la fermeture reste sans fenetre (et ne joue plus rien)
+    /// a cote du FL rouvert : pick prend celui qui a des fenetres.
+    pub ui: bool,
 }
 
 /// (audit de publication) La reponse au studio pour un pid refuse : toujours la meme, que le processus existe ou non et
@@ -83,13 +86,15 @@ pub fn pick(spec: &str, all: &[Proc], any: bool, extra: Option<u32>) -> Result<P
             return hit.cloned().ok_or_else(|| if any { format!("no process matching \"{s}\"") } else { format!("no DAW matching \"{s}\"") });
         }
     };
-    // le DAW : FL64 avant FL (FL.exe peut n'etre que le lanceur), et le processus le plus haut de son arbre
+    // le DAW : celui qui a des fenetres (19 nov. : un FL64 bloque a la fermeture, sans fenetre, restait a cote du FL
+    // rouvert, et le retour enregistrait son silence), FL64 avant FL (FL.exe peut n'etre que le lanceur), et le
+    // processus le plus haut de son arbre
     let mut found: Vec<&Proc> = all.iter().filter(|p| match (want, daw_of_exe(&p.exe)) {
         (None, Some(_)) => true,
         (Some(w), Some(d)) => w == d,
         _ => false,
     }).collect();
-    found.sort_by_key(|p| (p.exe.to_ascii_lowercase() == "fl.exe", p.pid));
+    found.sort_by_key(|p| (!p.ui, p.exe.to_ascii_lowercase() == "fl.exe", p.pid));
     // un DAW lance par un autre DAW du meme arbre (FL.exe → FL64.exe) : l'arbre du parent le contient deja
     let top = found.iter().find(|p| !found.iter().any(|q| q.pid == p.parent)).or(found.first());
     match top {
@@ -104,8 +109,23 @@ pub fn pick(spec: &str, all: &[Proc], any: bool, extra: Option<u32>) -> Result<P
 
 #[cfg(windows)]
 pub fn list() -> Vec<Proc> {
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
     use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    // les processus qui ont une fenetre visible de premier niveau
+    unsafe extern "system" fn shown(h: HWND, lp: LPARAM) -> windows::core::BOOL {
+        let v = &mut *(lp.0 as *mut Vec<u32>);
+        if IsWindowVisible(h).as_bool() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut pid));
+            v.push(pid);
+        }
+        windows::core::BOOL(1)
+    }
+    let mut ui: Vec<u32> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(shown), LPARAM(&mut ui as *mut Vec<u32> as isize));
+    }
     let mut out = Vec::new();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
@@ -113,7 +133,7 @@ pub fn list() -> Vec<Proc> {
         if Process32FirstW(snap, &mut e).is_ok() {
             loop {
                 let n = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
-                out.push(Proc { pid: e.th32ProcessID, parent: e.th32ParentProcessID, exe: String::from_utf16_lossy(&e.szExeFile[..n]) });
+                out.push(Proc { pid: e.th32ProcessID, parent: e.th32ParentProcessID, exe: String::from_utf16_lossy(&e.szExeFile[..n]), ui: ui.contains(&e.th32ProcessID) });
                 if Process32NextW(snap, &mut e).is_err() {
                     break;
                 }
@@ -139,7 +159,19 @@ mod tests {
     use super::*;
 
     fn p(pid: u32, parent: u32, exe: &str) -> Proc {
-        Proc { pid, parent, exe: exe.into() }
+        Proc { pid, parent, exe: exe.into(), ui: false }
+    }
+
+    #[test]
+    fn a_daw_without_windows_is_not_taken_for_the_one_that_has_them() {
+        // 19 nov. : un FL64 bloque a la fermeture (sans fenetre, pid plus petit) a cote du FL rouvert
+        let mut d = vec![p(100, 4, "explorer.exe"), p(38152, 100, "FL64.exe"), p(47816, 100, "FL64.exe")];
+        d[2].ui = true;
+        assert_eq!(pick("fl", &d, false, None).unwrap().pid, 47816);
+        assert_eq!(pick("auto", &d, false, None).unwrap().pid, 47816);
+        // aucun n'a de fenetre (un DAW minimise dans la barre ? il en garde une) : comme avant, le plus petit pid
+        d[2].ui = false;
+        assert_eq!(pick("fl", &d, false, None).unwrap().pid, 38152);
     }
 
     fn desk() -> Vec<Proc> {

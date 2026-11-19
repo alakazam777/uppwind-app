@@ -15,7 +15,8 @@
 //!   le bouton est tenu, Windows donne la souris a Chrome) ; la molette tout de suite ; le survol est ignore ; le
 //!   clavier passe comme en direct.
 //!
-//! Securite : l'injecteur ne vise que la fenetre suivie (verifiee par la session : une fenetre de plugin de Live) et
+//! Securite : l'injecteur ne vise que la fenetre suivie (verifiee par la session : une fenetre de plugin de Live ;
+//! (19 nov.) le panneau d'un plugin detache de FL Studio, jamais la barre de FL au-dessus) et
 //! ses sous-fenetres ; en FOCUS, il verifie avant chaque clic que la fenetre sous le point est bien celle-la, et un
 //! glisser ou un relachement ne sort jamais de la zone du plugin (keep_inside).
 //! Le journal ne contient jamais ce qui est tape.
@@ -180,6 +181,15 @@ pub fn wheel_msgs(dx: f64, dy: f64, mods: u8, screen: (i32, i32)) -> Vec<WinMsg>
         out.push(WinMsg { msg: WM_MOUSEHWHEEL, wparam: ((h as i16 as u16 as usize) << 16) | mk, lparam: lp });
     }
     out
+}
+
+/// (19 nov., essai avec le vrai FL Studio) Echap qu'un plugin ne prend pas remonte a FL Studio, qui ferme alors la
+/// fenetre du plugin (mesure : TAL-U-NO-LX detache, en Direct comme en Focus ; Live, lui, ne ferme rien). Avec FL,
+/// Echap ne part donc que si un menu du plugin est ouvert (popups.rs) : il le ferme, comme avec Live.
+pub const FL_ESCAPE_REFUSED: &str = "Escape is not sent to a plugin in FL Studio unless one of its menus is open: FL Studio would close the plugin's window";
+
+pub fn escape_refused(vk: u16, fl: bool, menu_open: bool) -> bool {
+    vk == 0x1B && fl && !menu_open
 }
 
 /// KeyboardEvent.code (la touche physique) → touche virtuelle Windows et « etendue ». Les lettres et chiffres :
@@ -581,6 +591,9 @@ impl Injector {
             }
             InputEvent::Key { down, key, code, mods } => {
                 let Some((vk, ext)) = vk_of_code(code) else { return Err("this key is not sent to plugins".into()) };
+                if escape_refused(vk, win::in_fl_plugin_form(top), !crate::popups::list(top).is_empty()) {
+                    return Err(FL_ESCAPE_REFUSED.into());
+                }
                 let target = win::key_target(top, self.key_target);
                 let chars = if *down { chars_for_key(key, *mods) } else { Vec::new() };
                 for m in key_msgs(*down, vk, win::scan_code(vk), ext, &chars, *mods) {
@@ -999,9 +1012,9 @@ pub mod win {
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, ChildWindowFromPointEx, GetClassLongPtrW, GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowRect,
+        BringWindowToTop, ChildWindowFromPointEx, GetAncestor, GetClassLongPtrW, GetClientRect, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowRect,
         GetWindowThreadProcessId, IsChild, IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, SetWindowPos,
-        WindowFromPoint, CS_DBLCLKS, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GCL_STYLE, GUITHREADINFO, HWND_NOTOPMOST, HWND_TOPMOST, SMTO_ABORTIFHUNG,
+        WindowFromPoint, CS_DBLCLKS, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE, GUITHREADINFO, HWND_NOTOPMOST, HWND_TOPMOST, SMTO_ABORTIFHUNG,
         SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
@@ -1055,6 +1068,28 @@ pub mod win {
     }
     fn id(h: HWND) -> u64 {
         h.0 as isize as u64
+    }
+
+    /// (19 nov.) La fenetre de premier niveau qui contient `w` (elle-meme si elle en est une).
+    pub fn root_of(w: u64) -> u64 {
+        let r = id(unsafe { GetAncestor(h(w), GA_ROOT) });
+        if r == 0 {
+            w
+        } else {
+            r
+        }
+    }
+
+    /// (19 nov.) `top` est-il le panneau d'un plugin de FL Studio (une sous-fenetre d'une `TPluginForm`, plugins.rs) ?
+    pub fn in_fl_plugin_form(top: u64) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        let root = root_of(top);
+        if root == top {
+            return false;
+        }
+        let mut c = [0u16; 64];
+        let n = unsafe { GetClassNameW(h(root), &mut c) }.max(0) as usize;
+        String::from_utf16_lossy(&c[..n]) == crate::plugins::FL_PLUGIN_CLASS
     }
 
     pub fn check_alive(top: u64) -> Result<(), String> {
@@ -1269,16 +1304,31 @@ pub mod win {
             let saved_fg = GetForegroundWindow();
             let mut saved_cur = POINT::default();
             let _ = GetCursorPos(&mut saved_cur);
+            // (19 nov.) FL Studio : `top` est le panneau du plugin, une sous-fenetre ; c'est sa fenetre de premier niveau
+            // (la fenetre detachee du plugin) qu'on deplace et qu'on fait passer devant
+            let root = root_of(top);
             let mut wr = RECT::default();
-            let _ = GetWindowRect(h(top), &mut wr);
+            let _ = GetWindowRect(h(root), &mut wr);
             // le point vise doit etre a l'ecran : sinon on amene la fenetre sous le curseur, le temps du geste
             let first = steps.iter().map(|s| match s { Step::Down { p, .. } | Step::Move { p } | Step::Up { p, .. } | Step::Wheel { p, .. } => *p }).next().unwrap_or((0, 0));
             let sp = client_to_screen(top, first);
             let moved = MonitorFromPoint(POINT { x: sp.0, y: sp.1 }, MONITOR_DEFAULTTONULL).is_invalid();
             if moved {
-                let _ = SetWindowPos(h(top), None, wr.left + saved_cur.x - sp.0, wr.top + saved_cur.y - sp.1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = SetWindowPos(h(root), None, wr.left + saved_cur.x - sp.0, wr.top + saved_cur.y - sp.1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
-            let _ = SetWindowPos(h(top), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            let _ = SetWindowPos(h(root), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // (19 nov.) mesure sur FL Studio : 80 ms apres, la fenetre n'etait pas encore devant (la fenetre de FL
+            // l'etait au point vise) ; a 200 ms, si. On attend qu'elle y soit, 300 ms au plus, avant la verification
+            // de securite plus bas (qui refuse le clic si une autre fenetre est sous le point)
+            let first_screen = client_to_screen(top, first);
+            let t_up = std::time::Instant::now();
+            while t_up.elapsed() < std::time::Duration::from_millis(300) {
+                let under = id(WindowFromPoint(POINT { x: first_screen.0, y: first_screen.1 }));
+                if is_inside(top, under) || in_popup(top, under) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // la zone client du plugin et ses menus, a l'ecran (apres l'eventuel deplacement) : un glisser n'en sort pas
             let (cw, ch) = client_size(top);
             let c0 = client_to_screen(top, (0, 0));
@@ -1323,9 +1373,9 @@ pub mod win {
             }
             // tout remettre
             std::thread::sleep(std::time::Duration::from_millis(30));
-            let _ = SetWindowPos(h(top), Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            let _ = SetWindowPos(h(root), Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             if moved {
-                let _ = SetWindowPos(h(top), None, wr.left, wr.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = SetWindowPos(h(root), None, wr.left, wr.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
             let _ = SetCursorPos(saved_cur.x, saved_cur.y);
             if !saved_fg.is_invalid() {
@@ -1507,6 +1557,16 @@ mod window_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_never_reaches_an_fl_plugin_without_an_open_menu() {
+        let esc = vk_of_code("Escape").unwrap().0;
+        assert!(escape_refused(esc, true, false), "FL Studio would close the plugin's window");
+        assert!(!escape_refused(esc, true, true), "a menu of the plugin is open: Escape closes it");
+        assert!(!escape_refused(esc, false, false), "Live: Escape goes to the plugin, as before");
+        assert!(!escape_refused(vk_of_code("KeyA").unwrap().0, true, false), "only Escape");
+        assert!(!escape_refused(vk_of_code("Enter").unwrap().0, true, false));
+    }
 
     fn pt(x: f64, y: f64, iw: Option<f64>, ih: Option<f64>) -> Pt {
         Pt { x, y, iw, ih }

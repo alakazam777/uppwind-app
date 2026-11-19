@@ -33,6 +33,12 @@ supprimer un canal, choisir les ports MIDI d'un canal (getChannelMidiInPort se l
 caps ne contient donc ni 'plugins', ni 'add', ni 'remove' : le studio dit « Add the plugin in FL's
 channel rack; it appears here instantly ».
 
+(19 nov., 1.3.0) EDITOR {id, open} (cap 'editor') : la fenetre de l'instrument s'ouvre dans FL, a la demande du
+studio (Follow track, quand le compagnon ne la trouve pas). channels.showEditor(index, 1), pose au prochain OnIdle
+(pas dans le traitement du SysEx) ; la reponse EDITOR_ACK part alors. FERMER est refuse (unsupported) : mesure du
+19 nov. sur FL 2026 (API 45), showEditor(index, 0) sur une fenetre detachee a bloque FL (« Not responding », a tuer). Une fenetre que l'on a
+detachee une fois (son menu, « Detached ») se rouvre detachee : FL s'en souvient.
+
 (27 oct., 1.2.1) Nos propres reponses revenues sur l'entree : le Script output dit pourquoi (la sortie « Uppwind Link »
 a le numero de l'entree) et comment reparer.
 
@@ -70,10 +76,10 @@ import ui
 
 import uwlink_protocol as P
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.0"
 TAG = "[Uppwind Link]"
 DAW_NAME = "FL Studio"
-CAPS = ["list", "bind", "set", "audition", "tempo", "notes"]
+CAPS = ["list", "bind", "set", "audition", "tempo", "notes", "editor"]
 ADD_HINT = "Add the plugin in FL's channel rack; it appears here instantly."
 # (26 oct.) le plugin des notes, son parametre « Link tag » (0..255, 0 : aucun), les ports MIDI de FL
 NOTES_NAME = "Uppwind Link Notes"
@@ -163,6 +169,8 @@ class _State(object):
         self.tag_param = {}
         self.tags = {}
         self.said = {}
+        # (19 nov., 1.3.0) EDITOR en attente du prochain OnIdle : (req, index, open) ; le dernier demande gagne
+        self.editor = None
 
 
 S = _State()
@@ -1023,6 +1031,15 @@ def _dispatch(cmd, req, data):
         _set(d)
     elif cmd == P.TEMPO:
         _set_tempo(d["bpm"])
+    elif cmd == P.EDITOR:
+        if not _playable(d["id"]) or _is_notes(d["id"]):
+            _error(req, P.ERR_NOT_FOUND, "No instrument at position %d of the channel rack." % (d["id"] + 1))
+            return
+        if not d["open"]:
+            # (19 nov.) fermer une fenetre detachee par showEditor(index, 0) a bloque FL 2026 : jamais
+            _error(req, P.ERR_UNSUPPORTED, "Close the plugin's window in FL Studio itself.")
+            return
+        S.editor = (req, d["id"], True)
     elif cmd == P.PING:
         _send(P.PONG, req, {"t": d["t"]})
     elif cmd == P.ERROR:
@@ -1133,9 +1150,26 @@ def OnSysEx(event):
         _log("SysEx: %s" % e)
 
 
+def _show_editor():
+    """(19 nov.) EDITOR : ouvrir la fenetre du canal (jamais la fermer : voir l'en-tete), puis EDITOR_ACK."""
+    req, i, want = S.editor
+    S.editor = None
+    if not _playable(i):
+        _error(req, P.ERR_NOT_FOUND, "No instrument at position %d of the channel rack." % (i + 1))
+        return
+    try:
+        channels.showEditor(*_g(i, 1 if want else 0))
+    except Exception as e:
+        _error(req, P.ERR_INTERNAL, ("FL Studio did not open the window: %s" % e)[:200])
+        return
+    _send(P.EDITOR_ACK, req, {"id": i, "open": want})
+
+
 def OnIdle():
     try:
         now = _now()
+        if S.editor is not None:
+            _show_editor()
         _flush()
         if S.dirty and now - S.dirty_at >= CHANGE_SETTLE:
             S.dirty = False

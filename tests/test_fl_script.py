@@ -80,6 +80,8 @@ class World(object):
         self.tempo_next = None
         self.rec = []            # (id, valeur, drapeaux) de general.processRECEvent
         self.docs = False
+        self.editors = []        # (19 nov.) channels.showEditor : (index, valeur)
+        self.in_sysex = False    # (19 nov.) vrai pendant le traitement d'un SysEx (showEditor y est interdit ici)
 
     def add(self, name, plugin=None, ctype=2, color=0x5F7581, vst=False, vol=0.78125, pan=0.0, muted=False, port=-2,
             pnames=None):
@@ -169,9 +171,16 @@ def make_modules(w):
         w.g(g, "getChannelMidiInPort")
         return w.chans[i]["port"]
 
+    def showEditor(i, value=-1, g=False):
+        w.g(g, "showEditor")
+        assert not w.in_sysex, "the window opens from OnIdle, never while a SysEx is being handled"
+        assert value in (0, 1), "never a toggle: a second Follow must not close the window"
+        assert 0 <= i < len(w.chans)
+        w.editors.append((i, value))
+
     for f in (channelCount, getChannelName, getChannelColor, getChannelType, getChannelVolume, setChannelVolume,
               getChannelPan, setChannelPan, isChannelMuted, muteChannel, setChannelPitch, midiNoteOn, getChannelIndex,
-              getChannelMidiInPort):
+              getChannelMidiInPort, showEditor):
         setattr(ch, f.__name__, f)
 
     pl = types.ModuleType("plugins")
@@ -284,7 +293,11 @@ class Rig(object):
             req = self.req
         for chunk in P.encode_message(cmd, req, data or {}):
             ev = Ev(0xF0, sysex=chunk)
-            self.s.OnMidiMsg(ev)
+            self.w.in_sysex = True
+            try:
+                self.s.OnMidiMsg(ev)
+            finally:
+                self.w.in_sysex = False
             assert ev.handled, "our SysEx must be handled"
         return req
 
@@ -324,12 +337,35 @@ class Rig(object):
 
 # -- Les tests ------------------------------------------------------------------------------
 @test
+def editor_opens_and_closes_an_instrument_window_from_idle():
+    # (19 nov., 1.3.0) EDITOR : la fenetre du canal s'ouvre (1) ou se ferme (0) au prochain OnIdle, puis EDITOR_ACK
+    r = Rig()
+    r.hello()
+    cmd, req, d = r.ask(P.EDITOR, {"id": 1, "open": True})
+    assert (cmd, d) == (P.EDITOR_ACK, {"id": 1, "open": True}), (cmd, d)
+    assert r.w.editors == [(1, 1)], r.w.editors
+    # deja ouverte : on la redemande, elle reste ouverte (jamais une bascule)
+    cmd, req, d = r.ask(P.EDITOR, {"id": 1, "open": True})
+    assert (cmd, d) == (P.EDITOR_ACK, {"id": 1, "open": True}), (cmd, d)
+    # fermer : refuse (showEditor(index, 0) a bloque FL 2026 sur une fenetre detachee), rien n'est touche
+    cmd, req, d = r.ask(P.EDITOR, {"id": 1, "open": False})
+    assert cmd == P.ERROR and d["code"] == P.ERR_UNSUPPORTED, (cmd, d)
+    assert r.w.editors == [(1, 1), (1, 1)], r.w.editors
+    # pas d'instrument la : une erreur, rien d'ouvert (un clip d'automation, un canal qui n'existe pas)
+    for i in (3, 40):
+        cmd, req, d = r.ask(P.EDITOR, {"id": i, "open": True})
+        assert cmd == P.ERROR and d["code"] == P.ERR_NOT_FOUND, (cmd, d)
+    assert r.w.editors == [(1, 1), (1, 1)], r.w.editors
+    assert not r.w.non_global, r.w.non_global
+
+
+@test
 def hello_ack_describes_fl_honestly():
     r = Rig()
     d = r.hello()
     assert d["daw"] == "FL Studio"
     assert d["project"] == "Night drive", d
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes"], d["caps"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor"], d["caps"]
     assert d["bpm"] == 140, d
     for cap in ("plugins", "add", "remove"):
         assert cap not in d["caps"]
@@ -694,7 +730,7 @@ def no_output_port_means_a_clear_hint_not_a_crash():
 def older_api_without_global_indexes_still_works():
     r = Rig(api=30)
     d = r.hello()
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor"]
     r.bind(1, 1)
     r.midi(0x90, 60, 100)
     assert r.w.notes == [(1, 60, 100)]

@@ -127,8 +127,20 @@ pub fn learn(plugin: &str, bit: u8) {
 }
 
 /// Comme `open`, pour la fenetre d'un plugin nomme : les essais deja rates pour ce plugin sont sautes.
+/// (19 nov.) FL Studio : le studio suit le PANNEAU du plugin (plugins.rs), une sous-fenetre. Windows ne filme que des
+/// fenetres de premier niveau : on filme celle qui le contient (la fenetre detachee du plugin) et on decoupe le panneau
+/// dans chaque image (`win::Sub`), sans la barre de FL.
 #[cfg(windows)]
 pub fn open_plugin(hwnd: u64, plugin: &str, force: Option<&str>) -> Result<Box<dyn Capturer>, String> {
+    if let Some(root) = win::root_of_child(hwnd) {
+        let inner = open_plugin_top(root, plugin, force)?;
+        return Ok(Box::new(win::Sub::new(inner, root, hwnd)));
+    }
+    open_plugin_top(hwnd, plugin, force)
+}
+
+#[cfg(windows)]
+fn open_plugin_top(hwnd: u64, plugin: &str, force: Option<&str>) -> Result<Box<dyn Capturer>, String> {
     if force.is_some() {
         return open(hwnd, force);
     }
@@ -250,6 +262,82 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindow};
 
     const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
+
+    // ── (19 nov.) une sous-fenetre, decoupee dans l'image de sa fenetre de premier niveau ─────────────────────────
+    /// La fenetre de premier niveau qui contient `id`, si `id` est une sous-fenetre (sinon None).
+    pub fn root_of_child(id: u64) -> Option<u64> {
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+        let h = hwnd_of(id);
+        if !alive(h) {
+            return None;
+        }
+        let root = unsafe { GetAncestor(h, GA_ROOT) };
+        let r = root.0 as isize as u64;
+        (r != 0 && r != id).then_some(r)
+    }
+
+    /// Le coin de la zone client de `child` dans la zone client de `root`, et sa taille (pixels physiques).
+    fn child_in_root(root: HWND, child: HWND) -> (i32, i32, i32, i32) {
+        use windows::Win32::Graphics::Gdi::MapWindowPoints;
+        let mut pts = [POINT { x: 0, y: 0 }];
+        unsafe {
+            MapWindowPoints(Some(child), Some(root), &mut pts);
+        }
+        let (w, h) = client_size(child);
+        (pts[0].x, pts[0].y, w, h)
+    }
+
+    pub struct Sub {
+        inner: Box<dyn Capturer>,
+        root: HWND,
+        child: HWND,
+    }
+
+    // les deux handles ne servent qu'au fil de la capture, comme ceux de Wgc et Dwm
+    unsafe impl Send for Sub {}
+
+    impl Sub {
+        pub fn new(inner: Box<dyn Capturer>, root: u64, child: u64) -> Self {
+            Sub { inner, root: hwnd_of(root), child: hwnd_of(child) }
+        }
+    }
+
+    impl Capturer for Sub {
+        // la voie de la fenetre qui la contient (« dwm » : le studio et stream.rs la savent bon marche)
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
+        fn display_size(&self) -> Option<(u32, u32)> {
+            // seulement si l'image de la fenetre entiere est plus petite que l'ecran (« DPI unaware ») : la taille du
+            // panneau a l'ecran
+            self.inner.display_size().map(|_| {
+                let (w, h) = client_size(self.child);
+                (w.max(1) as u32, h.max(1) as u32)
+            })
+        }
+        fn grab(&mut self) -> Result<Option<Frame>, String> {
+            use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+            if !alive(self.child) {
+                return Err("the window is gone".into());
+            }
+            if !unsafe { IsWindowVisible(self.child) }.as_bool() {
+                return Err("the plugin window is hidden".into());
+            }
+            let Some(f) = self.inner.grab()? else { return Ok(None) };
+            let (rw, _) = client_size(self.root);
+            if rw <= 0 || f.w == 0 || f.h == 0 {
+                return Ok(None);
+            }
+            let s = f.w as f64 / rw as f64;
+            let (x, y, w, h) = child_in_root(self.root, self.child);
+            let sc = |v: i32| (v as f64 * s).round() as i32;
+            let r = clamp_crop(sc(x), sc(y), sc(w), sc(h), f.w, f.h);
+            if r.2 == 0 || r.3 == 0 {
+                return Ok(None);
+            }
+            Ok(Some(crate::stream::crop(&f, r)))
+        }
+    }
 
     fn hwnd_of(id: u64) -> HWND {
         HWND(id as isize as *mut core::ffi::c_void)
@@ -841,6 +929,41 @@ mod tests {
         let _ = crate::input::win::post(t.knob, &crate::input::WinMsg { msg: 0x0202, wparam: 0, lparam: crate::input::make_lparam(100, 100) });
         assert!(changed, "the press is seen through the DWM surface");
         assert_eq!(d.kind(), "dwm");
+    }
+
+    /// (19 nov.) FL Studio : le studio suit le PANNEAU d'un plugin, une sous-fenetre. Ici la sous-fenetre « potard » de
+    /// la fenetre d'essai : l'image est decoupee dans la surface DWM de la fenetre qui la contient, a la taille du
+    /// panneau, et un appui s'y voit.
+    #[cfg(windows)]
+    #[test]
+    fn a_child_panel_is_cut_out_of_its_window() {
+        use crate::testwin;
+        let t = testwin::open_with((80, 260), false, true).expect("test window");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(super::win::root_of_child(t.knob), Some(t.top));
+        assert_eq!(super::win::root_of_child(t.top), None, "a top-level window is captured as before");
+        let mut d = match super::open_plugin(t.knob, "Uppwind Test panel", Some("dwm")) {
+            Ok(d) => d,
+            Err(e) => panic!("panel capture: {e}"),
+        };
+        assert_eq!(d.kind(), "dwm");
+        let a = d.grab().unwrap().expect("a frame");
+        assert_eq!((a.w, a.h), (testwin::KNOB_W as u32, testwin::KNOB_H as u32), "the panel only");
+        assert_eq!(d.display_size(), None);
+        crate::input::win::post(t.knob, &crate::input::WinMsg { msg: 0x0201, wparam: 1, lparam: crate::input::make_lparam(100, 100) }).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut changed = false;
+        while t0.elapsed() < std::time::Duration::from_millis(1000) {
+            if let Ok(Some(b)) = d.grab() {
+                if crate::stream::dirty_rect(&a, &b).is_some() {
+                    changed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let _ = crate::input::win::post(t.knob, &crate::input::WinMsg { msg: 0x0202, wparam: 0, lparam: crate::input::make_lparam(100, 100) });
+        assert!(changed, "the press is seen in the cut-out panel");
     }
 
     /// Le plantage du 21 oct. : un fil de connexion ouvre WGC puis se termine ; le suivant ouvrait WGC sur un MTA
