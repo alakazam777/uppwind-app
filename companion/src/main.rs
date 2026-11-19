@@ -252,6 +252,9 @@ struct Args {
     bench: Option<String>,
     bench_clicks: Vec<(f64, f64)>,
     bench_out: Option<String>,
+    /// (19 nov., soir) --bench-gestures "drag:x,y,dy;wheel:x,y,dy" et --bench-mode direct|focus (bench.rs)
+    bench_gestures: Option<String>,
+    bench_mode: Option<String>,
     install: bool,
     uninstall: bool,
     autostart: Option<bool>,
@@ -296,6 +299,8 @@ fn parse_args() -> Result<Args, String> {
             "--logic-view" => a.logic_view = Some(val("--logic-view")?),
             "--bench" => a.bench = Some(val("--bench")?),
             "--bench-out" => a.bench_out = Some(val("--bench-out")?),
+            "--bench-gestures" => a.bench_gestures = Some(val("--bench-gestures")?),
+            "--bench-mode" => a.bench_mode = Some(val("--bench-mode")?),
             "--bench-clicks" => {
                 for p in val("--bench-clicks")?.split(';').filter(|p| !p.trim().is_empty()) {
                     let (x, y) = p.split_once(',').ok_or("--bench-clicks x,y;x,y")?;
@@ -527,7 +532,9 @@ fn probe(name: &str, seconds: f64, force: Option<&str>, any: bool) -> i32 {
         print_windows();
         return 2;
     };
-    let mut cap = match capture::open(w.id, force) {
+    // (19 nov., soir) le chemin du serveur (session.rs) : une sous-fenetre (le panneau d'un plugin de FL) est decoupee
+    // dans sa fenetre de premier niveau ; capture::open seul la filmait comme une fenetre a part
+    let mut cap = match capture::open_plugin(w.id, &w.plugin, force) {
         Ok(c) => c,
         Err(e) => {
             println!("Cannot capture \"{}\": {e}", w.title);
@@ -887,6 +894,9 @@ fn main() {
     }
     #[cfg(windows)]
     if let Some(name) = &args.bench {
+        if let Some(g) = &args.bench_gestures {
+            std::process::exit(bench::gestures(name, g, args.bench_mode.as_deref().unwrap_or("direct"), args.bench_out.as_deref()));
+        }
         std::process::exit(bench::run(name, &args.bench_clicks, args.bench_out.as_deref(), args.seconds));
     }
     if let Some(name) = &args.probe {

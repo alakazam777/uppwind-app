@@ -707,6 +707,176 @@
    "code": "wrong_direction"
   },
   {
+   "name": "editor-ok",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6,
+    "open": true
+   },
+   "ok": true,
+   "out": {
+    "id": 6,
+    "open": true
+   }
+  },
+  {
+   "name": "editor-close",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6,
+    "open": false
+   },
+   "ok": true,
+   "out": {
+    "id": 6,
+    "open": false
+   }
+  },
+  {
+   "name": "editor-no-open",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "editor-open-not-bool",
+   "cmd": 96,
+   "from": "studio",
+   "data": {
+    "id": 6,
+    "open": 1
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "editor-from-daw",
+   "cmd": 96,
+   "from": "daw",
+   "data": {
+    "id": 6,
+    "open": true
+   },
+   "ok": false,
+   "code": "wrong_direction"
+  },
+  {
+   "name": "editor-ack-ok",
+   "cmd": 97,
+   "from": "daw",
+   "data": {
+    "id": 6,
+    "open": true,
+    "extra": "x"
+   },
+   "ok": true,
+   "out": {
+    "id": 6,
+    "open": true
+   }
+  },
+  {
+   "name": "param-set-clamped",
+   "cmd": 54,
+   "from": "studio",
+   "data": {
+    "id": 5,
+    "p": 70,
+    "v": 1.7
+   },
+   "ok": true,
+   "out": {
+    "id": 5,
+    "p": 70,
+    "v": 1
+   }
+  },
+  {
+   "name": "param-set-bad-index",
+   "cmd": 54,
+   "from": "studio",
+   "data": {
+    "id": 5,
+    "p": 4096,
+    "v": 0.5
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
+   "name": "param-set-from-daw",
+   "cmd": 54,
+   "from": "daw",
+   "data": {
+    "id": 5,
+    "p": 1,
+    "v": 0.5
+   },
+   "ok": false,
+   "code": "wrong_direction"
+  },
+  {
+   "name": "params-reply-drops-bad-items",
+   "cmd": 53,
+   "from": "daw",
+   "data": {
+    "id": 5,
+    "items": [
+     {
+      "p": 1,
+      "name": "a",
+      "v": 0.5
+     },
+     {
+      "p": -1,
+      "name": "b",
+      "v": 0
+     },
+     {
+      "p": 2,
+      "v": 0.1
+     },
+     {
+      "p": 3,
+      "name": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "v": 2
+     }
+    ]
+   },
+   "ok": true,
+   "out": {
+    "id": 5,
+    "items": [
+     {
+      "p": 1,
+      "name": "a",
+      "v": 0.5
+     },
+     {
+      "p": 3,
+      "name": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "v": 1
+     }
+    ]
+   }
+  },
+  {
+   "name": "param-changed-no-items",
+   "cmd": 56,
+   "from": "daw",
+   "data": {
+    "id": 5
+   },
+   "ok": false,
+   "code": "invalid"
+  },
+  {
    "name": "hello-studio-caps",
    "cmd": 1,
    "from": "studio",
@@ -969,81 +1139,6 @@
    "ok": true,
    "out": {
     "bpm": 999
-   }
-  },
-  {
-   "name": "editor-ok",
-   "cmd": 96,
-   "from": "studio",
-   "data": {
-    "id": 6,
-    "open": true
-   },
-   "ok": true,
-   "out": {
-    "id": 6,
-    "open": true
-   }
-  },
-  {
-   "name": "editor-close",
-   "cmd": 96,
-   "from": "studio",
-   "data": {
-    "id": 6,
-    "open": false
-   },
-   "ok": true,
-   "out": {
-    "id": 6,
-    "open": false
-   }
-  },
-  {
-   "name": "editor-no-open",
-   "cmd": 96,
-   "from": "studio",
-   "data": {
-    "id": 6
-   },
-   "ok": false,
-   "code": "invalid"
-  },
-  {
-   "name": "editor-open-not-bool",
-   "cmd": 96,
-   "from": "studio",
-   "data": {
-    "id": 6,
-    "open": 1
-   },
-   "ok": false,
-   "code": "invalid"
-  },
-  {
-   "name": "editor-from-daw",
-   "cmd": 96,
-   "from": "daw",
-   "data": {
-    "id": 6,
-    "open": true
-   },
-   "ok": false,
-   "code": "wrong_direction"
-  },
-  {
-   "name": "editor-ack-ok",
-   "cmd": 97,
-   "from": "daw",
-   "data": {
-    "id": 6,
-    "open": true,
-    "extra": "x"
-   },
-   "ok": true,
-   "out": {
-    "id": 6,
-    "open": true
    }
   }
  ]

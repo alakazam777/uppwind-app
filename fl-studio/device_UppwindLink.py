@@ -33,6 +33,17 @@ supprimer un canal, choisir les ports MIDI d'un canal (getChannelMidiInPort se l
 caps ne contient donc ni 'plugins', ni 'add', ni 'remove' : le studio dit « Add the plugin in FL's
 channel rack; it appears here instantly ».
 
+(19 nov., 1.4.0) Les PARAMETRES d'un plugin (cap 'params') : « Link to controller » sur la fenetre du plugin dans le
+studio. PARAMS {id, start?} -> PARAMS_REPLY : les parametres NOMMES du plugin du canal id (un VST en annonce 4240 :
+4096 normaux, la plupart sans nom, puis ses « MIDI CC » ; seuls les 4096 premiers comptent), pagines. PARAM_SET
+{id, p, v} : plugins.setParamValue sans reprise (le studio fait la sienne). PARAM_WATCH {id} : le canal suivi (un a
+la fois ; sans id : aucun) ; ses valeurs sont relues quand FL dit qu'une valeur de plugin a change (OnRefresh,
+HW_Dirty_ControlValues = 4096, mesure le 19 nov. : il part a chaque bouton tourne dans la fenetre du plugin), au plus
+toutes les PARAM_EVERY, et au moins toutes les PARAM_POLL ; ce qui a change part en PARAM_CHANGED, avec la barre
+d'aide de FL (ui.getHintMsg : « FX Delay Dry / Wet: 0.38 », le dernier reglage touche). Mesure sur TAL-U-NO-LX : 74
+parametres nommes, leurs valeurs relues en 0,03 ms ; un instrument de FL (FLEX) : 44 ms, d'ou la relecture seulement
+quand FL le dit. Un reglage pose par PARAM_SET n'est pas renvoye (son echo est ignore).
+
 (19 nov., 1.3.0) EDITOR {id, open} (cap 'editor') : la fenetre de l'instrument s'ouvre dans FL, a la demande du
 studio (Follow track, quand le compagnon ne la trouve pas). channels.showEditor(index, 1), pose au prochain OnIdle
 (pas dans le traitement du SysEx) ; la reponse EDITOR_ACK part alors. FERMER est refuse (unsupported) : mesure du
@@ -76,10 +87,10 @@ import ui
 
 import uwlink_protocol as P
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 TAG = "[Uppwind Link]"
 DAW_NAME = "FL Studio"
-CAPS = ["list", "bind", "set", "audition", "tempo", "notes", "editor"]
+CAPS = ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params"]
 ADD_HINT = "Add the plugin in FL's channel rack; it appears here instantly."
 # (26 oct.) le plugin des notes, son parametre « Link tag » (0..255, 0 : aucun), les ports MIDI de FL
 NOTES_NAME = "Uppwind Link Notes"
@@ -94,6 +105,11 @@ MUTE_CHECK = 0.06           # s entre deux verifications des mutes
 OUT_PER_TICK = 8            # morceaux SysEx envoyes par appel (le reste au prochain OnIdle)
 STRUCT_CHECK = 2.0          # s : filet de securite (le nombre de canaux a-t-il change sans qu'on le dise ?)
 VST_CC_BASE = 4096          # parametres des VST : 4096 normaux, puis 128 « MIDI CC », puis 16 aftertouch
+PARAMS_PAGE = 100           # parametres par PARAMS_REPLY (~ 50 octets chacun)
+PARAM_EVERY = 0.04          # s : au plus un PARAM_CHANGED toutes les 40 ms
+PARAM_POLL = 0.5            # s : relue meme sans OnRefresh (une automation ne le dit pas toujours)
+PARAM_EPS = 0.0005          # un changement plus petit ne compte pas (l'arrondi du protocole est 1e-4)
+HW_DIRTY_CONTROL_VALUES = getattr(midi, "HW_Dirty_ControlValues", 4096)
 TEMPO_CHECK = P.TEMPO_MIN_INTERVAL_MS / 1000.0   # s entre deux lectures du tempo de FL (et deux TEMPO_CHANGED)
 FL_TEMPO_MIN = 10.0         # le tempo de FL va de 10 a 522 BPM
 FL_TEMPO_MAX = 522.0
@@ -171,6 +187,14 @@ class _State(object):
         self.said = {}
         # (19 nov., 1.3.0) EDITOR en attente du prochain OnIdle : (req, index, open) ; le dernier demande gagne
         self.editor = None
+        # (19 nov., 1.4.0) les parametres : index -> [(p, nom)] (cache, oublie quand le rack change) ; le canal suivi,
+        # ses dernieres valeurs (p -> v), FL a-t-il dit qu'une valeur a change, la derniere lecture
+        self.pnames = {}
+        self.pw = None
+        self.pw_last = {}
+        self.pw_dirty = False
+        self.pw_at = 0.0
+        self.pw_sig = None
 
 
 S = _State()
@@ -550,6 +574,99 @@ def _param_count(i):
     return S.cc_params[i]
 
 
+def _param_names(i):
+    """(19 nov., 1.4.0) Les parametres nommes du plugin du canal i : [(p, nom)] (cache)."""
+    if i not in S.pnames:
+        out = []
+        if _plugin_valid(i):
+            n = min(_param_count(i), VST_CC_BASE)
+            for p in range(n):
+                try:
+                    nm = str(plugins.getParamName(*((p,) + _pg(i, -1))) or "").strip()
+                except Exception:
+                    nm = ""
+                if nm:
+                    out.append((p, nm))
+        S.pnames[i] = out
+    return S.pnames[i]
+
+
+def _param_value(i, p):
+    v = float(plugins.getParamValue(*((p,) + _pg(i, -1))))
+    return min(1.0, max(0.0, v)) if v == v else 0.0
+
+
+def _params_page(i, start):
+    names = _param_names(i)
+    items = []
+    k = start
+    while k < len(names) and len(items) < PARAMS_PAGE:
+        p, nm = names[k]
+        try:
+            v = _param_value(i, p)
+        except Exception:
+            v = 0.0
+        items.append({"p": p, "name": nm[:64], "v": round(v, 4)})
+        k += 1
+    data = {"id": i, "plugin": _plugin_name(i)[:64], "items": items}
+    if k < len(names):
+        data["next"] = k
+    return data
+
+
+def _param_set(i, p, v):
+    plugins.setParamValue(*((float(v), p) + _pg(i, -1, PIM_NONE)))
+    if S.pw == i:
+        S.pw_last[p] = float(v)        # pas d'echo : le studio sait ce qu'il a pose
+
+
+def _param_watch(i):
+    S.pw = i
+    S.pw_sig = (_name(i), _plugin_name(i)) if i is not None else None
+    S.pw_last = {}
+    S.pw_dirty = False
+    S.pw_at = 0.0
+    if i is None:
+        return
+    for p, _ in _param_names(i):
+        try:
+            S.pw_last[p] = _param_value(i, p)
+        except Exception:
+            pass
+
+
+def _param_check(now):
+    i = S.pw
+    if i is None or now - S.pw_at < PARAM_EVERY:
+        return
+    if not S.pw_dirty and now - S.pw_at < PARAM_POLL:
+        return
+    S.pw_at = now
+    S.pw_dirty = False
+    if not _plugin_valid(i):
+        S.pw = None
+        return
+    changed = []
+    for p, _ in _param_names(i):
+        try:
+            v = _param_value(i, p)
+        except Exception:
+            continue
+        old = S.pw_last.get(p)
+        S.pw_last[p] = v
+        if old is not None and abs(v - old) > PARAM_EPS and len(changed) < P.MAX_PARAM_CHANGES:
+            changed.append({"p": p, "v": round(v, 4)})
+    if changed:
+        data = {"id": i, "items": changed}
+        try:
+            hint = str(ui.getHintMsg() or "").strip()
+        except Exception:
+            hint = ""
+        if hint:
+            data["hint"] = hint[:80]
+        _send(P.PARAM_CHANGED, 0, data)
+
+
 def _cc(slot, cc, value):
     if cc in P.ALL_OFF_CCS:
         _release_slot(slot)
@@ -759,6 +876,9 @@ def _reset_session(restore=True):
     S.cc_params.clear()
     S.tag_param.clear()
     S.tags.clear()
+    S.pnames.clear()
+    S.pw = None
+    S.pw_last = {}
 
 
 # -- La structure du rack a change ----------------------------------------------------------
@@ -786,6 +906,7 @@ def _remap(mapping):
         d.update(moved)
     S.cc_params.clear()
     S.tag_param.clear()
+    S.pnames.clear()
 
 
 def _rack(n):
@@ -832,6 +953,14 @@ def _reconcile_structure():
     S.cc_params.clear()
     S.tag_param.clear()
     S.tags.clear()
+    S.pnames.clear()
+    if S.pw is not None:
+        # (1.4.0) le canal suivi, comme un lien : retrouve par son nom et son plugin (le plus proche), sinon plus rien
+        pw = S.pw
+        if pw >= n or sigs[pw] != S.pw_sig:
+            cands = [i for i, s in enumerate(sigs) if s == S.pw_sig]
+            pw = min(cands, key=lambda i: (abs(i - S.pw), i)) if cands else None
+        _param_watch(pw)
     if S.session:
         _sync_tags()                # (26 oct.) un Notes ajoute, deplace : son numero suit son port
     sig = tuple(rack)
@@ -1040,6 +1169,21 @@ def _dispatch(cmd, req, data):
             _error(req, P.ERR_UNSUPPORTED, "Close the plugin's window in FL Studio itself.")
             return
         S.editor = (req, d["id"], True)
+    elif cmd == P.PARAMS:
+        if not _playable(d["id"]) or not _plugin_valid(d["id"]):
+            _error(req, P.ERR_NOT_FOUND, "No plugin at position %d of the channel rack." % (d["id"] + 1))
+            return
+        _send(P.PARAMS_REPLY, req, _params_page(d["id"], d.get("start", 0)))
+    elif cmd == P.PARAM_SET:
+        if not _playable(d["id"]) or not _plugin_valid(d["id"]):
+            _error(0, P.ERR_NOT_FOUND, "No plugin at position %d of the channel rack." % (d["id"] + 1))
+            return
+        _param_set(d["id"], d["p"], d["v"])
+    elif cmd == P.PARAM_WATCH:
+        i = d.get("id")
+        if i is not None and (not _playable(i) or not _plugin_valid(i)):
+            i = None
+        _param_watch(i)
     elif cmd == P.PING:
         _send(P.PONG, req, {"t": d["t"]})
     elif cmd == P.ERROR:
@@ -1170,6 +1314,8 @@ def OnIdle():
         now = _now()
         if S.editor is not None:
             _show_editor()
+        if S.pw is not None:
+            _param_check(now)
         _flush()
         if S.dirty and now - S.dirty_at >= CHANGE_SETTLE:
             S.dirty = False
@@ -1196,6 +1342,8 @@ def OnIdle():
 
 def OnRefresh(flags):
     try:
+        if int(flags) & HW_DIRTY_CONTROL_VALUES:
+            S.pw_dirty = True
         if int(flags) & REFRESH_FLAGS:
             _mark_dirty()
     except Exception:

@@ -53,6 +53,11 @@ BIND = 0x20
 BIND_ACK = 0x21
 UNBIND = 0x22
 SET = 0x30
+PARAMS = 0x34
+PARAMS_REPLY = 0x35
+PARAM_SET = 0x36
+PARAM_WATCH = 0x37
+PARAM_CHANGED = 0x38
 PLUGINS = 0x40
 PLUGINS_REPLY = 0x41
 ADD = 0x42
@@ -66,7 +71,7 @@ PING = 0x70
 PONG = 0x71
 ERROR = 0x7F
 
-CAPS = ("list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes", "editor")
+CAPS = ("list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes", "editor", "params")
 # (25 oct.) BIND.via : 'port' (le port loopMIDI « Uppwind Link », canal n) ou 'plugin' (cap 'notes' : la piste prend
 # ses notes du plugin Uppwind Link Notes, sans port MIDI) ; BIND_ACK.via le redit, BIND_ACK.notes = le numero du Notes
 VIAS = ("port", "plugin")
@@ -128,6 +133,14 @@ ITEM_SCHEMA = _obj([
     ("id", _req(_ID)), ("name", _req(_str(64))), ("plugin", _str(64)), ("kind", _str(24)),
     ("color", _COLOR), ("slots", _list(_SLOT, 16)),
 ])
+# (19 nov., cap 'params') un parametre d'un plugin : son numero chez le logiciel hote, son nom, sa valeur 0..1
+PARAM_MAX = 4095
+MAX_PARAMS = 512
+MAX_PARAM_CHANGES = 128
+_PARAM_P = _int(0, PARAM_MAX)
+_PARAM_V = _num(0, 1)
+PARAM_SCHEMA = _obj([("p", _req(_PARAM_P)), ("name", _req(_str(64))), ("v", _req(_PARAM_V))])
+PARAM_VALUE_SCHEMA = _obj([("p", _req(_PARAM_P)), ("v", _req(_PARAM_V))])
 PLUGIN_SCHEMA = _obj([
     ("id", _req(_str(200, 1))), ("name", _req(_str(80))), ("vendor", _str(60)), ("kind", _str(24)),
 ])
@@ -150,6 +163,16 @@ COMMANDS = {
     SET: ("SET", "studio", None, "set",
           _obj([("id", _req(_ID)), ("vol", _num(0, 1)), ("pan", _num(-1, 1)), ("mute", _BOOL),
                 ("solo", _BOOL)])),
+    PARAMS: ("PARAMS", "studio", PARAMS_REPLY, "params", _obj([("id", _req(_ID)), ("start", _int(0, 1000000))])),
+    PARAMS_REPLY: ("PARAMS_REPLY", "daw", None, None,
+                   _obj([("id", _req(_ID)), ("plugin", _str(64)), ("items", _req(_list(PARAM_SCHEMA, MAX_PARAMS))),
+                         ("next", _NEXT)])),
+    PARAM_SET: ("PARAM_SET", "studio", None, "params",
+                _obj([("id", _req(_ID)), ("p", _req(_PARAM_P)), ("v", _req(_PARAM_V))])),
+    PARAM_WATCH: ("PARAM_WATCH", "studio", None, "params", _obj([("id", _ID)])),
+    PARAM_CHANGED: ("PARAM_CHANGED", "daw", None, None,
+                    _obj([("id", _req(_ID)), ("items", _req(_list(PARAM_VALUE_SCHEMA, MAX_PARAM_CHANGES))),
+                          ("hint", _str(80))])),
     PLUGINS: ("PLUGINS", "studio", PLUGINS_REPLY, "plugins", _obj([("start", _int(0, 1000000))])),
     PLUGINS_REPLY: ("PLUGINS_REPLY", "daw", None, None,
                     _obj([("items", _req(_list(PLUGIN_SCHEMA, 2000))), ("next", _NEXT)])),

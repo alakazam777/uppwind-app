@@ -229,6 +229,17 @@ pub fn escape_refused(vk: u16, fl: bool, menu_open: bool) -> bool {
     vk == 0x1B && fl && !menu_open
 }
 
+/// (19 nov., soir, mesure sur FL 2026) Les boutons des plugins de FL lui-meme (FLEX, Fruity Limiter…) suivent le VRAI
+/// curseur pendant un appui, pas les messages : en mode Direct, le meme glisser vers le haut fait monter le bouton si le
+/// vrai curseur est au-dessus, descendre s'il est au-dessous (le bouton saute vers lui). Un clic seul (appui, relache,
+/// sans deplacement) ne le bouge pas. En Direct, les deplacements pendant un appui ne partent donc pas a un panneau
+/// natif de FL (sauf dans un menu ouvert) : le clic reste, le glisser se fait en mode Focus.
+pub const FL_NATIVE_DRAG_REFUSED: &str = "FL Studio's own knobs follow the real mouse: switch Plugin window to Focus to turn them (clicks work in Direct)";
+
+pub fn fl_native_drag_refused(native: bool, action: PointerAction, buttons: u8, in_popup: bool) -> bool {
+    native && action == PointerAction::Move && buttons != 0 && !in_popup
+}
+
 /// KeyboardEvent.code (la touche physique) → touche virtuelle Windows et « etendue ». Les lettres et chiffres :
 /// leur VK ; la ponctuation : les VK_OEM d'un clavier US (le caractere, lui, part en WM_CHAR depuis `key`).
 pub fn vk_of_code(code: &str) -> Option<(u16, bool)> {
@@ -389,6 +400,8 @@ pub struct Injector {
     key_target: u64,
     /// FOCUS : le geste en cours, rejoue au relachement.
     pending: Vec<Step>,
+    /// (19 nov., soir) cet appui a deja vu un glisser refuse sur un panneau natif de FL (FL_NATIVE_DRAG_REFUSED)
+    native_refused: bool,
     /// (19 nov.) FOCUS : un menu garde (voir l'en-tete) — les gestes qui l'ouvrent, chacun avec les menus qu'il a
     /// laisses ouverts (par rapport a la zone client), et la fenetre suivie a qui il est
     held: Vec<(Vec<Step>, Vec<Rect>)>,
@@ -426,6 +439,7 @@ impl Default for Injector {
             drag: None,
             key_target: 0,
             pending: Vec::new(),
+            native_refused: false,
             held: Vec::new(),
             held_top: 0,
             mac_clicks: 1,
@@ -629,6 +643,17 @@ impl Injector {
                     (Some(t), PointerAction::Move | PointerAction::Up) if win::is_inside(top, t) || win::in_popup(top, t) => (t, win::map_to(top, t, p)),
                     _ => win::hit_with_popups(top, p),
                 };
+                if fl_native_drag_refused(win::is_fl_native_panel(top), *action, *buttons, win::in_popup(top, target)) {
+                    // une seule erreur par appui : le studio le dit une fois, les deplacements suivants passent sous silence
+                    if self.native_refused {
+                        return Ok(Outcome { applied: false, pointer: Some(p) });
+                    }
+                    self.native_refused = true;
+                    return Err(FL_NATIVE_DRAG_REFUSED.into());
+                }
+                if matches!(action, PointerAction::Down | PointerAction::DblClick) {
+                    self.native_refused = false;
+                }
                 let tp = win::to_window_dpi(target, top, tp);
                 let msgs = pointer_msgs(*action, *button, *buttons, *mods, tp, win::wants_dblclk(target));
                 for m in &msgs {
@@ -1176,6 +1201,14 @@ pub mod win {
         } else {
             r
         }
+    }
+
+    /// (19 nov., soir) `top` est-il le panneau d'un plugin de FL lui-meme (un TWPControlForm dans une TPluginForm) ?
+    pub fn is_fl_native_panel(top: u64) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        let mut c = [0u16; 64];
+        let n = unsafe { GetClassNameW(h(top), &mut c) }.max(0) as usize;
+        String::from_utf16_lossy(&c[..n]) == crate::plugins::FL_NATIVE_PANEL_CLASS && in_fl_plugin_form(top)
     }
 
     /// (19 nov.) `top` est-il le panneau d'un plugin de FL Studio (une sous-fenetre d'une `TPluginForm`, plugins.rs) ?
@@ -1835,6 +1868,18 @@ mod tests {
         assert!(!escape_refused(esc, false, false), "Live: Escape goes to the plugin, as before");
         assert!(!escape_refused(vk_of_code("KeyA").unwrap().0, true, false), "only Escape");
         assert!(!escape_refused(vk_of_code("Enter").unwrap().0, true, false));
+    }
+
+    /// (19 nov., soir) Un panneau natif de FL en Direct : le clic passe, le glisser non (sauf dans un menu ouvert).
+    #[test]
+    fn a_direct_drag_never_reaches_an_fl_native_panel() {
+        use PointerAction::*;
+        assert!(fl_native_drag_refused(true, Move, 1, false), "the knob would jump toward the real cursor");
+        assert!(!fl_native_drag_refused(true, Down, 1, false), "the press goes (a click)");
+        assert!(!fl_native_drag_refused(true, Up, 0, false), "the release goes");
+        assert!(!fl_native_drag_refused(true, Move, 0, false), "hovering goes");
+        assert!(!fl_native_drag_refused(true, Move, 1, true), "inside an open menu of the plugin");
+        assert!(!fl_native_drag_refused(false, Move, 1, false), "a VST in FL, or Live: as before");
     }
 
     fn pt(x: f64, y: f64, iw: Option<f64>, ih: Option<f64>) -> Pt {

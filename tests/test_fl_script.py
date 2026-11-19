@@ -50,7 +50,7 @@ def load_midi():
     for k, v in dict(CT_Sampler=0, CT_Hybrid=1, CT_GenPlug=2, CT_Layer=3, CT_AudioClip=4, CT_AutoClip=5,
                      PIM_None=0, HW_Dirty_Names=16384, HW_Dirty_Colors=8192, HW_Dirty_ChannelRack=262144,
                      HW_Dirty_ChannelRackGroup=32768, HW_Dirty_LEDs=256, CE_New=0, CE_Delete=1, CE_Replace=2,
-                     CE_Rename=3, CE_Select=4, PL_Start=0, PL_LoadOk=100, PL_LoadError=101).items():
+                     CE_Rename=3, CE_Select=4, HW_Dirty_ControlValues=4096, PL_Start=0, PL_LoadOk=100, PL_LoadError=101).items():
         setattr(mod, k, v)
     mod.__real__ = False
     return mod
@@ -81,6 +81,7 @@ class World(object):
         self.rec = []            # (id, valeur, drapeaux) de general.processRECEvent
         self.docs = False
         self.editors = []        # (19 nov.) channels.showEditor : (index, valeur)
+        self.hint = ""
         self.in_sysex = False    # (19 nov.) vrai pendant le traitement d'un SysEx (showEditor y est interdit ici)
 
     def add(self, name, plugin=None, ctype=2, color=0x5F7581, vst=False, vol=0.78125, pan=0.0, muted=False, port=-2,
@@ -242,6 +243,7 @@ def make_modules(w):
 
     ui = types.ModuleType("ui")
     ui.getProgTitle = lambda: w.title
+    ui.getHintMsg = lambda: w.hint     # (19 nov.) la barre d'aide : le dernier reglage touche
     ui.getVersion = lambda mode=4: (2026, 1, 0, 5123)[mode] if mode < 4 else "Producer Edition v2026.1.0 [build 5123]"
     return {"channels": ch, "plugins": pl, "device": dev, "general": gen, "mixer": mx, "ui": ui, "midi": MIDI}
 
@@ -336,6 +338,115 @@ class Rig(object):
 
 
 # -- Les tests ------------------------------------------------------------------------------
+def params_rig():
+    def setup(w):
+        w.add("Kick", None, ctype=0)
+        w.add("TAL", "TAL U-No-LX-V2", vst=True, pnames={0: "modulation", 10: "filter cutoff", 70: "FX Delay Dry / Wet",
+                                                        4100: "MIDI CC #4"})
+        w.add("FLEX Keys", "FLEX")
+    r = Rig(setup=setup)
+    r.w.chans[1]["pv"].update({10: 1.0, 70: 0.304})
+    r.hello()
+    return r
+
+
+@test
+def params_lists_the_named_parameters_of_a_plugin_paged():
+    # (19 nov., 1.4.0) PARAMS : les parametres NOMMES (jamais les « MIDI CC » au-dela de 4096), pagines
+    r = params_rig()
+    cmd, req, d = r.ask(P.PARAMS, {"id": 1})
+    assert cmd == P.PARAMS_REPLY, (cmd, d)
+    assert d == {"id": 1, "plugin": "TAL U-No-LX-V2", "items": [
+        {"p": 0, "name": "modulation", "v": 0}, {"p": 10, "name": "filter cutoff", "v": 1},
+        {"p": 70, "name": "FX Delay Dry / Wet", "v": 0.304}]}, d
+    names = dict((p, "p%d" % p) for p in range(250))
+    r.w.chans[1]["pnames"] = names
+    r.s.S.pnames.clear()
+    got, start = [], 0
+    while start is not None:
+        cmd, req, d = r.ask(P.PARAMS, {"id": 1, "start": start})
+        got += [it["p"] for it in d["items"]]
+        start = d.get("next")
+    assert got == list(range(250)), got
+    # pas de plugin : un sampler, un clip d'automation, un canal qui n'existe pas
+    for i in (0, 9):
+        cmd, req, d = r.ask(P.PARAMS, {"id": i})
+        assert cmd == P.ERROR and d["code"] == P.ERR_NOT_FOUND, (cmd, d)
+    assert not r.w.non_global, r.w.non_global
+
+
+@test
+def param_set_moves_the_plugin_parameter_without_pickup():
+    r = params_rig()
+    r.send(P.PARAM_SET, {"id": 1, "p": 10, "v": 0.25}, req=0)
+    r.replies()
+    assert r.w.params == [(1, 10, 0.25)], r.w.params
+    r.send(P.PARAM_SET, {"id": 0, "p": 10, "v": 0.25}, req=0)
+    out = r.replies()
+    assert [c for c, q, d in out] == [P.ERROR], out
+    assert r.w.params == [(1, 10, 0.25)], r.w.params
+
+
+@test
+def param_watch_pushes_what_moved_in_the_plugin_window_with_the_hint():
+    r = params_rig()
+    r.send(P.PARAM_WATCH, {"id": 1}, req=0)
+    assert pushed(r) == []
+    # l'utilisateur tourne Delay Wet dans la fenetre de TAL : FL dit HW_Dirty_ControlValues, la barre d'aide le nomme
+    r.w.chans[1]["pv"][70] = 0.444
+    r.w.hint = "FX Delay Dry / Wet: 0.44 "
+    r.s.OnRefresh(4096)
+    r.advance(0.05)
+    assert pushed(r) == [(P.PARAM_CHANGED, {"id": 1, "items": [{"p": 70, "v": 0.444}],
+                                           "hint": "FX Delay Dry / Wet: 0.44"})]
+    # rien de change : rien ne part (meme apres la relecture lente)
+    r.s.OnRefresh(4096)
+    r.advance(1.0)
+    assert pushed(r) == []
+    # une automation sans OnRefresh : relue au plus tard toutes les PARAM_POLL
+    r.w.hint = ""
+    r.w.chans[1]["pv"][10] = 0.5
+    r.advance(r.s.PARAM_POLL + 0.05)
+    assert pushed(r) == [(P.PARAM_CHANGED, {"id": 1, "items": [{"p": 10, "v": 0.5}]})]
+    # ce que le studio pose lui-meme ne revient pas (pas d'echo)
+    r.send(P.PARAM_SET, {"id": 1, "p": 10, "v": 0.75}, req=0)
+    r.s.OnRefresh(4096)
+    r.advance(0.05)
+    assert pushed(r) == []
+    # au plus un PARAM_CHANGED toutes les PARAM_EVERY
+    for k in range(10):
+        r.w.chans[1]["pv"][70] = 0.1 + k / 100.0
+        r.s.OnRefresh(4096)
+        r.s.OnIdle()
+    assert len(pushed(r)) <= 2
+    # ne plus suivre
+    r.send(P.PARAM_WATCH, {}, req=0)
+    r.w.chans[1]["pv"][70] = 0.9
+    r.s.OnRefresh(4096)
+    r.advance(1.0)
+    assert pushed(r) == []
+    assert not r.w.non_global, r.w.non_global
+
+
+@test
+def param_watch_follows_its_channel_when_the_rack_changes():
+    r = params_rig()
+    r.send(P.PARAM_WATCH, {"id": 1}, req=0)
+    pushed(r)
+    # un canal insere avant TAL : il passe en 2, le suivi le suit
+    r.w.chans.insert(0, {"name": "New", "plugin": None, "type": 0, "color": 0, "vst": False, "vol": 0.78125,
+                         "pan": 0.0, "muted": False, "port": -2, "pnames": {}, "pv": {}})
+    r.s.OnRefresh(MIDI.HW_Dirty_ChannelRack)
+    r.advance(1.0)
+    pushed(r)
+    assert r.s.S.pw == 2, r.s.S.pw
+    r.w.chans[2]["pv"][70] = 0.6
+    r.s.OnRefresh(4096)
+    r.advance(0.05)
+    out = [d for c, d in pushed(r) if c == P.PARAM_CHANGED]
+    assert out == [{"id": 2, "items": [{"p": 70, "v": 0.6}]}], out
+
+
 @test
 def editor_opens_and_closes_an_instrument_window_from_idle():
     # (19 nov., 1.3.0) EDITOR : la fenetre du canal s'ouvre (1) ou se ferme (0) au prochain OnIdle, puis EDITOR_ACK
@@ -365,7 +476,7 @@ def hello_ack_describes_fl_honestly():
     d = r.hello()
     assert d["daw"] == "FL Studio"
     assert d["project"] == "Night drive", d
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor"], d["caps"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params"], d["caps"]
     assert d["bpm"] == 140, d
     for cap in ("plugins", "add", "remove"):
         assert cap not in d["caps"]
@@ -730,7 +841,7 @@ def no_output_port_means_a_clear_hint_not_a_crash():
 def older_api_without_global_indexes_still_works():
     r = Rig(api=30)
     d = r.hello()
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params"]
     r.bind(1, 1)
     r.midi(0x90, 60, 100)
     assert r.w.notes == [(1, 60, 100)]

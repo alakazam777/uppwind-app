@@ -13,7 +13,7 @@
 //! Rien n'est envoye ; --bench-out DIR ecrit une image JPEG de la fenetre (pour trouver les points a cliquer).
 
 #[cfg(windows)]
-pub use win::run;
+pub use win::{gestures, run};
 
 #[cfg(windows)]
 mod win {
@@ -37,6 +37,128 @@ mod win {
         let avg = v.iter().sum::<f64>() / n as f64;
         let r = |x: f64| (x * 10.0).round() / 10.0;
         json!({ "n": n, "min": r(v[0]), "med": r(v[n / 2]), "p90": r(v[(n * 9 / 10).min(n - 1)]), "max": r(v[n - 1]), "avg": r(avg) })
+    }
+
+    /// (19 nov., soir) --bench-gestures "drag:x,y,dy;wheel:x,y,dy" [--bench-mode direct|focus] : les gestes du studio
+    /// (Injector, comme session.rs), en pixels de l'image du panneau. drag : appui en (x, y), 12 pas jusqu'a y+dy,
+    /// relache ; wheel : un cran (dy, en pixels de molette du navigateur, 100 = un cran) en (x, y). Chaque geste est
+    /// suivi de son contraire (le reglage revient), et l'on mesure l'image : changee apres le geste ? revenue apres le
+    /// contraire ? Les images avant / apres vont dans --bench-out. A reserver a des boutons inoffensifs.
+    pub fn gestures(name: &str, specs: &str, mode: &str, out: Option<&str>) -> i32 {
+        let wins = plugins::plugin_windows(&plugins::enumerate());
+        let needle = name.to_lowercase();
+        let Some(w) = wins.iter().find(|w| w.title.to_lowercase().contains(&needle)) else {
+            println!("No plugin window whose title contains \"{name}\"");
+            return 2;
+        };
+        let hwnd = w.id;
+        let Some(m) = crate::input::Mode::parse(mode) else {
+            println!("bad --bench-mode {mode}");
+            return 2;
+        };
+        let mut print = match capture::open_plugin(hwnd, &w.plugin, Some("print")) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("PrintWindow: {e}");
+                return 1;
+            }
+        };
+        let grab = |p: &mut Box<dyn capture::Capturer>| p.grab().ok().flatten();
+        let Some(f0) = grab(&mut print) else {
+            println!("no image");
+            return 1;
+        };
+        let (iw, ih) = (f0.w as f64, f0.h as f64);
+        println!("gestures on \"{}\" ({}×{}), mode {mode}", w.title, f0.w, f0.h);
+        let mut inj = Injector::default();
+        inj.set_mode(m);
+        let pt = |x: f64, y: f64| Pt { x, y, iw: Some(iw), ih: Some(ih) };
+        let mut send = |inj: &mut Injector, e: InputEvent| {
+            if let Err(err) = inj.handle(hwnd, &e) {
+                println!("  refused: {err}");
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        };
+        let drag = |inj: &mut Injector, send: &mut dyn FnMut(&mut Injector, InputEvent), x: f64, y: f64, dy: f64| {
+            send(inj, InputEvent::Pointer { action: PointerAction::Move, pt: pt(x, y), button: 0, buttons: 0, mods: 0 });
+            send(inj, InputEvent::Pointer { action: PointerAction::Down, pt: pt(x, y), button: 0, buttons: 1, mods: 0 });
+            for k in 1..=12 {
+                send(inj, InputEvent::Pointer { action: PointerAction::Move, pt: pt(x, y + dy * k as f64 / 12.0), button: 0, buttons: 1, mods: 0 });
+            }
+            send(inj, InputEvent::Pointer { action: PointerAction::Up, pt: pt(x, y + dy), button: 0, buttons: 0, mods: 0 });
+        };
+        // UWC_BENCH_PARK="X,Y" (ecran, pixels physiques) : le vrai curseur est pose la avant chaque geste (le mode
+        // Direct ne le bouge pas ; un plugin qui lit le vrai curseur suit alors cette place-la)
+        let parked: Option<(i32, i32)> = std::env::var("UWC_BENCH_PARK").ok().and_then(|s| {
+            let (a, b) = s.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        });
+        let park = || {
+            if let Some((px, py)) = parked {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(px, py);
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        if let Some(p) = parked {
+            println!("real cursor parked at {},{} before each gesture", p.0, p.1);
+        }
+        for (k, spec) in specs.split(';').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+            let Some((kind, nums)) = spec.split_once(':') else {
+                println!("bad gesture {spec}");
+                return 2;
+            };
+            let v: Vec<f64> = nums.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+            if v.len() != 3 {
+                println!("bad gesture {spec}");
+                return 2;
+            }
+            let (x, y, dy) = (v[0], v[1], v[2]);
+            let before = grab(&mut print);
+            park();
+            match kind {
+                "drag" => drag(&mut inj, &mut send, x, y, dy),
+                "wheel" => send(&mut inj, InputEvent::Wheel { pt: pt(x, y), dx: 0.0, dy, mods: 0 }),
+                // click:x,y,ms : appui, attente de ms, relache, au meme point (aucun deplacement)
+                "click" => {
+                    send(&mut inj, InputEvent::Pointer { action: PointerAction::Down, pt: pt(x, y), button: 0, buttons: 1, mods: 0 });
+                    std::thread::sleep(Duration::from_millis(dy.clamp(0.0, 2000.0) as u64));
+                    send(&mut inj, InputEvent::Pointer { action: PointerAction::Up, pt: pt(x, y), button: 0, buttons: 0, mods: 0 });
+                }
+                _ => {
+                    println!("bad gesture {spec}");
+                    return 2;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            let after = grab(&mut print);
+            // le contraire, depuis le meme point (le bouton) : le reglage revient
+            park();
+            match kind {
+                "drag" => drag(&mut inj, &mut send, x, y, -dy),
+                "click" => {}
+                _ => send(&mut inj, InputEvent::Wheel { pt: pt(x, y), dx: 0.0, dy: -dy, mods: 0 }),
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            let back = grab(&mut print);
+            // seulement autour du bouton (± 60 px) : FLEX montre des icones au survol, ailleurs
+            let bx = ((x - 60.0).max(0.0) as u32, (y - 60.0).max(0.0) as u32);
+            let around = |f: &Frame| stream::crop(f, (bx.0, bx.1, 120.min(f.w - bx.0), 120.min(f.h - bx.1)));
+            let area = |a: &Option<Frame>, b: &Option<Frame>| match (a, b) {
+                (Some(a), Some(b)) => stream::dirty_rect(&around(a), &around(b)).map(|r| r.2 as u64 * r.3 as u64).unwrap_or(0),
+                _ => 0,
+            };
+            println!("  {k} {spec}: changed {} px after the gesture, {} px still different after its opposite", area(&before, &after), area(&before, &back));
+            if let Some(dir) = out {
+                for (tag, f) in [("before", &before), ("after", &after), ("back", &back)] {
+                    if let Some(f) = f {
+                        let _ = std::fs::write(format!("{dir}/{mode}-{k}-{tag}.jpg"), encode::jpeg(f, 85).unwrap_or_default());
+                    }
+                }
+            }
+        }
+        0
     }
 
     pub fn run(name: &str, clicks: &[(f64, f64)], out: Option<&str>, seconds: f64) -> i32 {

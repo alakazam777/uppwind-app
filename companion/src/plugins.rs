@@ -133,9 +133,25 @@ pub fn plugin_windows(all: &[RawWindow]) -> Vec<PluginWindow> {
 
 pub const FL_PLUGIN_CLASS: &str = "TPluginForm";
 pub const FL_MAIN_CLASS: &str = "TFruityLoopsMainForm";
-/// Les panneaux qui portent le dessin d'un plugin dans FL (mesures : VST2, VST3). Ni les instruments de FL lui-meme
-/// (Sytrus, FLEX…) ni les CLAP, pas encore mesures.
+/// Les panneaux qui portent le dessin d'un plugin dans FL (mesures : VST2, VST3). Les CLAP ne sont pas encore mesures.
 pub const FL_PANEL_CLASSES: &[&str] = &["TVSTPanel", "TVST3Panel"];
+/// (19 nov., soir) Les plugins de FL lui-meme : mesure sur FL 2026 avec FLEX, Sytrus, Harmor (instruments), Fruity
+/// Reeverb 2, Fruity Parametric EQ 2, Fruity Limiter (effets). Sous la feuille visible du plugin (TVectorSheet), leur
+/// dessin est un TWPControlForm, toujours a la taille pleine de la feuille ; dedans, des TWPControl, TVectorPanel,
+/// TMEnvEditor… ne couvrent qu'une partie (Reeverb : 555 px sur 794). On prend donc le TWPControlForm le plus haut,
+/// jamais ce qu'il contient. Sytrus, Harmor, FLEX et Limiter passent par un TSynthEditorForm de meme taille, sans
+/// importance. Le Sampler (808 Clap) n'en a pas : ses onglets (TVectorSheet) sont dessines par FL, avec leur
+/// selecteur au-dessus ; pas de panneau unique, il reste hors de la liste.
+pub const FL_NATIVE_PANEL_CLASS: &str = "TWPControlForm";
+
+/// (19 nov., soir) Le panneau d'une fenetre de plugin de FL, parmi ses descendants dans l'ordre d'EnumChildWindows (en
+/// profondeur : un parent avant ses enfants), chacun (classe, visible) : le premier panneau VST visible ; sans lui, le
+/// premier TWPControlForm visible (le plus haut, a la taille pleine). Rien : None.
+pub fn fl_pick_panel(desc: &[(&str, bool)]) -> Option<usize> {
+    desc.iter()
+        .position(|(c, v)| *v && FL_PANEL_CLASSES.contains(c))
+        .or_else(|| desc.iter().position(|(c, v)| *v && *c == FL_NATIVE_PANEL_CLASS))
+}
 
 /// Un processus de FL Studio ? (« FL64.exe » ; « FL.exe » pour les anciennes versions 32 bits)
 pub fn is_fl_exe(exe: &str) -> bool {
@@ -146,7 +162,18 @@ pub fn is_fl_exe(exe: &str) -> bool {
 
 /// « TAL U-No-LX-V2 #2\u{E5A0} (Master)\u{E5FF} » → (« TAL U-No-LX-V2 #2 », « Master »). Sans piste entre parentheses :
 /// (« nom », « »). Les icones de FL (zone d'usage prive) et les caracteres de controle sont retires.
+/// (19 nov., soir) FL encadre ses ajouts par U+E5A0 … U+E5FF, parfois plusieurs : « Harmor <E5A0>TRIAL VERSION<E5FF>
+/// <E5A0> (Master)<E5FF> » (mesure). Le nom est ce qui precede le premier, la piste le dernier s'il est entre
+/// parentheses ; sans U+E5A0, la regle d'avant.
 pub fn fl_title(raw: &str) -> Option<(String, String)> {
+    if let Some(i) = raw.find('\u{E5A0}') {
+        let name = fl_clean(&raw[..i]);
+        if !name.is_empty() {
+            let last = fl_clean(raw[i..].rsplit('\u{E5A0}').next().unwrap_or(""));
+            let track = last.strip_prefix('(').and_then(|t| t.strip_suffix(')')).map(|t| t.trim().to_string()).unwrap_or_default();
+            return Some((name, track));
+        }
+    }
     let t: String = raw.chars().filter(|c| !('\u{E000}'..='\u{F8FF}').contains(c) && !c.is_control()).collect();
     let t = t.trim();
     if t.is_empty() {
@@ -161,6 +188,11 @@ pub fn fl_title(raw: &str) -> Option<(String, String)> {
         }
     }
     Some((t.to_string(), String::new()))
+}
+
+/// Sans les icones de FL (zone d'usage prive) ni les caracteres de controle, rogne.
+fn fl_clean(s: &str) -> String {
+    s.chars().filter(|c| !('\u{E000}'..='\u{F8FF}').contains(c) && !c.is_control()).collect::<String>().trim().to_string()
 }
 
 /// Le titre montre par le studio : « nom (piste) », sans les icones de FL.
@@ -336,6 +368,9 @@ impl Running {
         }
         if let Some(f) = self.fl {
             v["fl"] = f.into();
+            // (19 nov., soir) ce compagnon montre aussi les plugins de FL lui-meme (FLEX, Sytrus, Fruity Reeverb 2…) :
+            // le studio ne le promet qu'a un compagnon qui le dit
+            v["flNative"] = true.into();
         }
     }
 }
@@ -678,25 +713,23 @@ mod win {
             .collect()
     }
 
-    /// (19 nov.) Le premier panneau de plugin VISIBLE (TVSTPanel, TVST3Panel) sous une fenetre de plugin de FL ; les
-    /// onglets caches de son wrapper (reglages, enveloppes) ne le sont pas.
+    /// (19 nov.) Le panneau de plugin VISIBLE sous une fenetre de plugin de FL (fl_pick_panel : un VST, sinon un plugin
+    /// de FL lui-meme) ; les onglets caches de son wrapper (reglages, enveloppes) ne le sont pas.
     fn fl_panel(form: HWND) -> Option<super::Panel> {
         unsafe extern "system" fn each(c: HWND, lp: LPARAM) -> BOOL {
-            let found = &mut *(lp.0 as *mut Option<isize>);
+            let all = &mut *(lp.0 as *mut Vec<(isize, String, bool)>);
             let mut cls = [0u16; 64];
             let n = GetClassNameW(c, &mut cls).max(0) as usize;
-            let name = String::from_utf16_lossy(&cls[..n]);
-            if super::FL_PANEL_CLASSES.contains(&name.as_str()) && IsWindowVisible(c).as_bool() {
-                *found = Some(c.0 as isize);
-                return BOOL(0);
-            }
-            BOOL(1)
+            all.push((c.0 as isize, String::from_utf16_lossy(&cls[..n]), IsWindowVisible(c).as_bool()));
+            // quelques dizaines de descendants mesures ; une borne contre un plugin qui en creerait sans fin
+            BOOL((all.len() < 4096) as i32)
         }
-        let mut found: Option<isize> = None;
+        let mut all: Vec<(isize, String, bool)> = Vec::new();
         unsafe {
-            let _ = EnumChildWindows(Some(form), Some(each), LPARAM(&mut found as *mut Option<isize> as isize));
+            let _ = EnumChildWindows(Some(form), Some(each), LPARAM(&mut all as *mut Vec<(isize, String, bool)> as isize));
         }
-        let c = HWND(found? as *mut core::ffi::c_void);
+        let desc: Vec<(&str, bool)> = all.iter().map(|(_, c, v)| (c.as_str(), *v)).collect();
+        let c = HWND(all[super::fl_pick_panel(&desc)?].0 as *mut core::ffi::c_void);
         let mut r = RECT::default();
         unsafe {
             let _ = GetClientRect(c, &mut r);
@@ -1155,10 +1188,60 @@ mod tests {
         assert_eq!(fl_title("Lead (copy)\u{E5A0} (Insert 2)\u{E5FF}"), Some(("Lead (copy)".into(), "Insert 2".into())));
         assert_eq!(fl_title("Pigments"), Some(("Pigments".into(), String::new())));
         assert_eq!(fl_title("\u{E5A0} \u{E5FF}"), None);
+        // (19 nov., soir) mesure : Harmor en version d'essai, deux ajouts de FL
+        assert_eq!(fl_title("Harmor \u{E5A0}TRIAL VERSION\u{E5FF}\u{E5A0} (Master)\u{E5FF}"), Some(("Harmor".into(), "Master".into())));
+        assert_eq!(fl_title("Harmor \u{E5A0}TRIAL VERSION\u{E5FF}"), Some(("Harmor".into(), String::new())));
+        assert_eq!(fl_title("Fruity Parametric EQ 2\u{E5A0} (Insert 1)\u{E5FF}"), Some(("Fruity Parametric EQ 2".into(), "Insert 1".into())));
         assert_eq!(fl_display_title("Kontakt 8", "Master"), "Kontakt 8 (Master)");
         assert!(is_fl_exe("FL64.exe") && is_fl_exe("C:\\Program Files\\Image-Line\\FL Studio 2026\\FL64.exe") && is_fl_exe("fl.exe"));
         assert!(!is_fl_exe("FLEngine_x64.dll") && !is_fl_exe("ilbridge.exe") && !is_fl_exe(""));
         assert!(fl_running(&fl_desktop()) && !fl_running(&fake_desktop()));
+    }
+
+    /// (19 nov., soir) Les arbres mesures sur FL 2026 (descendants dans l'ordre d'EnumChildWindows : classe, visible,
+    /// taille) : le panneau choisi, et sa taille.
+    #[test]
+    fn picks_the_measured_fl_panels() {
+        type T = &'static [(&'static str, bool, (i32, i32))];
+        let pick = |t: T| fl_pick_panel(&t.iter().map(|(c, v, _)| (*c, *v)).collect::<Vec<_>>()).map(|i| (t[i].0, t[i].2));
+        let kontakt: T = &[
+            ("TWinControlProxy", true, (0, 0)), ("TVectorSheet", true, (1010, 679)), ("TWrapperSynthPanel", true, (1010, 679)),
+            ("TVST3Panel", true, (1010, 679)), ("Qt661QWindowIcon", true, (1010, 679)), ("TVectorPanel", false, (836, 67)),
+            ("TVectorSheet", false, (1010, 679)), ("TMEnvEditor", false, (816, 190)), ("TNewCaption", true, (1020, 35)),
+        ];
+        let reeverb: T = &[
+            ("TWinControlProxy", true, (0, 0)), ("TVectorSheet", true, (794, 240)), ("TWPControlForm", true, (794, 240)),
+            ("TWPControl", true, (555, 240)), ("TNewCaption", true, (804, 35)),
+        ];
+        let flex: T = &[
+            ("TWinControlProxy", true, (0, 0)), ("TVectorSheet", true, (1620, 900)), ("TSynthEditorForm", true, (1620, 900)),
+            ("TWPControlForm", true, (1620, 900)), ("TVectorPanel", true, (351, 900)), ("TQuickStringGrid", true, (351, 676)),
+            ("TWPControl", true, (1269, 900)), ("TVectorPanel", true, (1230, 48)), ("TNewCaption", true, (1630, 35)),
+        ];
+        let harmor: T = &[
+            ("TWinControlProxy", true, (0, 0)), ("TVectorSheet", true, (1536, 1020)), ("TSynthEditorForm", true, (1536, 1020)),
+            ("TWPControlForm", true, (1536, 1020)), ("TWinControlProxy", true, (0, 0)), ("TWPControl", true, (1400, 101)),
+            ("TMEnvEditor", true, (925, 341)), ("TNewCaption", true, (1546, 35)),
+        ];
+        // l'onglet des reglages du wrapper choisi : la feuille du plugin cachee, plus de panneau
+        let settings: T = &[
+            ("TVectorSheet", false, (794, 240)), ("TWPControlForm", false, (794, 240)), ("TVectorSheet", true, (794, 240)),
+            ("TNewCaption", true, (804, 35)),
+        ];
+        // le Sampler (808 Clap) : des onglets dessines par FL, aucun panneau
+        let sampler: T = &[
+            ("TWinControlProxy", true, (0, 0)), ("TVectorPanel", true, (836, 67)), ("TQuickSheetSelector", true, (198, 67)),
+            ("TVectorSheet", false, (836, 583)), ("TVectorSheet", true, (836, 583)), ("TVectorPanel", true, (402, 234)),
+            ("TMEnvEditor", true, (816, 190)), ("TNewCaption", true, (846, 35)),
+        ];
+        assert_eq!(pick(kontakt), Some(("TVST3Panel", (1010, 679))), "a VST keeps its panel, as in 0.4.8");
+        assert_eq!(pick(reeverb), Some(("TWPControlForm", (794, 240))), "the whole Reeverb, not its 555 px TWPControl");
+        assert_eq!(pick(flex), Some(("TWPControlForm", (1620, 900))));
+        assert_eq!(pick(harmor), Some(("TWPControlForm", (1536, 1020))));
+        assert_eq!(pick(settings), None);
+        assert_eq!(pick(sampler), None);
+        // un VST dont le wrapper contiendrait aussi un TWPControlForm visible : toujours le panneau VST
+        assert_eq!(fl_pick_panel(&[("TWPControlForm", true), ("TVSTPanel", true)]), Some(1));
     }
 
     #[test]
@@ -1169,6 +1252,7 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(r.fl, Some(true));
             assert_eq!(v["fl"], true);
+            assert_eq!(v["flNative"], true);
             assert_eq!(Running::of(&fake_desktop(), true, true).fl, Some(false));
         } else {
             assert_eq!(r.fl, None);
