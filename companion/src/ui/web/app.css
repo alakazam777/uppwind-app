@@ -23,6 +23,8 @@
     --danger: #ff5e7a;
     --ok: #8dffb0;
     --ok-2: #4fe39a;
+    /* le logo : la Helvetica du site ; sinon Segoe UI, qui a un Light sur tout Windows (Arial n'en a pas) */
+    --brand-font: "Helvetica Neue LT Std", "Helvetica Neue LT Pro", "Helvetica Neue", "Segoe UI", Helvetica, Arial, sans-serif;
     --font: "UW Helvetica LT", "Helvetica Neue LT Std", "Helvetica Neue", "Inter Tight", Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     --r: 12px;
@@ -59,16 +61,30 @@ button, input { font: inherit; color: inherit; }
     padding: 14px 22px 12px;
     border-bottom: 1px solid var(--line-2);
 }
-.uw-mark { width: 22px; height: 22px; flex: none; }
-.uw-brand { font-weight: 700; letter-spacing: 0.01em; }
-.uw-brand small { margin-left: 6px; font-weight: 400; color: var(--dim); }
+/* (19 nov.) le logo texte remplace le disque, UPPWIND en gras et LINK en Light :
+   capitales Helvetica etirees 115 % x 90 %, UPPWIND gras, LINK en Light, comme .at-brand de l'atelier, le widget
+   de l'accueil, la boutique et l'admin. L'etirement deborde de ~15 % : la marge droite du mot le rend. */
+.uw-brand {
+    display: flex; align-items: baseline; gap: 2px;
+    font: 700 15px/1 var(--brand-font); letter-spacing: -0.04em; text-transform: uppercase; white-space: nowrap;
+    color: var(--ink);
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.22), 0 0 26px rgba(197, 155, 255, 0.20);
+}
+.uw-word { display: inline-block; transform: scale(1.15, 0.9); transform-origin: 0 60%; word-spacing: -0.06em; margin-right: 1.15em; }
+.uw-word b { font-weight: 300; letter-spacing: -0.01em; }
+.uw-brand small {
+    font: 400 11px/1 var(--font); letter-spacing: 0.02em; text-transform: none; text-shadow: none; color: var(--dim);
+}
 .uw-head-right { margin-left: auto; display: flex; align-items: center; }
 .uw-dots { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; }
 .uw-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .uw-dot.is-on { background: var(--neon); box-shadow: 0 0 8px var(--neon-glow); }
 .uw-dot.is-done { background: var(--lav); }
 .uw-pill {
-    padding: 3px 9px;
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 10px;
     border-radius: 999px;
     font-size: 11px;
     font-weight: 700;
@@ -101,8 +117,14 @@ b, strong { font-weight: 700; }
 
 /* la page d'accueil */
 .uw-hero { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding-top: 18px; }
-.uw-hero-mark { width: 64px; height: 64px; margin-bottom: 14px; filter: drop-shadow(0 0 22px rgba(155, 77, 255, 0.45)); }
 .uw-hero h1 { font-size: 28px; }
+/* le logo en grand sur la page d'accueil de l'installation (19 nov.) */
+.uw-hero h1.uw-hero-word {
+    margin: 6px 0 14px;
+    font: 700 40px/1 var(--brand-font); letter-spacing: -0.04em; text-transform: uppercase; white-space: nowrap;
+    text-shadow: 0 0 14px rgba(255, 255, 255, 0.20), 0 0 40px rgba(155, 77, 255, 0.35);
+}
+.uw-hero-word .uw-word { margin-right: 0; }
 .uw-hero p { margin: 0; color: var(--ink-2); max-width: 54ch; font-size: 14px; }
 .uw-found { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 22px; }
 .uw-chip {
@@ -361,3 +383,28 @@ body[data-edge="ne"] *, body[data-edge="sw"] *, body[data-edge="nw"] *, body[dat
 .uw-settings-head { margin-bottom: 4px; }
 .uw-settings-head h1 { margin: 0; }
 .uw-card-body.is-flush { margin-left: 0; }
+
+/* ── 19 nov. : les alignements et un peu de finition ─────────────────────────────────── */
+/* la tete sans cadre : le logo au meme bord gauche que le contenu (22 px) */
+.is-frameless .uw-head { padding-left: 22px; }
+.uw-head { background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent); }
+/* une pastille d'etat devant un texte sur deux lignes : sur la premiere ligne, pas entre les deux */
+.uw-st { align-items: flex-start; }
+.uw-st::before { margin-top: calc((1.45em - 8px) / 2); }
+.uw-chip .uw-st::before { margin-top: 0; }
+/* la grille de l'etat : pas de filet sous la tete en double ; les noms des lignes en petites capitales, comme les
+   titres de Settings, sur la hauteur de la premiere ligne de la valeur */
+.uw-grid > .uw-cell-k:first-child, .uw-grid > .uw-cell-k:first-child + .uw-cell-v { border-top: 0; padding-top: 2px; }
+.uw-cell-k {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+    line-height: calc(13px * 1.45);
+}
+/* les cartes et les boutons : un reflet en haut, des transitions douces */
+.uw-card { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035); }
+.uw-btn { transition: border-color 0.12s, background 0.12s, box-shadow 0.12s; }
+.uw-btn-primary { background: linear-gradient(180deg, rgba(155, 77, 255, 0.32), rgba(155, 77, 255, 0.18)); }
+.uw-card-body.is-flush { margin-top: 10px; }
+/* les noms des lignes tiennent sur une ligne (« REMOTE CONTROL ») */
+.uw-grid { grid-template-columns: 128px 1fr; }
+/* la page d'accueil montre le logo en grand : pas une deuxieme fois dans la tete */
+.uw-head:has(+ .uw-main .uw-hero-word) .uw-brand { visibility: hidden; }

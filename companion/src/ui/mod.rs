@@ -23,6 +23,9 @@ const CSS: &str = include_str!("web/app.css");
 const JS: &str = include_str!("web/app.js");
 const TEMPLATE: &str = include_str!("web/page.html");
 
+// (19 nov.) les fenetres n'affichent plus le disque (le logo texte UPPWIND LINK, app.css .uw-brand) ;
+// build/winres.rs genere encore son PNG, garde pour un usage futur.
+#[allow(dead_code)]
 mod assets {
     include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 }
@@ -34,13 +37,12 @@ pub fn nonce() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// La page : le gabarit, le style, le script, le disque ; `preview` : un script de plus avant celui de la page (les
+/// La page : le gabarit, le style, le script ; `preview` : un script de plus avant celui de la page (les
 /// apercus de --ui-preview, qui imitent le compagnon).
 pub fn html(page: ipc::Page, nonce: &str, preview: Option<&str>) -> String {
-    let mark = format!("data:image/png;base64,{}", assets::MARK_PNG_BASE64);
     let pre = preview.map(|p| format!("<script nonce=\"{nonce}\">{p}</script>\n")).unwrap_or_default();
     // d'abord les petites valeurs du gabarit, puis le style et le script tels quels
-    let t = TEMPLATE.replace("__NONCE__", nonce).replace("__PAGE__", page.name()).replace("__MARK__", &mark).replace("__PREVIEW__", &pre);
+    let t = TEMPLATE.replace("__NONCE__", nonce).replace("__PAGE__", page.name()).replace("__PREVIEW__", &pre);
     let (a, rest) = t.split_once("__CSS__").expect("page.html has __CSS__");
     let (b, c) = rest.split_once("__JS__").expect("page.html has __JS__");
     let mut out = String::with_capacity(t.len() + CSS.len() + JS.len());
@@ -583,7 +585,8 @@ mod tests {
         let h = html(ipc::Page::Wizard, &n, None);
         assert!(h.contains(&format!("script-src 'nonce-{n}'")) && h.contains("default-src 'none'"));
         assert!(h.contains(&format!("<script nonce=\"{n}\">")) && h.contains(&format!("<style nonce=\"{n}\">")));
-        assert!(h.contains("data-page=\"wizard\"") && h.contains("data:image/png;base64,iVBOR"));
+        // (19 nov.) le logo est du texte : plus d'image dans la page
+        assert!(h.contains("data-page=\"wizard\"") && h.contains("<span class=\"uw-word\">Uppwind <b>Link</b></span>"));
         // (l'espace de noms SVG n'est pas une adresse chargee)
         let h2 = h.replace("http://www.w3.org/2000/svg", "");
         for bad in ["http://", "https://", "src=\"//", "onclick=", "onload=", " style=\""] {

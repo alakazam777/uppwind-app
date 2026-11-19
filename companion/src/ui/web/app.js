@@ -7,7 +7,6 @@
 (() => {
     'use strict';
     const PAGE = document.body.dataset.page || 'wizard';
-    const MARK = (document.querySelector('.uw-mark') || {}).src || '';
     const main = document.getElementById('main');
     const foot = document.getElementById('foot');
     const headRight = document.getElementById('head-right');
@@ -51,6 +50,8 @@
     }
     const btn = (text, onClick, cls = '', disabled = false) => h('button', { type: 'button', class: `uw-btn ${cls}`, onclick: onClick, disabled }, text);
     const st = (cls, text) => h('span', { class: `uw-st ${cls}` }, text);
+    // (19 nov.) le logo : UPPWIND en gras, LINK en Light, comme Uppwind Studio, Uppwind Shop et Uppwind Admin
+    const wordmark = () => h('span', { class: 'uw-word', translate: 'no' }, 'Uppwind ', h('b', null, 'Link'));
     const note = (cls, ...kids) => h('div', { class: `uw-note ${cls}` }, ...kids);
     const list = (cls, items) => h('ul', { class: `uw-done ${cls}` }, items.map((t) => h('li', null, t)));
     function set(el, ...kids) { el.replaceChildren(...kids.flat(Infinity).filter((k) => k != null && k !== false)); }
@@ -230,8 +231,8 @@
         return [
             sandboxBanner(m),
             h('div', { class: 'uw-hero' },
-                h('img', { class: 'uw-hero-mark', src: MARK, alt: '' }),
-                h('h1', null, again ? 'Set up Uppwind Link again' : upd ? 'Update Uppwind Link' : 'Uppwind Link'),
+                upd ? h('h1', null, again ? 'Set up Uppwind Link again' : 'Update Uppwind Link')
+                    : h('h1', { class: 'uw-hero-word', 'aria-label': 'Uppwind Link' }, wordmark()),
                 h('p', null, 'Play the instruments of Ableton Live and FL Studio from Uppwind Studio, and use their plugin windows there.'),
                 h('p', null, again ? `Version ${m.version} is installed. This looks at your DAWs again and puts back what is missing; your pairing stays.`
                     : upd ? (m.update_from ? `Version ${m.update_from} is installed. This is ${m.version}: your settings and your pairing stay.` : `An earlier version is installed. This is ${m.version}: your settings and your pairing stay.`)
@@ -282,7 +283,7 @@
                 h('div', { class: 'uw-grow' }, h('div', { class: 'uw-card-title' }, 'loopMIDI'),
                     h('div', { class: 'uw-card-sub' }, 'loopMIDI is free software by Tobias Erichsen for private, non-commercial use.')),
                 btn('Get loopMIDI', () => send('open', { link: 'loopmidi' }), 'uw-btn-sm')),
-            h('div', { class: 'uw-card-body' },
+            h('div', { class: 'uw-card-body is-flush' },
                 h('div', null, st(p.loopmidi_running ? 'is-ok' : p.loopmidi_installed ? 'is-warn' : '', p.loopmidi_running ? 'Installed and running' : p.loopmidi_installed ? 'Installed, not running: start it' : 'Not installed')),
                 h('ol', { class: 'uw-steps' },
                     h('li', null, 'Install loopMIDI from its page, then start it.'),
@@ -596,11 +597,11 @@
                     : btn('Download it', () => send('open', { link: 'releases' }), 'uw-btn-sm uw-btn-primary'))) : null;
             const busy = updBusy ? note('is-neon uw-banner', updLine || 'Installing the new version…') : null;
             render([sb, upd, busy, h('div', { class: 'uw-grid' }, cell('Remote control', remote), cell('Studio', studio), cell('DAWs', daws), cell('MIDI ports', ports), cell('Sound', sound), cell('Discord', discord), cell('Help', help))],
-                [h('span', { class: 'uw-sp' }), btn('Check again', () => send('recheck'), 'uw-btn-sm'), btn('Close', () => send('close'))],
+                [h('span', { class: 'uw-sp' }), btn('Check again', () => send('recheck')), btn('Close', () => send('close'))],
                 pill);
         }
         const brand = document.getElementById('brand');
-        if (brand) set(brand, 'Uppwind Link', h('small', null, s.version));
+        if (brand) set(brand, wordmark(), h('small', null, s.version));
         ready();
     }
 
