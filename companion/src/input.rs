@@ -775,6 +775,10 @@ impl Injector {
     #[cfg(target_os = "macos")]
     pub fn handle(&mut self, top: u64, ev: &InputEvent) -> Result<Outcome, String> {
         let w = crate::macos::window(top).ok_or("the plugin window is gone")?;
+        // (20 nov.) un plugin que le compagnon heberge lui-meme : le geste va a son enfant, qui le remet a sa fenetre
+        if let Some((hid, tb)) = crate::host::hosted_window(top) {
+            return self.handle_hosted(hid, tb, &w, ev);
+        }
         // (11 nov.) Logic Pro : par l'Accessibilite (un clic qui lui est poste en arriere-plan est ignore)
         if crate::plugins::is_logic_app(&w.owner) {
             return self.handle_logic(&w, ev);
@@ -825,6 +829,56 @@ impl Injector {
     }
 
     /// (11 nov.) Logic Pro : les gestes par l'Accessibilite, dans la fenetre suivie `w` (voir l'en-tete du module).
+    /// (20 nov., l'hote macOS) Les gestes vers l'editeur d'un plugin heberge (host.rs) : les memes evenements que pour Live
+    /// (mac_pointer_events…), mais en points DE LA FENETRE (origine en haut a gauche, barre de titre comprise) et remis
+    /// par l'enfant (host::gesture) : un clic poste au processus n'atteint pas une fenetre rangee derriere les autres
+    /// (mesure du 20 nov.). Ni l'ecran, ni l'Accessibilite.
+    #[cfg(target_os = "macos")]
+    fn handle_hosted(&mut self, hid: u32, tb: f64, w: &crate::macos::MacWindow, ev: &InputEvent) -> Result<Outcome, String> {
+        use serde_json::json;
+        let b = w.bounds;
+        // (20 nov.) l'image filmee est le contenu seul (sans la barre de titre, macos::WindowCapture) : le point de l'image →
+        // le contenu → la fenetre (la barre de titre en plus)
+        let (cw, ch) = (b.size.width.round() as i32, (b.size.height - tb).round().max(1.0) as i32);
+        let below = |p: (i32, i32)| (p.0, p.1 + tb.round() as i32);
+        match ev {
+            InputEvent::Pointer { action, pt, button, buttons, mods } => {
+                let p = below(map_point(pt, cw, ch));
+                if matches!(action, PointerAction::DblClick) {
+                    self.mac_clicks = 2;
+                } else if matches!(action, PointerAction::Down) {
+                    self.mac_clicks = 1;
+                }
+                for m in mac_pointer_events(*action, *button, *buttons, *mods, (p.0 as f64, p.1 as f64), self.mac_clicks) {
+                    crate::host::gesture(hid, json!({ "cmd": "mouse", "ty": m.ty, "x": m.x, "y": m.y, "clicks": m.clicks, "flags": m.flags }))?;
+                }
+                Ok(Outcome { applied: true, pointer: Some(p) })
+            }
+            InputEvent::Wheel { pt, dx, dy, mods } => {
+                let p = below(map_point(pt, cw, ch));
+                let (wx, wy) = mac_wheel(*dx, *dy);
+                crate::host::gesture(hid, json!({ "cmd": "wheel", "x": p.0, "y": p.1, "dx": wx, "dy": wy, "flags": mac_flags(*mods) }))?;
+                Ok(Outcome { applied: true, pointer: Some(p) })
+            }
+            InputEvent::Key { down, key, code, mods } => {
+                let Some(kc) = mac_keycode_of_code(code) else { return Err("this key is not sent to plugins".into()) };
+                let text: String = if *down { String::from_utf16_lossy(&chars_for_key(key, *mods)) } else { String::new() };
+                crate::host::gesture(hid, json!({ "cmd": "key", "kc": kc, "down": down, "text": text, "flags": mac_flags(*mods) }))?;
+                Ok(Outcome { applied: true, pointer: None })
+            }
+            InputEvent::Text { text } => {
+                // une touche neutre (Espace, code 49) qui porte le texte, comme pour Live
+                let u: Vec<char> = text.chars().collect();
+                for chunk in u.chunks(20) {
+                    let t: String = chunk.iter().collect();
+                    crate::host::gesture(hid, json!({ "cmd": "key", "kc": 49, "down": true, "text": t, "flags": 0 }))?;
+                    crate::host::gesture(hid, json!({ "cmd": "key", "kc": 49, "down": false, "text": "", "flags": 0 }))?;
+                }
+                Ok(Outcome { applied: true, pointer: None })
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn handle_logic(&mut self, w: &crate::macos::MacWindow, ev: &InputEvent) -> Result<Outcome, String> {
         use crate::macos::{ax_press, ax_reach_value, ax_step, ax_target_at, AxAt, AxTarget};

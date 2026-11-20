@@ -203,22 +203,201 @@ pub fn paste_held(frame: &mut Frame, held: &[Held], scale: f64) {
     }
 }
 
+/// (20 nov.) Colle `src` dans `dst` en (x, y) en tenant compte de sa transparence (BGRA premultiplie, comme les images
+/// de macOS) : les coins arrondis d'un menu laissent voir le plugin dessous.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn paste_over(dst: &mut Frame, src: &Frame, x: i32, y: i32) {
+    for sy in 0..src.h as i32 {
+        let dy = y + sy;
+        if dy < 0 || dy >= dst.h as i32 {
+            continue;
+        }
+        for sx in 0..src.w as i32 {
+            let dx = x + sx;
+            if dx < 0 || dx >= dst.w as i32 {
+                continue;
+            }
+            let s = ((sy as u32 * src.w + sx as u32) * 4) as usize;
+            let d = ((dy as u32 * dst.w + dx as u32) * 4) as usize;
+            let a = src.bgra[s + 3] as u32;
+            if a == 255 {
+                dst.bgra[d..d + 4].copy_from_slice(&src.bgra[s..s + 4]);
+            } else if a > 0 {
+                for c in 0..3 {
+                    let v = src.bgra[s + c] as u32 + (dst.bgra[d + c] as u32 * (255 - a) + 127) / 255;
+                    dst.bgra[d + c] = v.min(255) as u8;
+                }
+                dst.bgra[d + 3] = 255;
+            }
+        }
+    }
+}
+
+/// (20 nov., l'hote macOS) Une fenetre a l'ecran telle que CGWindowList la decrit, pour `select_mac`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacCand {
+    pub id: u64,
+    pub pid: i32,
+    pub layer: i32,
+    pub onscreen: bool,
+    /// points, origine en haut a gauche de l'ecran principal : gauche, haut, droite, bas
+    pub rect: (i32, i32, i32, i32),
+}
+
+/// Le niveau des menus (kCGPopUpMenuWindowLevel).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MAC_MENU_LAYER: i32 = 101;
+
+/// (20 nov., l'hote macOS) Les menus de l'editeur heberge `top` : les fenetres A L'ECRAN du MEME processus (l'enfant
+/// --plug-host, qui n'a que le plugin), au niveau des menus, le plus haut d'abord. Jamais la fenetre de l'editeur, une
+/// fenetre ordinaire (niveau 0 : une fenetre du plugin), ni une fenetre d'un autre processus (une boite « Ouvrir » de
+/// macOS vit dans un service a part : elle n'est jamais prise).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn select_mac(cands: &[MacCand], top: u64, pid: i32) -> Vec<Popup> {
+    cands
+        .iter()
+        .filter(|c| c.id != top && c.pid == pid && pid > 0 && c.layer == MAC_MENU_LAYER && c.onscreen && c.rect.2 > c.rect.0 && c.rect.3 > c.rect.1)
+        .take(MAX_POPUPS)
+        .map(|c| Popup { id: c.id, rect: c.rect, owned: true })
+        .collect()
+}
+
 #[cfg(windows)]
 pub use win::{compose, grab_held, list, signature};
+#[cfg(target_os = "macos")]
+pub use mac::{compose, list, signature};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn list(_top: u64) -> Vec<Popup> {
     Vec::new()
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn compose(_top: u64, f: Frame) -> Frame {
     f
 }
 /// Ce qui est pose sur l'image a change (un menu ouvert ou ferme, un menu garde ou oublie) : la capture refait
 /// l'image meme si le plugin ne s'est pas redessine.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn signature(_top: u64) -> u64 {
     HELD_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// (20 nov., l'hote macOS) Les menus d'un plugin heberge par le compagnon (host.rs), sur Mac : filmes et poses sur
+/// l'image de son editeur. Un geste du studio sur un menu va a l'enfant comme les autres (input.rs, handle_hosted) ; c'est
+/// l'enfant qui le traduit pour le menu (uwl_vst3host::macui : un clic sur un article devient le clavier). Les editeurs
+/// de Live ou de Logic ne sont pas concernes (leurs menus restent hors de l'image).
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::{paste_over, place, resize, select_mac, MacCand, Popup, HELD_GEN};
+    use crate::capture::Frame;
+    use std::time::{Duration, Instant};
+
+    /// La liste des fenetres coute quelques dixiemes de ms : relue au plus toutes les 50 ms par editeur (la capture la
+    /// demande deux fois par image).
+    const FRESH: Duration = Duration::from_millis(50);
+
+    fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, (Instant, Vec<Popup>)>> {
+        static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, (Instant, Vec<Popup>)>>> = std::sync::OnceLock::new();
+        C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// Les menus ouverts du plugin heberge dont l'editeur est la fenetre `top`, le plus haut d'abord.
+    pub fn list(top: u64) -> Vec<Popup> {
+        if crate::host::hosted_window(top).is_none() {
+            return Vec::new();
+        }
+        if let Some((t, l)) = cache().lock().unwrap().get(&top) {
+            if t.elapsed() < FRESH {
+                return l.clone();
+            }
+        }
+        let Some(w) = crate::macos::window(top) else { return Vec::new() };
+        let cands: Vec<MacCand> = crate::macos::on_screen_windows()
+            .into_iter()
+            .filter(|c| c.pid == w.pid)
+            .map(|c| {
+                let b = c.bounds;
+                MacCand {
+                    id: c.id as u64,
+                    pid: c.pid,
+                    layer: c.layer,
+                    onscreen: c.onscreen,
+                    rect: (b.origin.x.round() as i32, b.origin.y.round() as i32, (b.origin.x + b.size.width).round() as i32, (b.origin.y + b.size.height).round() as i32),
+                }
+            })
+            .collect();
+        let l = select_mac(&cands, top, w.pid);
+        let mut c = cache().lock().unwrap();
+        c.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(10));
+        c.insert(top, (Instant::now(), l.clone()));
+        l
+    }
+
+    /// Les images des menus prises par `signature`, reprises par `compose` dans la meme image (au plus 100 ms).
+    fn shots() -> &'static std::sync::Mutex<std::collections::HashMap<u64, (Instant, Vec<(u64, Frame)>)>> {
+        static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, (Instant, Vec<(u64, Frame)>)>>> = std::sync::OnceLock::new();
+        C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn quick_hash(b: &[u8]) -> u64 {
+        // FNV-1a sur un octet sur 5 : assez pour voir une surbrillance qui change
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for x in b.iter().step_by(5) {
+            h ^= *x as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    /// Une empreinte des menus ouverts (leur numero, leur place, leur image) : un menu qui s'ouvre, se ferme ou change
+    /// de surbrillance (les fleches, un sous-menu) refait l'image meme si le plugin ne s'est pas redessine.
+    pub fn signature(top: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        HELD_GEN.load(std::sync::atomic::Ordering::SeqCst).hash(&mut s);
+        let pops = list(top);
+        let mut imgs = Vec::new();
+        for p in &pops {
+            (p.id, p.rect).hash(&mut s);
+            if let Ok(Some(img)) = crate::macos::window_image(p.id) {
+                quick_hash(&img.bgra).hash(&mut s);
+                imgs.push((p.id, img));
+            }
+        }
+        let mut c = shots().lock().unwrap();
+        if imgs.is_empty() {
+            c.remove(&top);
+        } else {
+            c.insert(top, (Instant::now(), imgs));
+        }
+        s.finish()
+    }
+
+    /// L'image de l'editeur (sans sa barre de titre, macos::WindowCapture), avec ses menus ouverts poses dessus.
+    pub fn compose(top: u64, mut frame: Frame) -> Frame {
+        let pops = list(top);
+        if pops.is_empty() {
+            return frame;
+        }
+        let (Some(w), Some((_, tb))) = (crate::macos::window(top), crate::host::hosted_window(top)) else { return frame };
+        // l'origine du contenu (points, ecran) et l'echelle de l'image (2 sur un ecran Retina)
+        let origin = (w.bounds.origin.x.round() as i32, (w.bounds.origin.y + tb).round() as i32);
+        let scale = frame.w as f64 / w.bounds.size.width.max(1.0);
+        let taken: Vec<(u64, Frame)> = shots().lock().unwrap().get(&top).filter(|(t, _)| t.elapsed() < Duration::from_millis(100)).map(|(_, v)| v.clone()).unwrap_or_default();
+        for p in pops.iter().rev() {
+            let img = match taken.iter().find(|(id, _)| *id == p.id) {
+                Some((_, f)) => Some(Frame { w: f.w, h: f.h, bgra: f.bgra.clone() }),
+                None => crate::macos::window_image(p.id).ok().flatten(),
+            };
+            if let Some(img) = img {
+                let (x, y, pw, ph) = place(p.rect, origin, scale);
+                let img = resize(&img, pw, ph);
+                paste_over(&mut frame, &img, x, y);
+            }
+        }
+        frame
+    }
 }
 
 #[cfg(windows)]
@@ -544,6 +723,41 @@ mod tests {
         assert!(g1 >= g0 + 2);
         hold(777_001, Vec::new());
         assert!(held_of(777_001).is_empty());
+    }
+
+    /// (20 nov., l'hote macOS) les menus d'un editeur heberge : seulement les fenetres a l'ecran de son processus, au
+    /// niveau des menus ; ni l'editeur, ni une fenetre ordinaire du plugin, ni un menu d'un autre processus, ni une
+    /// fenetre cachee ou vide.
+    #[test]
+    fn mac_menus_are_the_child_menu_windows() {
+        let (top, pid) = (833, 4242);
+        let c = |id, pid, layer, onscreen, rect| MacCand { id, pid, layer, onscreen, rect };
+        let cands = vec![
+            c(901, 999, 101, true, (700, 700, 800, 800)),  // le menu d'une autre appli : non
+            c(902, pid, 101, true, (721, 759, 782, 793)),  // le menu du plugin : oui
+            c(903, pid, 101, true, (782, 735, 850, 817)),  // son sous-menu : oui
+            c(904, pid, 0, true, (300, 300, 600, 500)),    // une autre fenetre du plugin : non
+            c(905, pid, 101, false, (721, 759, 782, 793)), // cachee : non
+            c(906, pid, 101, true, (721, 759, 721, 793)),  // vide : non
+            c(top, pid, 101, true, (120, 465, 1320, 1167)), // l'editeur lui-meme : non
+        ];
+        let got = select_mac(&cands, top, pid);
+        assert_eq!(got.iter().map(|p| p.id).collect::<Vec<_>>(), vec![902, 903]);
+        assert!(select_mac(&cands, top, 0).is_empty(), "no pid, no menu");
+    }
+
+    /// (20 nov.) un menu aux coins transparents (premultiplie) : le plugin se voit dans les coins, le menu ailleurs.
+    #[test]
+    fn menus_are_pasted_over_with_their_transparency() {
+        let mut dst = Frame { w: 4, h: 1, bgra: vec![100; 4 * 4] };
+        // opaque, transparent, a moitie (premultiplie : 60 pour une couleur 120 a 50 %)
+        let src = Frame { w: 3, h: 1, bgra: vec![200, 200, 200, 255, 0, 0, 0, 0, 60, 60, 60, 128] };
+        paste_over(&mut dst, &src, 1, 0);
+        let px = |x: usize| dst.bgra[x * 4];
+        assert_eq!((px(0), px(1), px(2)), (100, 200, 100));
+        assert!((108..=112).contains(&px(3)), "{}", px(3)); // 60 + 100 × 127/255
+        paste_over(&mut dst, &src, -2, 0); // deborde a gauche : seul le dernier pixel tombe dedans
+        paste_over(&mut dst, &src, 9, 9); // hors de l'image : rien
     }
 
     #[test]

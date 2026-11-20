@@ -6,11 +6,13 @@
 //!   plugins (Uppwind Link Notes et Return, nice-plug) ;
 //! - `realhost` : ce qu'un plugin du commerce demande en plus (controleur a part, IMessage, IComponentHandler, etats,
 //!   tous les bus, IPlugFrame) ;
-//! - `child` (Windows) : le processus enfant du compagnon, un plugin par processus (`--plug-host`), et le scan d'un
-//!   module (`--plug-scan`).
+//! - `child` (Windows ; macOS depuis le 20 nov., sa coquille AppKit dans `macui`) : le processus enfant du compagnon, un
+//!   plugin par processus (`--plug-host`), et le scan d'un module (`--plug-scan`).
 
 pub mod b64;
 pub mod realhost;
 pub mod vsthost;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod child;
+#[cfg(target_os = "macos")]
+pub mod macui;

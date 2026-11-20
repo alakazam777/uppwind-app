@@ -245,6 +245,12 @@ pub fn all_windows() -> Vec<MacWindow> {
     windows_with(kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements, 0)
 }
 
+/// (20 nov.) Les fenetres a l'ecran (sans le bureau), de la plus haute a la plus basse.
+pub fn on_screen_windows() -> Vec<MacWindow> {
+    // kCGWindowListOptionOnScreenOnly
+    windows_with(1 | kCGWindowListExcludeDesktopElements, 0)
+}
+
 /// Une fenetre par son numero (None : fermee).
 pub fn window(id: u64) -> Option<MacWindow> {
     windows_with(kCGWindowListOptionIncludingWindow, id as u32).into_iter().find(|w| w.id as u64 == id)
@@ -964,7 +970,16 @@ impl crate::capture::Capturer for WindowCapture {
         if window(self.id).is_none() {
             return Err("the window is gone".into());
         }
-        let Some(f) = window_image(self.id)? else { return Ok(None) };
+        let Some(mut f) = window_image(self.id)? else { return Ok(None) };
+        // (20 nov.) l'editeur d'un plugin heberge : sans la barre de titre de sa fenetre (le studio a deja le titre, et ses
+        // trois boutons n'ont rien a faire dans l'image)
+        if let (Some((_, tb)), Some(w)) = (crate::host::hosted_window(self.id), window(self.id)) {
+            let rows = ((tb / w.bounds.size.height.max(1.0)) * f.h as f64).round() as u32;
+            if rows > 0 && rows < f.h {
+                f.bgra.drain(..(rows * f.w * 4) as usize);
+                f.h -= rows;
+            }
+        }
         let d = digest(&f.bgra);
         if d == self.last {
             return Ok(None);

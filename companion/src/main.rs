@@ -36,8 +36,8 @@ mod audio;
 mod bench;
 mod capture;
 mod discord;
-// (19 nov.) heberger les plugins VST3 sans DAW (les processus enfants : uwl_vst3host::child)
-#[cfg(windows)]
+// (19 nov.) heberger les plugins VST3 sans DAW (les processus enfants : uwl_vst3host::child) ; (20 nov.) macOS aussi
+#[cfg(any(windows, target_os = "macos"))]
 mod host;
 mod encode;
 mod input;
@@ -763,8 +763,8 @@ fn dlls_from_system32_only() {
 
 fn main() {
     // (19 nov.) un plugin heberge (host.rs) : AVANT dlls_from_system32_only — un plugin charge ses propres DLL depuis son
-    // dossier ; ce processus ne fait rien d'autre (ni journal, ni fichier d'etat, ni serveur)
-    #[cfg(windows)]
+    // dossier ; ce processus ne fait rien d'autre (ni journal, ni fichier d'etat, ni serveur). (20 nov.) macOS aussi.
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let raw: Vec<String> = std::env::args().skip(1).collect();
         match raw.first().map(|s| s.as_str()) {
@@ -975,8 +975,9 @@ fn main() {
             }
         }
     };
-    // (19 nov.) l'hote VST3 (host.rs) : seulement avec l'ecoute des plugins (ses plugins heberges s'y connectent)
-    #[cfg(windows)]
+    // (19 nov.) l'hote VST3 (host.rs) : seulement avec l'ecoute des plugins (ses plugins heberges s'y connectent) ;
+    // (20 nov.) macOS aussi
+    #[cfg(any(windows, target_os = "macos"))]
     if plugin_port.is_some() {
         host::configure(state.clone());
     }
@@ -1135,8 +1136,9 @@ fn main() {
     if !to_log {
         console_commands(shared.clone());
     }
-    // (20 nov., relecture de securite) desarme, les editeurs des plugins heberges se ferment (host.rs)
-    #[cfg(windows)]
+    // (20 nov., relecture de securite) desarme, les editeurs des plugins heberges se ferment (host.rs) ; (relecture macOS)
+    // sur Mac aussi
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let sh = shared.clone();
         host::watch_arming(Box::new(move || sh.arming.armed()));

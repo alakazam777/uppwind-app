@@ -16,6 +16,7 @@
 //!
 //! Le dialogue avec le compagnon : des lignes JSON. Entree : {"cmd":"save","n":1} · {"cmd":"editor","show":true|false}
 //! · {"cmd":"view","open":true|false} (l'editeur ouvert, MASQUE : le studio le filme) · {"cmd":"tempo","bpm":120,"playing":true} · {"cmd":"mix","vol":1,"pan":0,"mute":false} · {"cmd":"quit"} ; la fin de l'entree (le compagnon est parti) = quit.
+//! (20 nov.) macOS : {"cmd":"mouse"|"wheel"|"key",…} (les gestes du studio, poses dans la file d'AppKit : macui::gesture).
 //! Sortie : {"event":"ready",…} · {"event":"saved","n","sha","bytes"} · {"event":"editor","shown"} · {"event":"error",…}
 //! · {"event":"closed"}. L'etat d'un plugin (composant + controleur) est ecrit par CE processus dans --states-dir, sous
 //! son empreinte SHA-256 : seul un etat que le compagnon a produit lui-meme est jamais relu (--state), jamais des octets
@@ -25,7 +26,6 @@ use crate::realhost::{classes, Engine, Frame, Instance};
 use crate::vsthost::{Block, Module};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::ffi::c_void;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
@@ -34,14 +34,22 @@ use std::time::{Duration, Instant};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
-use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const WM_CMD: u32 = WM_APP + 2;
-const WM_QUIT_HOST: u32 = WM_APP + 1;
-const WM_HIDE_EDITOR: u32 = WM_APP + 3;
+#[cfg(windows)]
+use self::win as ui;
+#[cfg(target_os = "macos")]
+use crate::macui as ui;
 
-fn out(v: Value) {
+/// (20 nov., l'hote macOS) Ce que la boucle de l'interface recoit en plus des evenements du systeme : un ordre du
+/// compagnon en attente, la fin, la croix de la fenetre (montree sur le bureau).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiEv {
+    Cmd,
+    Quit,
+    HideEditor,
+}
+
+pub(crate) fn out(v: Value) {
     let mut o = std::io::stdout().lock();
     let _ = writeln!(o, "{v}");
     let _ = o.flush();
@@ -124,87 +132,10 @@ pub fn scan_main(module: &Path) -> i32 {
     }
 }
 
-// ── La fenetre ──────────────────────────────────────────────────────────────────────────────────────────────────
-
 /// (20 nov., relecture) le delai apres la fermeture de l'entree, avant que l'enfant ne s'arrete de lui-meme
 const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-static VIEW: std::sync::atomic::AtomicPtr<IPlugView> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_SIZE {
-        if let Some(v) = vst3::ComRef::from_raw(VIEW.load(Ordering::Relaxed)) {
-            let (w, h) = ((lp & 0xffff) as i32, ((lp >> 16) & 0xffff) as i32);
-            let mut cur: ViewRect = std::mem::zeroed();
-            v.getSize(&mut cur);
-            if w > 0 && h > 0 && (cur.right - cur.left != w || cur.bottom - cur.top != h) {
-                let mut r = ViewRect { left: 0, top: 0, right: w, bottom: h };
-                v.onSize(&mut r);
-            }
-        }
-    }
-    if msg == WM_CLOSE {
-        // la croix (fenetre montree sur le bureau) : on la masque, le plugin reste
-        cloak(hwnd, true);
-        PostMessageW(hwnd, WM_HIDE_EDITOR, 0, 0);
-        out(json!({ "event": "editor", "shown": false }));
-        return 0;
-    }
-    DefWindowProcW(hwnd, msg, wp, lp)
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
-
-fn cloak(hwnd: HWND, on: bool) {
-    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
-    let v: i32 = on as i32;
-    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as u32, &v as *const i32 as *const c_void, 4) };
-}
-
-fn make_window(title: &str) -> Result<HWND, String> {
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    unsafe {
-        let inst = GetModuleHandleW(std::ptr::null());
-        let class = wide("UppwindPlugHost");
-        let wc = WNDCLASSW {
-            style: CS_DBLCLKS,
-            lpfnWndProc: Some(wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: inst,
-            hIcon: std::ptr::null_mut(),
-            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: class.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        let o = wide("Uppwind plugin host");
-        let owner = CreateWindowExW(0, class.as_ptr(), o.as_ptr(), WS_OVERLAPPED, 0, 0, 10, 10, std::ptr::null_mut(), std::ptr::null_mut(), inst, std::ptr::null());
-        let t = wide(title);
-        // pas WS_EX_TOOLWINDOW : Windows.Graphics.Capture refuse les fenetres d'outil (mesure du 19 nov.)
-        let hwnd = CreateWindowExW(0, class.as_ptr(), t.as_ptr(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, 120, 120, 800, 500, owner, std::ptr::null_mut(), inst, std::ptr::null());
-        if hwnd.is_null() {
-            return Err("CreateWindowExW failed".into());
-        }
-        Ok(hwnd)
-    }
-}
-
-fn show_on_desktop(hwnd: HWND, show: bool) {
-    unsafe {
-        if show {
-            cloak(hwnd, false);
-            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            SetForegroundWindow(hwnd);
-        } else {
-            cloak(hwnd, true);
-            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
-    }
-}
+pub(crate) static VIEW: std::sync::atomic::AtomicPtr<IPlugView> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// (19 nov., etape 3b) Un EFFET EN DIRECT : le son du studio arrive date (sa trame dans le contexte du studio), il ressort
 /// avec la MEME date (moins la latence du plugin) : le studio le replace au bon endroit, avec un retard fixe (il n'y a
@@ -386,12 +317,7 @@ pub fn host_main(a: HostArgs) -> i32 {
 }
 
 fn run(a: HostArgs) -> Result<(), String> {
-    use windows_sys::Win32::System::Ole::OleInitialize;
-    use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-    unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        OleInitialize(std::ptr::null());
-    }
+    ui::init();
     let cid = parse_cid(&a.cid).ok_or("--cid is 32 hex digits")?;
     let (rate, block) = (a.rate, a.block);
 
@@ -419,7 +345,7 @@ fn run(a: HostArgs) -> Result<(), String> {
     }
 
     // ── la fenetre et l'editeur (masques) ──
-    let hwnd = make_window(&format!("{}/Uppwind", info.name))?;
+    let hwnd = ui::make_window(&format!("{}/Uppwind", info.name))?;
     let frame = ComWrapper::new(Frame { hwnd: AtomicIsize::new(hwnd as isize), resizes: AtomicU32::new(0) });
     // (19 nov.) l'editeur ne s'ouvre qu'a la demande (« editor » show) et se ferme quand on le cache : un editeur masque
     // continue de se dessiner (Vital : la moitie d'un coeur, l'essai du 19 nov.)
@@ -427,8 +353,7 @@ fn run(a: HostArgs) -> Result<(), String> {
     // l'editeur est voulu par le studio (« view », pour le filmer) et/ou montre sur le bureau (« editor ») ; ferme quand
     // ni l'un ni l'autre
     let (mut film, mut shown) = (false, false);
-    cloak(hwnd, true);
-    unsafe { SetWindowPos(hwnd, HWND_BOTTOM, 120, 120, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW) };
+    ui::park(hwnd);
 
     // ── le fil audio (un instrument) : nos plugins Notes (le Link tag) et Return autour de lui ──
     let lm = if a.effect { None } else { Some(Module::load(&a.link_bundle).map_err(|e| format!("the Uppwind Link plugins: {e}"))?) };
@@ -456,7 +381,7 @@ fn run(a: HostArgs) -> Result<(), String> {
         let mut eng = Engine::new(&ins, &outs, block, rate);
         let (mut nb, mut rb) = (Block::new(block, rate), Block::new(block, rate));
         nb.queue_param(tag_id, tag_v);
-        raise_priority();
+        ui::raise_priority();
         let start = Instant::now() + Duration::from_millis(50);
         let mut k = 0u64;
         let mut params: Vec<(u32, f64)> = Vec::new();
@@ -497,8 +422,11 @@ fn run(a: HostArgs) -> Result<(), String> {
     }));
     }
 
-    out(json!({ "event": "ready", "pid": std::process::id(), "hwnd": hwnd as isize, "name": info.name, "vendor": info.vendor, "sub": info.sub,
-                "editor": inst.ctrl.is_some(), "params": inst.param_count(), "outs": inst.outs, "ins": inst.ins, "latency": inst.latency, "tag": a.tag, "effect": a.effect }));
+    out(json!({ "event": "ready", "pid": std::process::id(), "hwnd": ui::window_id(hwnd), "titlebar": ui::titlebar(hwnd), "name": info.name, "vendor": info.vendor, "sub": info.sub,
+                "editor": inst.ctrl.is_some(), "params": inst.param_count(), "outs": inst.outs, "ins": inst.ins, "latency": inst.latency, "tag": a.tag, "effect": a.effect,
+                // (20 nov., un projet recharge) la frequence du fil audio d'un instrument (--rate, sinon 48 kHz) : le studio
+                // rouvre celui qui ne tourne pas a celle de son contexte (link-host.js needsReopen)
+                "rate": if a.effect { Value::Null } else { json!(a.rate.round() as u32) } }));
 
     // ── (19 nov., etape 3b) le fil d'un effet en direct ──
     let live = Arc::new(Live {
@@ -530,7 +458,7 @@ fn run(a: HostArgs) -> Result<(), String> {
     let cmds: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     {
         let cmds = cmds.clone();
-        let hw = hwnd as isize;
+        let hw = hwnd;
         let lv = live.clone();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
@@ -544,6 +472,25 @@ fn run(a: HostArgs) -> Result<(), String> {
                     live_in(&lv, &l);
                     continue;
                 }
+                // (20 nov., l'hote macOS) un geste du studio pour l'editeur : tout droit dans la file d'AppKit (macui::gesture),
+                // jamais par la boucle de l'interface (un bouton qui suit la souris la tient dans sa propre boucle)
+                #[cfg(target_os = "macos")]
+                if l.starts_with("{\"cmd\":\"mouse\"") || l.starts_with("{\"cmd\":\"wheel\"") || l.starts_with("{\"cmd\":\"key\"") {
+                    if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                        ui::gesture(&v);
+                    }
+                    continue;
+                }
+                #[cfg(target_os = "macos")]
+                if l.starts_with("{\"cmd\":\"probe\"") {
+                    ui::probe_menus();
+                    continue;
+                }
+                #[cfg(target_os = "macos")]
+                if l.starts_with("{\"cmd\":\"snap\"") {
+                    ui::snap();
+                    continue;
+                }
                 // (19 nov., la mesure en direct) une ancre du morceau : au fil du direct, avant les paquets qu'elle date
                 if l.starts_with("{\"cmd\":\"song\"") {
                     live_song(&lv, &l);
@@ -553,12 +500,13 @@ fn run(a: HostArgs) -> Result<(), String> {
                     continue;
                 }
                 cmds.lock().unwrap().push_back(l);
-                unsafe { PostMessageW(hw as HWND, WM_CMD, 0, 0) };
+                ui::post(hw, UiEv::Cmd);
             }
             // le compagnon est parti (ou a ferme l'entree) : on s'arrete
-            unsafe { PostMessageW(hw as HWND, WM_QUIT_HOST, 0, 0) };
+            ui::post(hw, UiEv::Quit);
             // (20 nov., relecture) une boite de dialogue du plugin a sa propre boucle de messages et avale le notre : apres
-            // QUIT_GRACE, l'enfant s'arrete de lui-meme (le Job object du compagnon le fait aussi quand celui-ci meurt)
+            // QUIT_GRACE, l'enfant s'arrete de lui-meme (le Job object du compagnon le fait aussi quand celui-ci meurt ;
+            // sur Mac, un menu du plugin tient de meme la boucle d'AppKit)
             std::thread::sleep(QUIT_GRACE);
             std::process::exit(0);
         });
@@ -566,15 +514,81 @@ fn run(a: HostArgs) -> Result<(), String> {
     // le dernier etat ecrit (empreinte, taille) et la marque des changements a ce moment-la
     let mut last_saved: Option<(String, usize)> = None;
     let mut last_mark = u64::MAX;
-    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // (20 nov., Link to controller) l'id → l'indice des parametres (rempli par « params », au fil de l'interface) ; le fil
+    // du suivi envoie les gestes de l'editeur au compagnon (« param »), toutes les 80 ms, tant que le studio suit
+    let pmap: Arc<Mutex<std::collections::HashMap<u32, u32>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    {
+        let (watch, touched, pm, st) = (inst.handler.watch.clone(), inst.handler.touched.clone(), pmap.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !st.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(80));
+                if !watch.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let got: Vec<(u32, f64)> = std::mem::take(&mut *touched.lock().unwrap());
+                if got.is_empty() {
+                    continue;
+                }
+                let map = pm.lock().unwrap();
+                let mut last: Vec<(u32, f64)> = Vec::new();
+                for (id, v) in got {
+                    let Some(&p) = map.get(&id) else { continue };
+                    if let Some(e) = last.iter_mut().find(|e| e.0 == p) {
+                        e.1 = v;
+                    } else if last.len() < 128 {
+                        last.push((p, v));
+                    }
+                }
+                drop(map);
+                if !last.is_empty() {
+                    let items: Vec<Value> = last.iter().map(|(p, v)| json!({ "p": p, "v": if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 } })).collect();
+                    out(json!({ "event": "param", "items": items }));
+                }
+            }
+        });
+    }
     'ui: loop {
-        if unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } <= 0 {
+        // (20 nov., l'hote macOS) pendant un menu du plugin (macui : la boucle de suivi du menu tient celle-ci) : ce qui ne
+        // touche pas a la fenetre est traite tout de suite (« save » toutes les 15 s ne ferme pas le menu qu'on lit) ; au
+        // premier autre ordre, le menu se ferme et la boucle reprend avec lui et ceux qui le suivent (leur ordre garde)
+        let ev = {
+            let mut in_menu = || loop {
+                let mut q = cmds.lock().unwrap();
+                let Some(line) = q.pop_front() else { break };
+                let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                match v["cmd"].as_str().unwrap_or("") {
+                    "save" => {
+                        drop(q);
+                        save_cmd(&inst, &a.states_dir, &mut last_saved, &mut last_mark, v["n"].clone());
+                    }
+                    "mix" | "tempo" => {
+                        drop(q);
+                        transport_cmd(&transport, &v);
+                    }
+                    "params" | "param-set" | "param-watch" => {
+                        drop(q);
+                        param_cmd(&inst, &v, &pmap);
+                    }
+                    _ => {
+                        q.push_front(line);
+                        drop(q);
+                        ui::cancel_menu();
+                        break;
+                    }
+                }
+            };
+            ui::next(&mut in_menu)
+        };
+        let Some(ev) = ev else { break };
+        if ev == UiEv::Quit {
             break;
         }
-        if msg.message == WM_QUIT_HOST {
-            break;
-        }
-        if msg.message == WM_HIDE_EDITOR {
+        if ev == UiEv::HideEditor {
+            // la croix (fenetre montree sur le bureau) : masquee, le plugin reste. (20 nov., relecture macOS) sur Mac, la
+            // fenetre est rangee ici (should_close ne fait que prevenir) : sinon elle restait devant, filmee et cliquable
+            #[cfg(target_os = "macos")]
+            ui::park(hwnd);
+            out(json!({ "event": "editor", "shown": false }));
             shown = false;
             if !film && view.is_some() {
                 close_view(&mut view);
@@ -582,40 +596,13 @@ fn run(a: HostArgs) -> Result<(), String> {
             }
             continue;
         }
-        if msg.message == WM_CMD {
+        if ev == UiEv::Cmd {
             loop {
                 let Some(line) = cmds.lock().unwrap().pop_front() else { break };
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 match v["cmd"].as_str().unwrap_or("") {
                     "quit" => break 'ui,
-                    "save" => {
-                        let n = v["n"].clone();
-                        // (19 nov.) l'etat de certains plugins change de quelques octets sans qu'on touche a rien (Diva) :
-                        // il n'est relu que si le plugin a dit un changement (un geste dans l'editeur, restartComponent)
-                        // depuis le dernier enregistrement — sinon une empreinte de plus toutes les 15 s (Kontakt : 160 Ko)
-                        let mark = changes(&inst);
-                        if let (Some((sha, bytes)), true) = (&last_saved, mark == last_mark) {
-                            out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": bytes, "unchanged": true }));
-                            continue;
-                        }
-                        match inst.get_state() {
-                            Ok((c, k)) => {
-                                let blob = pack_state(&c, k.as_deref());
-                                let sha = sha256_hex(&blob);
-                                let path = a.states_dir.join(format!("{sha}.bin"));
-                                let r = if std::fs::read(&path).map(|b| sha256_hex(&b) == sha).unwrap_or(false) { Ok(()) } else { write_state(&a.states_dir, &path, &blob) };
-                                if r.is_ok() {
-                                    last_saved = Some((sha.clone(), blob.len()));
-                                    last_mark = mark;
-                                }
-                                match r {
-                                    Ok(()) => out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": blob.len() })),
-                                    Err(e) => out(json!({ "event": "error", "n": n, "error": format!("the state could not be written ({e})") })),
-                                }
-                            }
-                            Err(e) => out(json!({ "event": "error", "n": n, "error": e })),
-                        }
-                    }
+                    "save" => save_cmd(&inst, &a.states_dir, &mut last_saved, &mut last_mark, v["n"].clone()),
                     "editor" | "view" => {
                         let on = if v["cmd"] == "editor" { v["show"].as_bool().unwrap_or(false) } else { v["open"].as_bool().unwrap_or(false) };
                         if v["cmd"] == "editor" {
@@ -624,7 +611,7 @@ fn run(a: HostArgs) -> Result<(), String> {
                             film = on;
                         }
                         if (film || shown) && view.is_none() {
-                            match open_view(&inst, hwnd, &frame) {
+                            match ui::open_view(&inst, hwnd, &frame) {
                                 Ok((v, w, h)) => {
                                     view = Some(v);
                                     out(json!({ "event": "view", "open": true, "w": w, "h": h }));
@@ -638,7 +625,7 @@ fn run(a: HostArgs) -> Result<(), String> {
                             }
                         }
                         if v["cmd"] == "editor" {
-                            show_on_desktop(hwnd, shown);
+                            ui::show_on_desktop(hwnd, shown);
                             out(json!({ "event": "editor", "shown": shown }));
                         }
                         if !film && !shown && view.is_some() {
@@ -707,27 +694,16 @@ fn run(a: HostArgs) -> Result<(), String> {
                             out(json!({ "event": "live", "n": n, "on": false, "dropped": live.dropped.load(Ordering::Relaxed), "done": live.done.load(Ordering::Relaxed) }));
                         }
                     }
-                    "mix" => {
-                        let (gl, gr) = gains(v["vol"].as_f64().unwrap_or(1.0), v["pan"].as_f64().unwrap_or(0.0), v["mute"].as_bool().unwrap_or(false));
-                        transport.gain_l.store(gl.to_bits(), Ordering::Relaxed);
-                        transport.gain_r.store(gr.to_bits(), Ordering::Relaxed);
-                    }
-                    "tempo" => {
-                        if let Some(b) = v["bpm"].as_f64().filter(|b| (20.0..=999.0).contains(b)) {
-                            transport.tempo_bits.store(b.to_bits(), Ordering::Relaxed);
-                        }
-                        if let Some(p) = v["playing"].as_bool() {
-                            transport.playing.store(p, Ordering::Relaxed);
-                        }
-                    }
+                    "mix" | "tempo" => transport_cmd(&transport, &v),
+                    // (20 nov., Link to controller) les parametres du plugin pour le studio
+                    "params" | "param-set" | "param-watch" => param_cmd(&inst, &v, &pmap),
+                    // (20 nov.) le menu d'essai (seulement avec UWL_HOST_MENU_LOG=1 : macui::test_menu)
+                    #[cfg(target_os = "macos")]
+                    "testmenu" => ui::test_menu(hwnd, v["x"].as_f64().unwrap_or(100.0), v["y"].as_f64().unwrap_or(100.0)),
                     _ => out(json!({ "event": "error", "error": "unknown command" })),
                 }
             }
             continue;
-        }
-        unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
         }
     }
 
@@ -743,44 +719,55 @@ fn run(a: HostArgs) -> Result<(), String> {
     }
     close_view(&mut view);
     inst.close();
-    unsafe { DestroyWindow(hwnd) };
+    ui::destroy(hwnd);
     drop(inst);
     drop(lm);
     drop(m);
     Ok(())
 }
 
-/// Ouvre l'editeur dans la fenetre (masquee) : createView, le cadre, la mise a l'echelle, attached, la taille.
-fn open_view(inst: &Instance, hwnd: HWND, frame: &ComWrapper<Frame>) -> Result<(ComPtr<IPlugView>, i32, i32), String> {
-    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-    let c = inst.ctrl.as_ref().ok_or("the plugin has no editor")?;
-    unsafe {
-        let v = ComPtr::from_raw(c.createView(ViewType::kEditor)).ok_or("the plugin has no editor")?;
-        if v.isPlatformTypeSupported(kPlatformTypeHWND) != kResultTrue {
-            return Err("the editor does not support HWND".into());
+/// « save » : l'etat du plugin ecrit dans le dossier des etats (son empreinte pour nom), → {"event":"saved"}.
+fn save_cmd(inst: &Instance, states_dir: &Path, last_saved: &mut Option<(String, usize)>, last_mark: &mut u64, n: Value) {
+    // (19 nov.) l'etat de certains plugins change de quelques octets sans qu'on touche a rien (Diva) :
+    // il n'est relu que si le plugin a dit un changement (un geste dans l'editeur, restartComponent)
+    // depuis le dernier enregistrement — sinon une empreinte de plus toutes les 15 s (Kontakt : 160 Ko)
+    let mark = changes(inst);
+    if let (Some((sha, bytes)), true) = (&*last_saved, mark == *last_mark) {
+        out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": bytes, "unchanged": true }));
+        return;
+    }
+    match inst.get_state() {
+        Ok((c, k)) => {
+            let blob = pack_state(&c, k.as_deref());
+            let sha = sha256_hex(&blob);
+            let path = states_dir.join(format!("{sha}.bin"));
+            let r = if std::fs::read(&path).map(|b| sha256_hex(&b) == sha).unwrap_or(false) { Ok(()) } else { write_state(states_dir, &path, &blob) };
+            if r.is_ok() {
+                *last_saved = Some((sha.clone(), blob.len()));
+                *last_mark = mark;
+            }
+            match r {
+                Ok(()) => out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": blob.len() })),
+                Err(e) => out(json!({ "event": "error", "n": n, "error": format!("the state could not be written ({e})") })),
+            }
         }
-        let fp = frame.to_com_ptr::<IPlugFrame>().ok_or("frame")?;
-        v.setFrame(fp.as_ptr());
-        if let Some(s) = v.cast::<IPlugViewContentScaleSupport>() {
-            s.setContentScaleFactor(GetDpiForWindow(hwnd).max(96) as f32 / 96.0);
-        }
-        let mut r: ViewRect = std::mem::zeroed();
-        v.getSize(&mut r);
-        crate::realhost::size_window(hwnd as isize, (r.right - r.left).max(200), (r.bottom - r.top).max(100));
-        if v.attached(hwnd as *mut c_void, kPlatformTypeHWND) != kResultOk {
-            v.setFrame(std::ptr::null_mut());
-            return Err("the editor did not attach".into());
-        }
-        VIEW.store(v.as_ptr(), Ordering::Relaxed);
-        let mut r: ViewRect = std::mem::zeroed();
-        v.getSize(&mut r);
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        if w > 0 && h > 0 {
-            crate::realhost::size_window(hwnd as isize, w, h);
-            let mut r2 = ViewRect { left: 0, top: 0, right: w, bottom: h };
-            v.onSize(&mut r2);
-        }
-        Ok((v, w, h))
+        Err(e) => out(json!({ "event": "error", "n": n, "error": e })),
+    }
+}
+
+/// « mix » (volume, panoramique, muet) et « tempo » : des valeurs que le fil audio lit.
+fn transport_cmd(transport: &Transport, v: &Value) {
+    if v["cmd"] == "mix" {
+        let (gl, gr) = gains(v["vol"].as_f64().unwrap_or(1.0), v["pan"].as_f64().unwrap_or(0.0), v["mute"].as_bool().unwrap_or(false));
+        transport.gain_l.store(gl.to_bits(), Ordering::Relaxed);
+        transport.gain_r.store(gr.to_bits(), Ordering::Relaxed);
+        return;
+    }
+    if let Some(b) = v["bpm"].as_f64().filter(|b| (20.0..=999.0).contains(b)) {
+        transport.tempo_bits.store(b.to_bits(), Ordering::Relaxed);
+    }
+    if let Some(p) = v["playing"].as_bool() {
+        transport.playing.store(p, Ordering::Relaxed);
     }
 }
 
@@ -945,7 +932,7 @@ fn live_loop(lv: Arc<Live>, tr: Arc<Transport>, proc_ptr: SendBox<*mut IAudioPro
     let mut eng: Option<(u32, Engine)> = None;
     let mut ins: Vec<i32> = Vec::new();
     let mut params: Vec<(u32, f64)> = Vec::new();
-    raise_priority();
+    ui::raise_priority();
     loop {
         let item = {
             let mut q = lv.q.lock().unwrap();
@@ -1018,6 +1005,54 @@ fn live_loop(lv: Arc<Live>, tr: Arc<Transport>, proc_ptr: SendBox<*mut IAudioPro
     }
 }
 
+/// (20 nov., Link to controller) « params » {start, n} → {event:"params", n, items:[{p, name, v}], next} (64 au plus par
+/// page) ; « param-set » {p, v} ; « param-watch » {on}. Au fil de l'interface (le controleur n'est appele que la).
+fn param_cmd(inst: &Instance, v: &Value, pmap: &Arc<Mutex<std::collections::HashMap<u32, u32>>>) {
+    match v["cmd"].as_str().unwrap_or("") {
+        "params" => {
+            let start = v["start"].as_u64().unwrap_or(0).min(4096) as usize;
+            let (page, next) = inst.param_page(start, 64);
+            {
+                let mut m = pmap.lock().unwrap();
+                for (p, id, _, _) in &page {
+                    m.insert(*id, *p);
+                }
+            }
+            let items: Vec<Value> = page.iter().map(|(p, _, name, val)| json!({ "p": p, "name": name, "v": val })).collect();
+            out(json!({ "event": "params", "n": v["n"], "items": items, "next": next }));
+        }
+        "param-set" => {
+            let (Some(p), Some(val)) = (v["p"].as_u64(), v["v"].as_f64()) else { return };
+            if let Some(id) = inst.param_id(p.min(4095) as u32) {
+                inst.set_param(id, val);
+            }
+        }
+        "param-watch" => {
+            let on = v["on"].as_bool().unwrap_or(false);
+            // (20 nov., l'essai de Lucas) le studio redemande le suivi a CHAQUE appui dans l'image, en meme temps que le
+            // geste : deja suivi, rien n'est efface (ni ce que le geste vient de faire bouger) ni relu
+            if on && inst.handler.watch.load(Ordering::Relaxed) && !pmap.lock().unwrap().is_empty() {
+                return;
+            }
+            if on {
+                // l'indice de CHAQUE parametre (le studio n'en lit que les 512 premiers ; un geste peut en toucher un autre)
+                let mut start = Some(0);
+                let mut m = pmap.lock().unwrap();
+                while let Some(s) = start {
+                    let (page, next) = inst.param_page(s, 512);
+                    for (p, id, _, _) in &page {
+                        m.insert(*id, *p);
+                    }
+                    start = next;
+                }
+            }
+            inst.handler.touched.lock().unwrap().clear();
+            inst.handler.watch.store(on, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 /// Ce que le plugin a dit changer depuis son ouverture : les gestes de son editeur (performEdit) et ses restartComponent.
 fn changes(inst: &Instance) -> u64 {
     let h = &*inst.handler;
@@ -1040,10 +1075,203 @@ fn wait_until(target: Instant) {
     }
 }
 
-fn raise_priority() {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+// ── (Windows) la fenetre, la boucle de l'interface ──────────────────────────────────────────────────────────────
+// (20 nov.) le code de l'etape 1, tel quel, sorti de run() : les memes appels, dans le meme ordre
+
+#[cfg(windows)]
+mod win {
+    use super::{UiEv, VIEW};
+    use crate::realhost::{Frame, Instance};
+    use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
+    use vst3::Steinberg::Vst::*;
+    use vst3::Steinberg::*;
+    use vst3::{ComPtr, ComWrapper};
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    const WM_CMD: u32 = WM_APP + 2;
+    const WM_QUIT_HOST: u32 = WM_APP + 1;
+    const WM_HIDE_EDITOR: u32 = WM_APP + 3;
+
+    pub type Win = isize;
+
+    pub fn init() {
+        use windows_sys::Win32::System::Ole::OleInitialize;
+        use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        unsafe {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            OleInitialize(std::ptr::null());
+        }
+    }
+
+    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if msg == WM_SIZE {
+            if let Some(v) = vst3::ComRef::from_raw(VIEW.load(Ordering::Relaxed)) {
+                let (w, h) = ((lp & 0xffff) as i32, ((lp >> 16) & 0xffff) as i32);
+                let mut cur: ViewRect = std::mem::zeroed();
+                v.getSize(&mut cur);
+                if w > 0 && h > 0 && (cur.right - cur.left != w || cur.bottom - cur.top != h) {
+                    let mut r = ViewRect { left: 0, top: 0, right: w, bottom: h };
+                    v.onSize(&mut r);
+                }
+            }
+        }
+        if msg == WM_CLOSE {
+            // la croix (fenetre montree sur le bureau) : on la masque, le plugin reste
+            cloak(hwnd, true);
+            PostMessageW(hwnd, WM_HIDE_EDITOR, 0, 0);
+            return 0;
+        }
+        DefWindowProcW(hwnd, msg, wp, lp)
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn cloak(hwnd: HWND, on: bool) {
+        use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+        let v: i32 = on as i32;
+        unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as u32, &v as *const i32 as *const c_void, 4) };
+    }
+
+    pub fn make_window(title: &str) -> Result<Win, String> {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        unsafe {
+            let inst = GetModuleHandleW(std::ptr::null());
+            let class = wide("UppwindPlugHost");
+            let wc = WNDCLASSW {
+                style: CS_DBLCLKS,
+                lpfnWndProc: Some(wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: inst,
+                hIcon: std::ptr::null_mut(),
+                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class.as_ptr(),
+            };
+            RegisterClassW(&wc);
+            let o = wide("Uppwind plugin host");
+            let owner = CreateWindowExW(0, class.as_ptr(), o.as_ptr(), WS_OVERLAPPED, 0, 0, 10, 10, std::ptr::null_mut(), std::ptr::null_mut(), inst, std::ptr::null());
+            let t = wide(title);
+            // pas WS_EX_TOOLWINDOW : Windows.Graphics.Capture refuse les fenetres d'outil (mesure du 19 nov.)
+            let hwnd = CreateWindowExW(0, class.as_ptr(), t.as_ptr(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, 120, 120, 800, 500, owner, std::ptr::null_mut(), inst, std::ptr::null());
+            if hwnd.is_null() {
+                return Err("CreateWindowExW failed".into());
+            }
+            Ok(hwnd as Win)
+        }
+    }
+
+    /// La place de depart : masquee par DWM, en bas de la pile.
+    pub fn park(w: Win) {
+        cloak(w as HWND, true);
+        unsafe { SetWindowPos(w as HWND, HWND_BOTTOM, 120, 120, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW) };
+    }
+
+    /// L'identifiant que le compagnon filme (le handle).
+    pub fn window_id(w: Win) -> u64 {
+        w as u64
+    }
+
+    /// (macOS seulement : la barre de titre retiree de l'image) ; sous Windows, la capture filme deja le contenu seul
+    pub fn titlebar(_w: Win) -> f64 {
+        0.0
+    }
+
+    pub fn show_on_desktop(w: Win, show: bool) {
+        let hwnd = w as HWND;
+        unsafe {
+            if show {
+                cloak(hwnd, false);
+                SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                SetForegroundWindow(hwnd);
+            } else {
+                cloak(hwnd, true);
+                SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
+
+    /// Depuis un autre fil : reveiller la boucle (un ordre en attente, ou la fin).
+    pub fn post(w: Win, ev: UiEv) {
+        let m = match ev {
+            UiEv::Cmd => WM_CMD,
+            UiEv::Quit => WM_QUIT_HOST,
+            UiEv::HideEditor => WM_HIDE_EDITOR,
+        };
+        unsafe { PostMessageW(w as HWND, m, 0, 0) };
+    }
+
+    /// (macOS seulement : un menu du plugin tient la boucle d'AppKit) ; sous Windows, rien a faire
+    pub fn cancel_menu() {}
+
+    /// La boucle de l'interface : les messages du systeme passent, les notres reviennent (None : la boucle est finie).
+    pub fn next(_in_menu: &mut dyn FnMut()) -> Option<UiEv> {
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        loop {
+            if unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } <= 0 {
+                return None;
+            }
+            match msg.message {
+                WM_QUIT_HOST => return Some(UiEv::Quit),
+                WM_HIDE_EDITOR => return Some(UiEv::HideEditor),
+                WM_CMD => return Some(UiEv::Cmd),
+                _ => unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                },
+            }
+        }
+    }
+
+    pub fn destroy(w: Win) {
+        unsafe { DestroyWindow(w as HWND) };
+    }
+
+    /// Ouvre l'editeur dans la fenetre (masquee) : createView, le cadre, la mise a l'echelle, attached, la taille.
+    pub fn open_view(inst: &Instance, w: Win, frame: &ComWrapper<Frame>) -> Result<(ComPtr<IPlugView>, i32, i32), String> {
+        use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+        let hwnd = w as HWND;
+        let c = inst.ctrl.as_ref().ok_or("the plugin has no editor")?;
+        unsafe {
+            let v = ComPtr::from_raw(c.createView(ViewType::kEditor)).ok_or("the plugin has no editor")?;
+            if v.isPlatformTypeSupported(kPlatformTypeHWND) != kResultTrue {
+                return Err("the editor does not support HWND".into());
+            }
+            let fp = frame.to_com_ptr::<IPlugFrame>().ok_or("frame")?;
+            v.setFrame(fp.as_ptr());
+            if let Some(s) = v.cast::<IPlugViewContentScaleSupport>() {
+                s.setContentScaleFactor(GetDpiForWindow(hwnd).max(96) as f32 / 96.0);
+            }
+            let mut r: ViewRect = std::mem::zeroed();
+            v.getSize(&mut r);
+            crate::realhost::size_window(w, (r.right - r.left).max(200), (r.bottom - r.top).max(100));
+            if v.attached(hwnd as *mut c_void, kPlatformTypeHWND) != kResultOk {
+                v.setFrame(std::ptr::null_mut());
+                return Err("the editor did not attach".into());
+            }
+            VIEW.store(v.as_ptr(), Ordering::Relaxed);
+            let mut r: ViewRect = std::mem::zeroed();
+            v.getSize(&mut r);
+            let (w2, h2) = (r.right - r.left, r.bottom - r.top);
+            if w2 > 0 && h2 > 0 {
+                crate::realhost::size_window(w, w2, h2);
+                let mut r2 = ViewRect { left: 0, top: 0, right: w2, bottom: h2 };
+                v.onSize(&mut r2);
+            }
+            Ok((v, w2, h2))
+        }
+    }
+
+    pub fn raise_priority() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        }
     }
 }
 

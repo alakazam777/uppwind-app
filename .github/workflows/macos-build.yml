@@ -110,11 +110,12 @@ jobs:
           UWL_RELEASE=1 UWL_NO_ADHOC=1 UWL_PLUGIN_SIGN_IDENTITY="$SIGN_IDENTITY" UWL_SIGN_KEYCHAIN="$RUNNER_TEMP/uwl-signing.keychain-db" \
             sh dev/build-macos.sh "$RUNNER_TEMP/build"
           lipo -archs "$RUNNER_TEMP/build/uppwind-companion"
+          lipo -archs "$RUNNER_TEMP/build/uppwind-link-host"
           lipo -archs "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link"
           lipo -archs "$RUNNER_TEMP/build/Uppwind Link.component/Contents/MacOS/Uppwind Link"
       - name: Check the programs (no path of the runner) and the plugins' signature
         run: |
-          python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion" "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link" \
+          python3 -I dev/release_check.py "$RUNNER_TEMP/build/uppwind-companion" "$RUNNER_TEMP/build/uppwind-link-host" "$RUNNER_TEMP/build/Uppwind Link.vst3/Contents/MacOS/Uppwind Link" \
             "$RUNNER_TEMP/build/Uppwind Link.component/Contents/MacOS/Uppwind Link"
           for B in "$RUNNER_TEMP/build/Uppwind Link.vst3" "$RUNNER_TEMP/build/Uppwind Link.component"; do
             codesign --verify --deep --strict --verbose=2 "$B"
@@ -160,6 +161,20 @@ jobs:
           codesign -dv --verbose=4 "$BIN" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Authority|Timestamp|TeamIdentifier|Runtime Version)'
           echo "entitlements (none expected):"
           codesign -d --entitlements - "$BIN" 2>&1 || true
+          # (20 Nov 2026) uppwind-link-host, the only program that loads other makers' VST 3 plugins: the hardened
+          # runtime too, with ONE entitlement (dev/host-entitlements.plist: disable-library-validation, which every DAW
+          # has); the companion above keeps none
+          HOST="$RUNNER_TEMP/build/uppwind-link-host"
+          codesign --force --options runtime --timestamp --identifier "$BUNDLE_ID.host" --entitlements dev/host-entitlements.plist --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$HOST"
+          codesign --verify --strict --verbose=2 "$HOST"
+          # exactly one entitlement on the helper, the hardened runtime on both, none on the companion
+          codesign -d --entitlements - --xml "$HOST" 2>/dev/null > "$RUNNER_TEMP/host-ent.plist"
+          python3 -I -c 'import plistlib,sys; d=plistlib.load(open(sys.argv[1],"rb")); k=sorted(d); print("helper entitlements:", k); sys.exit(0 if k==["com.apple.security.cs.disable-library-validation"] and d[k[0]] is True else 1)' "$RUNNER_TEMP/host-ent.plist"
+          codesign -dv "$HOST" 2>&1 | grep -qE 'flags=0x[0-9a-f]+\([^)]*runtime'
+          codesign -dv "$BIN" 2>&1 | grep -qE 'flags=0x[0-9a-f]+\([^)]*runtime'
+          if [ -n "$(codesign -d --entitlements - --xml "$BIN" 2>/dev/null)" ]; then
+            echo "the companion must carry no entitlement"; exit 1
+          fi
           "$BIN" --license > "$RUNNER_TEMP/license.txt"
           head -n 3 "$RUNNER_TEMP/license.txt"
           grep -q "Uppwind Link plugins -- third-party notices" "$RUNNER_TEMP/license.txt"
@@ -180,6 +195,7 @@ jobs:
           rm -rf "$STAGE" dist
           mkdir -p "$STAGE" dist
           ditto "$RUNNER_TEMP/build/uppwind-companion" "$STAGE/uppwind-companion"
+          ditto "$RUNNER_TEMP/build/uppwind-link-host" "$STAGE/uppwind-link-host"
           for k in vst3 component; do
             ditto "$RUNNER_TEMP/build/Uppwind Link.$k" "$STAGE/Uppwind Link.$k"
             codesign --verify --deep --strict "$STAGE/Uppwind Link.$k"
@@ -240,6 +256,7 @@ jobs:
           hdiutil attach -readonly -nobrowse -mountpoint "$MNT" "$DMG"
           ls -la "$MNT"
           codesign --verify --strict --verbose=2 "$MNT/uppwind-companion"
+          codesign --verify --strict --verbose=2 "$MNT/uppwind-link-host"
           spctl -a -vvv -t exec "$MNT/uppwind-companion" || echo "(spctl -t exec on a bare executable: see above)"
           "$MNT/uppwind-companion" --license > "$RUNNER_TEMP/license-dmg.txt"
           head -n 3 "$RUNNER_TEMP/license-dmg.txt"

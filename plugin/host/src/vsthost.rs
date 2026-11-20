@@ -158,7 +158,72 @@ type Lib = windows_sys::Win32::Foundation::HMODULE;
 #[cfg(unix)]
 type Lib = *mut c_void;
 
-#[cfg(unix)]
+/// (20 nov.) macOS : CoreFoundation, le strict necessaire pour un paquet (CFBundle).
+#[cfg(target_os = "macos")]
+mod cf {
+    use std::ffi::{c_char, c_void};
+    pub const UTF8: u32 = 0x0800_0100;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        pub fn CFURLCreateFromFileSystemRepresentation(alloc: *const c_void, buf: *const u8, len: isize, is_dir: bool) -> *mut c_void;
+        pub fn CFBundleCreate(alloc: *const c_void, url: *mut c_void) -> *mut c_void;
+        pub fn CFBundleLoadExecutableAndReturnError(b: *mut c_void, err: *mut *mut c_void) -> bool;
+        pub fn CFBundleGetFunctionPointerForName(b: *mut c_void, name: *const c_void) -> *mut c_void;
+        pub fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, enc: u32) -> *const c_void;
+        pub fn CFRelease(o: *const c_void);
+        fn CFCopyDescription(o: *const c_void) -> *const c_void;
+        fn CFBundleCopyExecutableArchitectures(b: *mut c_void) -> *const c_void;
+        fn CFArrayGetCount(a: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(a: *const c_void, i: isize) -> *const c_void;
+        fn CFNumberGetValue(n: *const c_void, ty: i32, out: *mut c_void) -> bool;
+        fn CFStringGetCString(s: *const c_void, buf: *mut c_char, size: isize, enc: u32) -> bool;
+    }
+    /// Les architectures du binaire d'un paquet (les cpu_type_t de Mach-O).
+    unsafe fn arch_list(b: *mut c_void) -> Vec<i32> {
+        let a = CFBundleCopyExecutableArchitectures(b);
+        if a.is_null() {
+            return Vec::new();
+        }
+        let mut v = Vec::new();
+        for i in 0..CFArrayGetCount(a) {
+            let mut x: i32 = 0;
+            // kCFNumberSInt32Type = 3
+            if CFNumberGetValue(CFArrayGetValueAtIndex(a, i), 3, &mut x as *mut i32 as *mut c_void) {
+                v.push(x);
+            }
+        }
+        CFRelease(a);
+        v
+    }
+    const ARM64: i32 = 0x0100_000c;
+    const X86_64: i32 = 0x0100_0007;
+    /// Le binaire a-t-il l'architecture de ce processus ? (rien de lisible : on ne sait pas, donc oui)
+    pub unsafe fn has_our_arch(b: *mut c_void) -> bool {
+        let v = arch_list(b);
+        let ours = if cfg!(target_arch = "aarch64") { ARM64 } else { X86_64 };
+        v.is_empty() || v.contains(&ours)
+    }
+    pub unsafe fn archs(b: *mut c_void) -> String {
+        let names: Vec<&str> = arch_list(b).iter().map(|x| match *x { ARM64 => "arm64", X86_64 => "x86_64", 7 => "i386", _ => "?" }).collect();
+        names.join(" + ")
+    }
+    /// Le texte d'un objet CF (une CFError : pourquoi le binaire ne charge pas, par exemple « incompatible architecture »).
+    pub unsafe fn describe(o: *const c_void) -> String {
+        let d = CFCopyDescription(o);
+        if d.is_null() {
+            return String::new();
+        }
+        let mut buf = vec![0 as c_char; 4096];
+        let ok = CFStringGetCString(d, buf.as_mut_ptr(), buf.len() as isize, UTF8);
+        CFRelease(d);
+        if !ok {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 mod dl {
     use std::ffi::{c_char, c_int, c_void};
     pub const RTLD_NOW: c_int = 2;
@@ -178,9 +243,69 @@ pub struct Module {
 }
 
 impl Module {
-    /// macOS (26 oct.) : dlopen du binaire du paquet, puis bundleEntry (un CFBundleRef ; nice-plug ne le lit pas, on
-    /// lui passe NULL — un vrai DAW passe le sien), GetPluginFactory ; a la fin bundleExit.
-    #[cfg(unix)]
+    /// macOS (26 oct.) : dlopen du binaire du paquet. (20 nov., l'hote macOS) Comme un DAW et comme le SDK de Steinberg
+    /// (module_mac.mm) : le paquet par CFBundle (CFBundleCreate, CFBundleLoadExecutable : le binaire que nomme son
+    /// Info.plist), puis bundleEntry AVEC ce CFBundleRef (Diva, Serum, les plugins JUCE y lisent leurs ressources ; nice-plug
+    /// l'ignore), GetPluginFactory ; a la fin bundleExit, puis le paquet relache (jamais decharge : le SDK ne le fait pas,
+    /// certains plugins ne le supportent pas).
+    #[cfg(target_os = "macos")]
+    pub fn load(bundle: &Path) -> Result<Module, String> {
+        use std::os::unix::ffi::OsStrExt;
+        if !bundle.is_dir() {
+            return Err(format!("{} is not a VST3 bundle", bundle.display()));
+        }
+        let bin = dll_of_bundle(bundle);
+        let p = bundle.as_os_str().as_bytes();
+        unsafe {
+            let url = cf::CFURLCreateFromFileSystemRepresentation(std::ptr::null(), p.as_ptr(), p.len() as isize, true);
+            if url.is_null() {
+                return Err(format!("no URL for {}", bundle.display()));
+            }
+            let lib = cf::CFBundleCreate(std::ptr::null(), url);
+            cf::CFRelease(url);
+            if lib.is_null() {
+                return Err(format!("not a bundle: {}", bundle.display()));
+            }
+            let mut err: *mut c_void = std::ptr::null_mut();
+            if !cf::CFBundleLoadExecutableAndReturnError(lib, &mut err) {
+                let mut why = if err.is_null() { String::new() } else { cf::describe(err) };
+                if !err.is_null() {
+                    cf::CFRelease(err);
+                }
+                // (20 nov.) le cas le plus courant sur un Mac Apple : un plugin Intel seulement (il faudrait Rosetta)
+                if !cf::has_our_arch(lib) {
+                    why = format!("{} only, not built for this Mac's processor", cf::archs(lib));
+                }
+                cf::CFRelease(lib);
+                return Err(format!("the module of {} could not be loaded ({why})", bundle.display()));
+            }
+            let sym = |name: &std::ffi::CStr| {
+                let s = cf::CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), cf::UTF8);
+                let f = cf::CFBundleGetFunctionPointerForName(lib, s);
+                cf::CFRelease(s);
+                f
+            };
+            let entry = sym(c"bundleEntry");
+            if !entry.is_null() {
+                let f: unsafe extern "C" fn(*mut c_void) -> bool = std::mem::transmute(entry);
+                if !f(lib) {
+                    cf::CFRelease(lib);
+                    return Err("bundleEntry returned false".into());
+                }
+            }
+            let ex = sym(c"bundleExit");
+            let exit = (!ex.is_null()).then(|| std::mem::transmute::<*mut c_void, unsafe extern "system" fn() -> bool>(ex));
+            let gpf = sym(c"GetPluginFactory");
+            if gpf.is_null() {
+                return Err("no GetPluginFactory export".into());
+            }
+            let gpf: unsafe extern "system" fn() -> *mut IPluginFactory = std::mem::transmute(gpf);
+            let factory = ComPtr::from_raw(gpf()).ok_or("GetPluginFactory returned null")?;
+            Ok(Module { lib, factory: Some(factory), exit, path: bin })
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn load(bundle: &Path) -> Result<Module, String> {
         use std::os::unix::ffi::OsStrExt;
         let bin = dll_of_bundle(bundle);
@@ -195,14 +320,14 @@ impl Module {
                 let why = if e.is_null() { String::new() } else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() };
                 return Err(format!("dlopen failed for {} ({why})", bin.display()));
             }
-            let entry = dl::dlsym(lib, c"bundleEntry".as_ptr());
+            let entry = dl::dlsym(lib, c"ModuleEntry".as_ptr());
             if !entry.is_null() {
                 let f: unsafe extern "system" fn(*mut c_void) -> bool = std::mem::transmute(entry);
-                if !f(std::ptr::null_mut()) {
-                    return Err("bundleEntry returned false".into());
+                if !f(lib) {
+                    return Err("ModuleEntry returned false".into());
                 }
             }
-            let ex = dl::dlsym(lib, c"bundleExit".as_ptr());
+            let ex = dl::dlsym(lib, c"ModuleExit".as_ptr());
             let exit = (!ex.is_null()).then(|| std::mem::transmute::<*mut c_void, unsafe extern "system" fn() -> bool>(ex));
             let gpf = dl::dlsym(lib, c"GetPluginFactory".as_ptr());
             if gpf.is_null() {
@@ -285,7 +410,9 @@ impl Drop for Module {
             }
             #[cfg(windows)]
             windows_sys::Win32::Foundation::FreeLibrary(self.lib);
-            #[cfg(unix)]
+            #[cfg(target_os = "macos")]
+            cf::CFRelease(self.lib);
+            #[cfg(all(unix, not(target_os = "macos")))]
             dl::dlclose(self.lib);
         }
     }

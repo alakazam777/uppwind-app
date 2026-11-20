@@ -165,7 +165,9 @@ pub enum ClientMsg {
         /// (19 nov., la mesure en direct) tempo {bpm, id, from, offset, playing} : l'ancre du morceau de l'effet en
         /// direct `id` (a partir de la trame `from` du worklet, le morceau est a trame + offset) ; render-begin {start} :
         /// la trame du morceau de la premiere trame rendue
-        from: Option<i64>, offset: Option<i64>, start: Option<i64> },
+        from: Option<i64>, offset: Option<i64>, start: Option<i64>,
+        /// (20 nov., Link to controller) params {id, start}, param-set {id, p, v}, param-watch {id, on}, param-changes {id}
+        p: Option<u32>, #[serde(rename = "v")] value: Option<f64>, on: Option<bool> },
 }
 
 /// (25 oct.) Un morceau SysEx du lien, en hexadecimal : F0 7D 55 57 … F7, 210 octets au plus (l'en-tete et 200
@@ -457,21 +459,21 @@ mod tests {
         // (19 nov., etape 3) le rendu d'un effet
         assert_eq!(
             parse(r#"{"type":"host","action":"render-begin","id":4,"frames":96000,"rate":44100,"bpm":122,"tail":2.5,"job":7,"n":1}"#),
-            Ok(ClientMsg::Host { action: "render-begin".into(), plugin: None, id: Some(4), state: None, show: None, bpm: Some(122.0), playing: None, n: Some(1), vol: None, pan: None, mute: None, open: None, frames: Some(96000), rate: Some(44100), job: Some(7), tail: Some(2.5), stream: None, from: None, offset: None, start: None })
+            Ok(ClientMsg::Host { action: "render-begin".into(), plugin: None, id: Some(4), state: None, show: None, bpm: Some(122.0), playing: None, n: Some(1), vol: None, pan: None, mute: None, open: None, frames: Some(96000), rate: Some(44100), job: Some(7), tail: Some(2.5), stream: None, from: None, offset: None, start: None, p: None, value: None, on: None })
         );
         // (19 nov., etape 3b) un effet en direct
         assert_eq!(
             parse(r#"{"type":"host","action":"fx-live","id":4,"rate":44100,"stream":9,"n":2}"#),
-            Ok(ClientMsg::Host { action: "fx-live".into(), plugin: None, id: Some(4), state: None, show: None, bpm: None, playing: None, n: Some(2), vol: None, pan: None, mute: None, open: None, frames: None, rate: Some(44100), job: None, tail: None, stream: Some(9), from: None, offset: None, start: None })
+            Ok(ClientMsg::Host { action: "fx-live".into(), plugin: None, id: Some(4), state: None, show: None, bpm: None, playing: None, n: Some(2), vol: None, pan: None, mute: None, open: None, frames: None, rate: Some(44100), job: None, tail: None, stream: Some(9), from: None, offset: None, start: None, p: None, value: None, on: None })
         );
         // (19 nov., la mesure en direct) l'ancre du morceau d'un effet en direct, le depart d'un rendu
         assert_eq!(
             parse(r#"{"type":"host","action":"tempo","bpm":128,"id":4,"from":1635456,"offset":-1587456,"playing":true}"#),
-            Ok(ClientMsg::Host { action: "tempo".into(), plugin: None, id: Some(4), state: None, show: None, bpm: Some(128.0), playing: Some(true), n: None, vol: None, pan: None, mute: None, open: None, frames: None, rate: None, job: None, tail: None, stream: None, from: Some(1635456), offset: Some(-1587456), start: None })
+            Ok(ClientMsg::Host { action: "tempo".into(), plugin: None, id: Some(4), state: None, show: None, bpm: Some(128.0), playing: Some(true), n: None, vol: None, pan: None, mute: None, open: None, frames: None, rate: None, job: None, tail: None, stream: None, from: Some(1635456), offset: Some(-1587456), start: None, p: None, value: None, on: None })
         );
         assert_eq!(
             parse(r#"{"type":"host","action":"render-begin","id":4,"frames":10,"rate":48000,"start":96000}"#),
-            Ok(ClientMsg::Host { action: "render-begin".into(), plugin: None, id: Some(4), state: None, show: None, bpm: None, playing: None, n: None, vol: None, pan: None, mute: None, open: None, frames: Some(10), rate: Some(48000), job: None, tail: None, stream: None, from: None, offset: None, start: Some(96000) })
+            Ok(ClientMsg::Host { action: "render-begin".into(), plugin: None, id: Some(4), state: None, show: None, bpm: None, playing: None, n: None, vol: None, pan: None, mute: None, open: None, frames: Some(10), rate: Some(48000), job: None, tail: None, stream: None, from: None, offset: None, start: Some(96000), p: None, value: None, on: None })
         );
         // (19 nov., etape 2) le numero de flux d'un plugin heberge
         assert_eq!(
@@ -481,7 +483,7 @@ mod tests {
         // (19 nov.) l'hote VST3 : chaque champ arrive (un champ oublie ici est jete sans bruit par serde)
         assert_eq!(
             parse(r#"{"type":"host","action":"view","id":3,"open":true,"show":false,"plugin":"ab","state":"cd","bpm":120,"playing":true,"n":9,"vol":0.5,"pan":-0.25,"mute":true}"#),
-            Ok(ClientMsg::Host { action: "view".into(), plugin: Some("ab".into()), id: Some(3), state: Some("cd".into()), show: Some(false), bpm: Some(120.0), playing: Some(true), n: Some(9), vol: Some(0.5), pan: Some(-0.25), mute: Some(true), open: Some(true), frames: None, rate: None, job: None, tail: None, stream: None, from: None, offset: None, start: None })
+            Ok(ClientMsg::Host { action: "view".into(), plugin: Some("ab".into()), id: Some(3), state: Some("cd".into()), show: Some(false), bpm: Some(120.0), playing: Some(true), n: Some(9), vol: Some(0.5), pan: Some(-0.25), mute: Some(true), open: Some(true), frames: None, rate: None, job: None, tail: None, stream: None, from: None, offset: None, start: None, p: None, value: None, on: None })
         );
         assert_eq!(parse(r#"{"type":"routes"}"#), Ok(ClientMsg::Routes));
         // (11 nov.) l'affichage d'une fenetre de Logic Pro

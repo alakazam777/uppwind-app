@@ -3,7 +3,8 @@
 //! (19 nov., etape 1 de « le compagnon comme hote VST3 », a-lire/hote-vst3-compagnon-19nov.md) Le compagnon heberge
 //! lui-meme les plugins VST3 : Uppwind Studio les charge, les joue et les affiche SANS DAW ouvert.
 //!
-//! - Le scan : les dossiers VST3 standard (Common Files\VST3, %LOCALAPPDATA%\Programs\Common\VST3), un module a la fois
+//! - Le scan : les dossiers VST3 standard (Common Files\VST3, %LOCALAPPDATA%\Programs\Common\VST3 ; (20 nov.) macOS :
+//!   /Library/Audio/Plug-Ins/VST3, ~/Library/Audio/Plug-Ins/VST3), un module a la fois
 //!   dans un processus a part (`--plug-scan`, SCAN_TIMEOUT au plus : un plugin qui plante ou se bloque est note et
 //!   saute), en fond ; le cache (%LOCALAPPDATA%\Uppwind Link\vst3-scan.json, par chemin + taille + date) : seuls les
 //!   modules nouveaux ou changes sont relus. Le studio ne voit que des identifiants de classe (32 chiffres), JAMAIS
@@ -83,7 +84,8 @@ impl Drop for Slot {
 /// L'armement (main.rs le donne) : desarme, les editeurs des plugins heberges se ferment et ne sont plus filmes.
 static ARMED: OnceLock<Box<dyn Fn() -> bool + Send + Sync>> = OnceLock::new();
 fn armed_now() -> bool {
-    ARMED.get().map(|f| f()).unwrap_or(true)
+    // (20 nov., relecture macOS) sans surveillance branchee (main.rs), « desarme » : un oubli refuse, il n'ouvre rien
+    ARMED.get().map(|f| f()).unwrap_or(false)
 }
 /// main.rs, une fois l'armement cree : le fil qui le surveille ferme les editeurs a chaque desarmement (la personne, ou
 /// l'arret automatique apres 10 minutes sans studio).
@@ -160,8 +162,11 @@ fn tie_to_companion(child: &Child) {
 fn tie_to_companion(_child: &Child) {}
 
 /// Une erreur pour le studio, sans chemin de fichier (celui d'un module de %LOCALAPPDATA% porte le nom de la session
-/// Windows) : chaque « X:\… » devient « (path) », jusqu'au « : » suivant, a une guillemet ou a la fin. Le message
-/// entier reste dans le journal du compagnon.
+/// Windows) : chaque « X:\… » devient « (path) », jusqu'au « : » suivant, a une guillemet ou a la fin. (20 nov.,
+/// relecture macOS) de meme un chemin absolu de Mac ou d'Unix (« /Users/<compte>/Library/… ») : un « / » en debut de
+/// mot suivi d'un autre « / » dans le meme mot ; il va jusqu'au « : », a une guillemet, a une parenthese ouvrante
+/// precedee d'une espace, a la fin du nom d'un paquet (.vst3, .component, .bundle, .dylib, .app, .json, .bin, .wav)
+/// ou a la fin. Le message entier reste dans le journal du compagnon.
 pub fn no_paths(e: &str) -> String {
     let b = e.as_bytes();
     let mut out = String::with_capacity(e.len());
@@ -170,6 +175,28 @@ pub fn no_paths(e: &str) -> String {
         let drive = i + 2 < b.len() && b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/')
             && (i == 0 || !b[i - 1].is_ascii_alphanumeric());
         let unc = i + 1 < b.len() && b[i] == b'\\' && b[i + 1] == b'\\';
+        if !drive && !unc && b[i] == b'/' && (i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'\n' | b'(' | b'"' | b'\'' | b'=' | b'[' | b',' | b':')) && i + 1 < b.len() && b[i + 1] != b' ' && b[i + 1] != b'/' {
+            let word_end = b[i + 1..].iter().position(|c| *c == b' ' || *c == b'"' || *c == b'\'').map(|p| i + 1 + p).unwrap_or(b.len());
+            if b[i + 1..word_end].contains(&b'/') {
+                let mut j = i + 1;
+                while j < b.len() && !(b[j] == b'"' || b[j] == b'\'' || (b[j] == b':' && (j + 1 == b.len() || b[j + 1] == b' ')) || (b[j] == b'(' && b[j - 1] == b' ')) {
+                    j += 1;
+                    if let Some(ext) = [".vst3", ".component", ".bundle", ".dylib", ".app", ".json", ".bin", ".wav"].iter().find(|x| b[..j].ends_with(x.as_bytes())) {
+                        let _ = ext;
+                        if j == b.len() || matches!(b[j], b' ' | b'"' | b'\'' | b')' | b':' | b',') {
+                            break;
+                        }
+                    }
+                }
+                // une espace laissee devant « ( » reste au message
+                while j > i + 1 && b[j - 1] == b' ' && j < b.len() && b[j] == b'(' {
+                    j -= 1;
+                }
+                out.push_str("(path)");
+                i = j;
+                continue;
+            }
+        }
         if drive || unc {
             let mut j = i + 2;
             while j < b.len() && !(b[j] == b'"' || b[j] == b'\'' || (b[j] == b':' && j + 1 < b.len() && b[j + 1] == b' ')) {
@@ -195,19 +222,58 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
-/// Au demarrage du serveur (main.rs), Windows seulement : le fichier d'etat que lisent nos plugins (les enfants le
-/// passent aux leurs), les dossiers.
+/// Au demarrage du serveur (main.rs), Windows et (20 nov.) macOS : le fichier d'etat que lisent nos plugins (les enfants
+/// le passent aux leurs), les dossiers.
 pub fn configure(state_file: PathBuf) {
     let Ok(exe) = std::env::current_exe() else { return };
-    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let Some(local) = local else { return };
-    let data = local.join(crate::install::APP_DIR);
-    let mut dirs = Vec::new();
-    if let Some(pf) = std::env::var_os("CommonProgramFiles").map(PathBuf::from) {
-        dirs.push(pf.join("VST3"));
-    }
-    dirs.push(local.join("Programs").join("Common").join("VST3"));
-    let link_bundle = dirs.first().map(|d| d.join("Uppwind Link.vst3")).unwrap_or_default();
+    #[cfg(windows)]
+    let (data, dirs, link_bundle) = {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let Some(local) = local else { return };
+        let data = local.join(crate::install::APP_DIR);
+        let mut dirs = Vec::new();
+        if let Some(pf) = std::env::var_os("CommonProgramFiles").map(PathBuf::from) {
+            dirs.push(pf.join("VST3"));
+        }
+        dirs.push(local.join("Programs").join("Common").join("VST3"));
+        let link_bundle = dirs.first().map(|d| d.join("Uppwind Link.vst3")).unwrap_or_default();
+        (data, dirs, link_bundle)
+    };
+    // (20 nov.) macOS : les deux dossiers VST3 de Steinberg (celui du Mac, celui de l'utilisateur) ; nos plugins la ou le
+    // compagnon les installe (~/Library, plugin_install) ; les donnees (scan, etats, rendus) a cote du fichier d'etat —
+    // ~/Library/Application Support/Uppwind Link pour le compagnon installe, le dossier d'essai pour un --state-file a part
+    #[cfg(target_os = "macos")]
+    let (data, dirs, link_bundle) = {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+        let Some(data) = state_file.parent().map(Path::to_path_buf) else { return };
+        let user = home.join("Library").join("Audio").join("Plug-Ins").join("VST3");
+        let dirs = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3"), user.clone()];
+        (data, dirs, user.join("Uppwind Link.vst3"))
+    };
+    // (20 nov.) un compagnon d'essai : nos plugins d'une autre version (celle de la branche), jamais ceux de la page —
+    // seulement l'environnement de qui lance le compagnon
+    let link_bundle = std::env::var_os("UWL_HOST_LINK_BUNDLE").map(PathBuf::from).filter(|p| p.join("Contents").is_dir()).unwrap_or(link_bundle);
+    // (20 nov., relecture de securite macOS) sur Mac, les plugins se chargent dans uppwind-link-host (src/bin), le seul
+    // programme signe avec l'autorisation de charger des bibliotheques d'autres editeurs ; le compagnon reste strict. Pose
+    // a cote du compagnon (le .dmg, --install) ; absent (une construction depuis les sources), le compagnon lui-meme.
+    #[cfg(target_os = "macos")]
+    let exe = {
+        let h = exe.with_file_name(crate::install::HOST_HELPER);
+        // (relecture 0.4.13) seulement le helper de CETTE version (un --install d'un dossier sans lui garderait l'ancien)
+        let same = h.is_file()
+            && std::process::Command::new(&h).arg("--version").stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == env!("CARGO_PKG_VERSION"))
+                .unwrap_or(false);
+        if same {
+            h
+        } else if h.is_file() {
+            crate::log(&format!("plugin host: {} is not version {}: install Uppwind Link again (its .dmg), so that plugins load", crate::install::HOST_HELPER, env!("CARGO_PKG_VERSION")));
+            exe
+        } else {
+            crate::log("plugin host: uppwind-link-host is not next to the companion: plugins load in the companion's own program (fine for a build from source; a signed release cannot load other makers' plugins that way)");
+            exe
+        }
+    };
     let _ = CFG.set(Cfg { exe, state_file, data, dirs, link_bundle });
     sweep_jobs();
 }
@@ -217,7 +283,7 @@ pub fn available() -> bool {
 }
 
 fn cfg() -> Result<&'static Cfg, String> {
-    CFG.get().ok_or_else(|| "this companion does not host plugins (Windows only, with the plugin listener on)".into())
+    CFG.get().ok_or_else(|| "this companion does not host plugins (it needs the plugin listener on)".into())
 }
 
 // ── Le scan ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -489,6 +555,9 @@ struct Inst {
     view: Mutex<Option<(i32, i32)>>,
     ready: Mutex<Option<Value>>,
     waiters: Mutex<HashMap<u64, Sender<Value>>>,
+    /// (20 nov., Link to controller) les parametres que l'editeur a fait bouger depuis la derniere lecture du studio
+    /// (« param » de l'enfant → « param-changes ») : le dernier de chacun, 256 au plus
+    param_changes: Mutex<Vec<(u32, f64)>>,
 }
 
 /// (19 nov., etape 3b) Les lignes en attente vers un enfant (un effet en direct : 200 paquets par seconde ; 512 : 2,5 s).
@@ -516,7 +585,9 @@ fn item_json(i: &Inst) -> Value {
     let ready = i.ready.lock().unwrap().clone().unwrap_or(Value::Null);
     json!({ "id": i.id, "name": i.name, "plugin": i.cid, "vendor": i.vendor, "tag": i.tag, "pid": i.pid, "kind": if i.effect { "effect" } else { "instrument" },
             "status": *i.status.lock().unwrap(), "error": i.error.lock().unwrap().as_deref().map(no_paths), "editor": i.editor.load(Ordering::Relaxed), "view": i.view.lock().unwrap().is_some(),
-            "hasEditor": ready["editor"], "w": ready["w"], "h": ready["h"], "hwnd": ready["hwnd"] })
+            "hasEditor": ready["editor"], "w": ready["w"], "h": ready["h"], "hwnd": ready["hwnd"],
+            // (20 nov., un projet recharge) la frequence de l'instrument, telle que l'enfant la dit (null : un effet, ou pas pret)
+            "rate": ready["rate"] })
 }
 
 fn send_cmd(i: &Inst, v: Value) -> Result<(), String> {
@@ -589,7 +660,24 @@ fn reader(inst: Arc<Inst>, stdout: std::process::ChildStdout, ready_tx: Sender<R
                         }
                     }
                 }
-                "saved" | "error" | "rendered" | "live" => {
+                "param" => {
+                    if let Some(items) = v["items"].as_array() {
+                        let mut pc = inst.param_changes.lock().unwrap();
+                        for it in items.iter().take(128) {
+                            let (Some(p), Some(x)) = (it["p"].as_u64(), it["v"].as_f64()) else { continue };
+                            if p > 4095 || !x.is_finite() {
+                                continue;
+                            }
+                            let x = x.clamp(0.0, 1.0);
+                            if let Some(e) = pc.iter_mut().find(|e| e.0 == p as u32) {
+                                e.1 = x;
+                            } else if pc.len() < 256 {
+                                pc.push((p as u32, x));
+                            }
+                        }
+                    }
+                }
+                "saved" | "error" | "rendered" | "live" | "params" => {
                     if v["fatal"] == true {
                         *inst.error.lock().unwrap() = v["error"].as_str().map(String::from);
                         if let Some(t) = ready_tx.take() {
@@ -605,6 +693,8 @@ fn reader(inst: Arc<Inst>, stdout: std::process::ChildStdout, ready_tx: Sender<R
                 "closed" => *inst.status.lock().unwrap() = "closed".into(),
                 // (20 nov., 2e relecture) les reglages abimes d'un plugin : il s'ouvre avec ses defauts, le journal le dit
                 "notice" => crate::log(&format!("plugin host: {}", no_paths(v["notice"].as_str().unwrap_or("")))),
+                // (20 nov., l'hote macOS) un menu du plugin s'ouvre ou se ferme (macui : ses gestes passent par l'enfant)
+                "menu" => crate::log(&format!("plugin host: {} menu {}", inst.name, if v["open"] == true { "open" } else { "closed" })),
                 _ => {}
             }
         }
@@ -696,6 +786,10 @@ fn add(plugin: &str, state: Option<&str>, rate: Option<u32>) -> Result<Value, St
         }
     }
     cmd.env("UWL_STATE_FILE", &c.state_file).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    // (20 nov.) les essais des menus (UWL_HOST_MENU_LOG=1, macui) : ce que l'enfant ecrit va au journal du compagnon
+    if std::env::var("UWL_HOST_MENU_LOG").as_deref() == Ok("1") {
+        cmd.stderr(Stdio::inherit());
+    }
     hidden(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("cannot start the plugin host ({e})"))?;
     tie_to_companion(&child);
@@ -723,6 +817,7 @@ fn add(plugin: &str, state: Option<&str>, rate: Option<u32>) -> Result<Value, St
         view: Mutex::new(None),
         ready: Mutex::new(None),
         waiters: Mutex::new(HashMap::new()),
+        param_changes: Mutex::new(Vec::new()),
     });
     insts().lock().unwrap().push(inst.clone());
     changed();
@@ -782,7 +877,7 @@ fn save(id: u32, n: Value) -> Result<Value, String> {
     if v["event"] == "saved" {
         Ok(json!({ "type": "host", "action": "saved", "id": id, "n": n, "state": v["sha"], "bytes": v["bytes"] }))
     } else {
-        Err(v["error"].as_str().unwrap_or("the settings could not be saved").to_string())
+        Err(no_paths(v["error"].as_str().unwrap_or("the settings could not be saved")))
     }
 }
 
@@ -810,8 +905,15 @@ pub fn windows() -> Vec<crate::plugins::PluginWindow> {
         .collect()
 }
 
+/// (20 nov.) macOS : le numero de fenetre (CGWindowID) que l'enfant a donne est-il toujours une fenetre de CET enfant ?
+#[cfg(target_os = "macos")]
+fn is_window_of(id: u64, pid: u32) -> bool {
+    pid != 0 && crate::macos::window_pid(id) == pid
+}
+
 /// La fenetre `hwnd` existe-t-elle, et appartient-elle au processus `pid` (l'enfant) ? Un handle recycle par Windows
 /// pour la fenetre d'un autre programme n'est jamais filme.
+#[cfg(windows)]
 fn is_window_of(hwnd: u64, pid: u32) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
@@ -824,6 +926,36 @@ fn is_window_of(hwnd: u64, pid: u32) -> bool {
         GetWindowThreadProcessId(h, Some(&mut owner));
         owner == pid
     }
+}
+
+/// (20 nov., l'hote macOS) La fenetre `win` (un CGWindowID) est-elle l'editeur ouvert d'un plugin heberge ? → son instance
+/// et la hauteur de sa barre de titre (points : retiree de l'image filmee, ajoutee aux gestes).
+#[cfg(target_os = "macos")]
+pub fn hosted_window(win: u64) -> Option<(u32, f64)> {
+    let list = insts().lock().unwrap();
+    list.iter()
+        .filter(|i| *i.status.lock().unwrap() == "ready" && i.view.lock().unwrap().is_some())
+        .find(|i| i.ready.lock().unwrap().as_ref().and_then(|r| r["hwnd"].as_u64()) == Some(win) && is_window_of(win, i.pid))
+        .map(|i| (i.id, i.ready.lock().unwrap().as_ref().and_then(|r| r["titlebar"].as_f64()).filter(|t| t.is_finite()).unwrap_or(0.0).clamp(0.0, 200.0)))
+}
+
+/// (20 nov., l'hote macOS) Un geste pour l'editeur du plugin heberge `id` (input.rs l'a traduit) : vers son enfant, qui le
+/// pose dans la file d'AppKit (uwl_vst3host::macui::gesture). Jamais d'attente : l'enfant en retard, le geste est perdu.
+#[cfg(target_os = "macos")]
+pub fn gesture(id: u32, v: Value) -> Result<(), String> {
+    let i = find(id)?;
+    i.tx.try_send(gesture_line(v)?).map_err(|_| format!("{} is busy", i.name))
+}
+
+/// La forme exacte que le fil de lecture de l'enfant reconnait : « {"cmd":"mouse" » (ou wheel, key) D'ABORD (serde_json
+/// range les cles par ordre alphabetique).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gesture_line(mut v: Value) -> Result<String, String> {
+    let cmd = v["cmd"].as_str().filter(|c| matches!(*c, "mouse" | "wheel" | "key")).ok_or("not a gesture")?.to_string();
+    let m = v.as_object_mut().ok_or("not a gesture")?;
+    m.remove("cmd");
+    let rest = Value::Object(m.clone()).to_string();
+    Ok(if rest == "{}" { format!("{{\"cmd\":\"{cmd}\"}}") } else { format!("{{\"cmd\":\"{cmd}\",{}", &rest[1..]) })
 }
 
 /// (19 nov., etape 2) Le Return du plugin heberge `id` (connecte au compagnon par son enfant) → « plugin:<hex> ».
@@ -891,7 +1023,7 @@ pub fn render(id: u32, input: &Path, output: &Path, frames: u64, rate: u32, bpm:
     if v["event"] == "rendered" {
         Ok(json!({ "frames": v["frames"], "latency": v["latency"], "tail": v["tail"] }))
     } else {
-        Err(v["error"].as_str().unwrap_or("the render failed").to_string())
+        Err(no_paths(v["error"].as_str().unwrap_or("the render failed")))
     }
 }
 
@@ -916,7 +1048,7 @@ pub fn fx_live(id: u32, rate: u32, gen: u32, sink: SyncSender<FxOut>) -> Result<
         crate::log(&format!("plugin host: {} live at {rate} Hz (latency {})", i.name, v["latency"]));
         Ok(json!({ "latency": v["latency"], "rate": v["rate"] }))
     } else {
-        Err(v["error"].as_str().unwrap_or("the effect could not go live").to_string())
+        Err(no_paths(v["error"].as_str().unwrap_or("the effect could not go live")))
     }
 }
 
@@ -1026,6 +1158,50 @@ pub fn request(v: Value, reply: Sender<String>) {
                     send_cmd(&i, json!({ "cmd": "view", "open": open }))?;
                     Ok(json!({ "type": "host", "action": "view", "id": id, "open": open }))
                 }
+                // (20 nov., Link to controller) les parametres d'un plugin heberge : la liste (par pages), en poser un,
+                // suivre ceux que son editeur fait bouger (le studio relit param-changes)
+                "params" => {
+                    let id = v["id"].as_u64().ok_or("id")? as u32;
+                    let i = find(id)?;
+                    let k = NEXT_N.fetch_add(1, Ordering::Relaxed);
+                    let (tx, rx) = mpsc::channel();
+                    i.waiters.lock().unwrap().insert(k, tx);
+                    let start = v["start"].as_u64().unwrap_or(0).min(4096);
+                    if let Err(e) = send_cmd(&i, json!({ "cmd": "params", "n": k, "start": start })) {
+                        i.waiters.lock().unwrap().remove(&k);
+                        return Err(e);
+                    }
+                    let r = rx.recv_timeout(Duration::from_secs(10));
+                    i.waiters.lock().unwrap().remove(&k);
+                    let r = r.map_err(|_| format!("{} did not list its parameters in time", i.name))?;
+                    Ok(json!({ "type": "host", "action": "params", "id": id, "n": v["n"], "plugin": i.name, "items": r["items"], "next": r["next"] }))
+                }
+                "param-set" => {
+                    let id = v["id"].as_u64().ok_or("id")? as u32;
+                    let i = find(id)?;
+                    let p = v["p"].as_u64().filter(|p| *p <= 4095).ok_or("p is 0..4095")?;
+                    let x = v["v"].as_f64().filter(|x| (0.0..=1.0).contains(x)).ok_or("v is 0..1")?;
+                    send_cmd(&i, json!({ "cmd": "param-set", "p": p, "v": x }))?;
+                    return Ok(Value::Null);
+                }
+                "param-watch" => {
+                    let id = v["id"].as_u64().ok_or("id")? as u32;
+                    let i = find(id)?;
+                    let on = v["on"].as_bool().unwrap_or(false);
+                    // (20 nov.) le suivi redemande (chaque appui dans l'image) n'efface pas ce que le geste a fait bouger
+                    if !on {
+                        i.param_changes.lock().unwrap().clear();
+                    }
+                    send_cmd(&i, json!({ "cmd": "param-watch", "on": on }))?;
+                    Ok(json!({ "type": "host", "action": "param-watch", "id": id, "on": on, "n": v["n"] }))
+                }
+                "param-changes" => {
+                    let id = v["id"].as_u64().ok_or("id")? as u32;
+                    let i = find(id)?;
+                    let got: Vec<(u32, f64)> = std::mem::take(&mut *i.param_changes.lock().unwrap());
+                    let items: Vec<Value> = got.iter().map(|(p, x)| json!({ "p": p, "v": x })).collect();
+                    Ok(json!({ "type": "host", "action": "param-changes", "id": id, "n": v["n"], "items": items }))
+                }
                 "tempo" => {
                     let bpm = v["bpm"].as_f64().filter(|b| (20.0..=999.0).contains(b)).ok_or("bpm is 20..999")?;
                     // (19 nov., la mesure en direct) avec `id`, `from` et `offset` : l'ancre du morceau de CET effet en direct
@@ -1076,6 +1252,17 @@ mod tests {
     }
 
     #[test]
+    fn a_gesture_line_starts_with_its_command() {
+        let l = gesture_line(json!({ "cmd": "mouse", "ty": 1, "x": 3.5, "y": 4, "clicks": 1, "flags": 0 })).unwrap();
+        assert!(l.starts_with("{\"cmd\":\"mouse\","), "{l}");
+        let v: Value = serde_json::from_str(&l).unwrap();
+        assert_eq!((v["ty"].as_u64(), v["x"].as_f64(), v["clicks"].as_u64()), (Some(1), Some(3.5), Some(1)));
+        assert!(gesture_line(json!({ "cmd": "key", "kc": 49, "down": true, "text": "a\"b", "flags": 0 })).unwrap().starts_with("{\"cmd\":\"key\","));
+        assert_eq!(gesture_line(json!({ "cmd": "wheel" })).unwrap(), "{\"cmd\":\"wheel\"}");
+        assert!(gesture_line(json!({ "cmd": "quit" })).is_err(), "only the three gestures");
+    }
+
+    #[test]
     fn kinds() {
         assert_eq!(kind_of("Instrument|Synth"), "instrument");
         assert_eq!(kind_of("Fx|Reverb"), "effect");
@@ -1099,6 +1286,15 @@ mod tests {
         assert_eq!(no_paths(r"\\nas\share\a.vst3"), "(path)");
         assert_eq!(no_paths("no plugin with this id"), "no plugin with this id");
         assert_eq!(no_paths("ratio 1:2 ok"), "ratio 1:2 ok");
+        // (20 nov., relecture macOS) les chemins de Mac
+        assert_eq!(no_paths("the module of /Users/someone/Library/Audio/Plug-Ins/VST3/My Synth.vst3 could not be loaded (code 4)"), "the module of (path) could not be loaded (code 4)");
+        assert_eq!(no_paths("state: /Users/someone/Library/Application Support/Uppwind Link/plugin-states/ab.bin: denied"), "state: (path): denied");
+        assert_eq!(no_paths("open '/Library/Audio/Plug-Ins/VST3/X.vst3' failed"), "open '(path)' failed");
+        assert_eq!(no_paths("1/2 of the sound, 3/4 later"), "1/2 of the sound, 3/4 later");
+        assert_eq!(no_paths("a/b and /c"), "a/b and /c");
+        assert_eq!(no_paths("load /Users/élodie/Library/Audio/Plug-Ins/VST3/Équaliseur.vst3 failed"), "load (path) failed");
+        assert_eq!(no_paths("Did find:\n\t/Users/someone/Library/Audio/Plug-Ins/VST3/Diva.vst3/Contents/MacOS/Diva: code signature"), "Did find:\n\t(path): code signature");
+        assert_eq!(no_paths("see https://example.com/a/b"), "see https://example.com/a/b");
     }
 
     // (point 3) un numero de rendu jamais donne deux fois, meme par des connexions simultanees

@@ -40,6 +40,8 @@ pub const LOG_NAME: &str = "companion.log";
 pub const ROOT_ENV: &str = "UWC_INSTALL_ROOT";
 pub const LOG_MAX: u64 = 1024 * 1024;
 const ASIDE_PREFIX: &str = "uppwind-companion.old-";
+/// (20 nov.) macOS : le programme qui charge les plugins heberges (src/bin/uppwind-link-host.rs), a cote du compagnon
+pub const HOST_HELPER: &str = "uppwind-link-host";
 /// (11 nov.) la copie provisoire de `replace_exe`, avant l'echange
 const NEW_PREFIX: &str = "uppwind-companion.new-";
 
@@ -258,6 +260,17 @@ pub fn install(dirs: &Dirs, src: &Path) -> Result<Vec<String>, String> {
         }
         did.push(format!("Copied {} to {}", src.display(), dst.display()));
     }
+    // (20 nov.) macOS : uppwind-link-host suit le compagnon (s'il est a cote de lui : le .dmg, une construction signee)
+    if cfg!(target_os = "macos") {
+        let hs = src.with_file_name(HOST_HELPER);
+        let hd = app.join(HOST_HELPER);
+        if hs.is_file() && !same_file(&hs, &hd) {
+            if let Some(l) = replace_exe(&hs, &hd)? {
+                did.push(format!("The installed copy {l}."));
+            }
+            did.push(format!("Copied {} to {}", hs.display(), hd.display()));
+        }
+    }
     let swept = sweep_asides(&app);
     if swept > 0 {
         did.push(format!("Removed {swept} old cop{} set aside by a previous install.", if swept == 1 { "y" } else { "ies" }));
@@ -303,6 +316,13 @@ pub fn uninstall(dirs: &Dirs) -> Result<Vec<String>, String> {
     }
     if let Some(l) = remove_or_aside(&dirs.exe())? {
         did.push(format!("{}{}", l[..1].to_uppercase(), &l[1..]));
+    }
+    // (20 nov.) macOS : le programme des plugins heberges
+    let helper = dirs.app_dir().join(HOST_HELPER);
+    if helper.exists() {
+        if let Some(l) = remove_or_aside(&helper)? {
+            did.push(format!("{}{}", l[..1].to_uppercase(), &l[1..]));
+        }
     }
     let log = dirs.log();
     if log.exists() && std::fs::remove_file(&log).is_ok() {
@@ -715,9 +735,13 @@ mod mac_tests {
         let src = root.join("build").join("uppwind-companion");
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         std::fs::write(&src, b"v1").unwrap();
+        // (20 nov.) le programme des plugins heberges, a cote : il suit le compagnon (installe, puis desinstalle)
+        std::fs::write(src.with_file_name(HOST_HELPER), b"h1").unwrap();
         let did = install(&d, &src).unwrap();
         assert!(did.iter().any(|l| l.starts_with("Copied")), "{did:?}");
+        assert_eq!(std::fs::read(d.app_dir().join(HOST_HELPER)).unwrap(), b"h1", "{did:?}");
         use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(d.app_dir().join(HOST_HELPER)).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(std::fs::metadata(d.exe()).unwrap().permissions().mode() & 0o777, 0o755);
         assert!(!d.launch_agent().exists(), "install alone does not autostart");
         assert!(autostart(&d, true, true).unwrap()[0].starts_with("Autostart on"));

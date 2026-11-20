@@ -104,11 +104,32 @@ pub fn run(a: &[String]) -> Result<(), String> {
         let _ = ws.close(None);
         return r;
     }
+    // (20 nov., Link to controller) --params NOM : un instrument heberge, la liste de ses parametres (pages), un parametre
+    // pose (param-set) puis relu, et le suivi (param-watch, param-changes)
+    if let Some(name) = arg(a, "--params") {
+        let r = params_test(&mut ws, &name);
+        let _ = ws.close(None);
+        return r;
+    }
     // (19 nov., etape 3b) --fxlive NOM [--secs 60] : un effet heberge en direct, le son date aller-retour
     if let Some(name) = arg(a, "--fxlive") {
         let secs = num(a, "--secs", 60.0)?;
         let block = num(a, "--block", 256.0)? as usize;
         let r = fxlive_test(&mut ws, &name, secs, block.clamp(16, 512));
+        let _ = ws.close(None);
+        return r;
+    }
+    // (20 nov., l'hote macOS) --watch NOM [--secs 6] [--out DOSSIER] [--click X,Y] : l'editeur ouvert (« view »), filme par
+    // le compagnon (« watch », la vraie capture), des notes pendant qu'on compte les images ; puis un clic au point X,Y de
+    // l'image (fractions 0..1) et le temps jusqu'a l'image suivante. Les images (premiere, derniere, apres le clic) dans --out.
+    if let Some(name) = arg(a, "--watch") {
+        let secs = num(a, "--secs", 6.0)?;
+        let out = arg(a, "--out").map(std::path::PathBuf::from);
+        let pair = |k: &str| arg(a, k).and_then(|c| { let v: Vec<f64> = c.split(',').filter_map(|x| x.parse().ok()).collect(); (v.len() == 2).then(|| (v[0], v[1])) });
+        let click = pair("--click");
+        // (20 nov.) --menu X,Y : un clic droit au point (un menu contextuel), puis ce que le studio en fait (menu_steps)
+        let menu = pair("--menu");
+        let r = watch_test(&mut ws, &name, secs, out, click, menu);
         let _ = ws.close(None);
         return r;
     }
@@ -370,6 +391,68 @@ fn multi(ws: &mut Ws, names: &str, seconds: f64, every: f64, lead: f64) -> Resul
 /// (19 nov., etape 3) Le rendu d'un effet par le compagnon : le son (une impulsion, ou un sinus de 440 Hz) a 44,1 kHz
 /// part en morceaux « UWJ1 », revient en « UWJ2 » ; on compare : longueur, latence annoncee, queue, energie apres la fin
 /// de l'entree, et l'ecart echantillon par echantillon avec l'entree (un effet transparent : ~0).
+fn params_test(ws: &mut Ws, name: &str) -> Result<(), String> {
+    let mut audio = Vec::new();
+    loop {
+        host(ws, json!({ "action": "status" }))?;
+        let v = read_until(ws, is_host("status"), Duration::from_secs(10), &mut audio)?;
+        if v["scanning"] != true && v["total"].as_u64().unwrap_or(0) > 0 && v["done"] == v["total"] {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+    host(ws, json!({ "action": "plugins" }))?;
+    let p = read_until(ws, is_host("plugins"), Duration::from_secs(10), &mut audio)?;
+    let list = p["list"].as_array().cloned().unwrap_or_default();
+    let want = name.to_lowercase();
+    let pick = list.iter().find(|x| x["name"].as_str().unwrap_or("").to_lowercase().contains(&want)).ok_or(format!("no plugin like {name}"))?.clone();
+    host(ws, json!({ "action": "add", "plugin": pick["id"], "n": 1 }))?;
+    let added = read_until(ws, |v| v["type"] == "host" && (v["action"] == "added" || v["action"] == "add"), Duration::from_secs(70), &mut audio)?;
+    if added["error"].is_string() {
+        return Err(format!("add: {added}"));
+    }
+    let id = added["item"]["id"].as_u64().unwrap();
+    let t = Instant::now();
+    let mut all: Vec<Value> = Vec::new();
+    let mut start = 0u64;
+    let mut pages = 0;
+    loop {
+        host(ws, json!({ "action": "params", "id": id, "start": start, "n": 10 + pages }))?;
+        let r = read_until(ws, |v| v["type"] == "host" && v["action"] == "params", Duration::from_secs(15), &mut audio)?;
+        if r["error"].is_string() {
+            return Err(format!("params: {r}"));
+        }
+        pages += 1;
+        all.extend(r["items"].as_array().cloned().unwrap_or_default());
+        match r["next"].as_u64() {
+            Some(n) if n > start && pages < 80 => start = n,
+            _ => break,
+        }
+    }
+    println!("params: {} in {} pages, {:.0} ms ; first: {}", all.len(), pages, t.elapsed().as_secs_f64() * 1000.0,
+        all.iter().take(6).map(|x| format!("{}={:.3} ({})", x["p"], x["v"].as_f64().unwrap_or(-1.0), x["name"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", "));
+    let target = all.iter().find(|x| x["name"].as_str().unwrap_or("").to_lowercase().contains("cutoff")).or(all.first()).cloned().ok_or("no parameter")?;
+    let p0 = target["p"].as_u64().unwrap();
+    let v0 = target["v"].as_f64().unwrap_or(0.0);
+    let v1 = if v0 > 0.5 { 0.2 } else { 0.8 };
+    host(ws, json!({ "action": "param-watch", "id": id, "on": true, "n": 3 }))?;
+    let w = read_until(ws, |v| v["type"] == "host" && v["action"] == "param-watch", Duration::from_secs(5), &mut audio)?;
+    println!("watch: {w}");
+    host(ws, json!({ "action": "param-set", "id": id, "p": p0, "v": v1 }))?;
+    std::thread::sleep(Duration::from_millis(400));
+    host(ws, json!({ "action": "params", "id": id, "start": p0, "n": 4 }))?;
+    let r = read_until(ws, |v| v["type"] == "host" && v["action"] == "params", Duration::from_secs(10), &mut audio)?;
+    let back = r["items"].as_array().and_then(|a| a.iter().find(|x| x["p"].as_u64() == Some(p0)).cloned()).unwrap_or(Value::Null);
+    println!("set {} ({}) {:.3} -> {:.3} ; read back {}", p0, target["name"], v0, v1, back["v"]);
+    host(ws, json!({ "action": "param-changes", "id": id, "n": 5 }))?;
+    let c = read_until(ws, |v| v["type"] == "host" && v["action"] == "param-changes", Duration::from_secs(5), &mut audio)?;
+    println!("changes (no editor gesture expected): {}", c["items"]);
+    host(ws, json!({ "action": "param-watch", "id": id, "on": false, "n": 6 }))?;
+    let _ = read_until(ws, |v| v["type"] == "host" && v["action"] == "param-watch", Duration::from_secs(5), &mut audio)?;
+    host(ws, json!({ "action": "remove", "id": id }))?;
+    Ok(())
+}
+
 fn render_test(ws: &mut Ws, name: &str, sig: &str, secs: f64) -> Result<(), String> {
     let mut audio = Vec::new();
     loop {
@@ -654,4 +737,295 @@ fn fxlive_test(ws: &mut Ws, name: &str, secs: f64, b_frames: usize) -> Result<()
 
 fn soft(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) || e.raw_os_error() == Some(997)
+}
+
+/// (20 nov., l'hote macOS) Les messages et les images d'une capture : (le texte, ou l'en-tete d'une image et son JPEG).
+enum Got {
+    Text(Value),
+    Frame(Value, Vec<u8>),
+    Nothing,
+}
+
+fn read_any(ws: &mut Ws) -> Got {
+    match ws.read() {
+        Ok(Message::Text(t)) => Got::Text(serde_json::from_str(t.as_str()).unwrap_or(Value::Null)),
+        Ok(Message::Binary(b)) if b.len() >= 8 && &b[..4] == b"UWF1" => {
+            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+            match (b.get(8..8 + n), b.get(8 + n..)) {
+                (Some(h), Some(j)) => Got::Frame(serde_json::from_slice(h).unwrap_or(Value::Null), j.to_vec()),
+                _ => Got::Nothing,
+            }
+        }
+        _ => Got::Nothing,
+    }
+}
+
+/// (20 nov., l'hote macOS) Un menu contextuel du plugin, depuis le studio : clic droit au point `m` (fractions de
+/// l'image), « save » pendant que le menu est ouvert (il ne doit ni attendre ni le fermer), un clic sur son premier
+/// article (25 × 5 points sous le pointeur, la place du premier article d'un menu contextuel de macOS 26), « save », le
+/// menu rouvert puis ferme par Echap, et le menu rouvert puis ferme par un clic a cote. Chaque etape : le temps, les
+/// images recues (la derniere dans --out), et ce que l'enfant a dit ({"event":"menu"} n'arrive pas jusqu'ici : les
+/// images et les temps de « save » sont les temoins).
+fn menu_steps(ws: &mut Ws, id: u64, size: (f64, f64), scale: f64, m: (f64, f64), out: &Option<std::path::PathBuf>) -> Result<(), String> {
+    let mut audio = Vec::new();
+    let (w, h) = size;
+    let at = (m.0 * w, m.1 * h);
+    let item = (at.0 + 25.0 * scale, at.1 + 5.0 * scale);
+    let away = (0.08 * w, 0.92 * h);
+    let pointer = |ws: &mut Ws, act: &str, p: (f64, f64), button: u8| -> Result<(), String> {
+        let buttons = match (act, button) {
+            ("down", 2) => 2,
+            ("down", _) => 1,
+            _ => 0,
+        };
+        let msg = json!({ "type": "input", "kind": "pointer", "action": act, "x": p.0, "y": p.1, "iw": w, "ih": h, "button": button, "buttons": buttons, "mods": 0 });
+        ws.send(Message::text(msg.to_string())).map_err(|e| e.to_string())
+    };
+    let click = |ws: &mut Ws, p: (f64, f64), button: u8| -> Result<(), String> {
+        pointer(ws, "down", p, button)?;
+        std::thread::sleep(Duration::from_millis(50));
+        pointer(ws, "up", p, button)
+    };
+    // les images pendant `ms` : combien, et la derniere dans --out sous `name`
+    let frames_for = |ws: &mut Ws, ms: u64, name: &str| -> usize {
+        let end = Instant::now() + Duration::from_millis(ms);
+        let (mut n, mut last) = (0usize, Vec::new());
+        while Instant::now() < end {
+            if let Got::Frame(hd, j) = read_any(ws) {
+                if let Some(seq) = hd["seq"].as_u64() {
+                    let _ = ws.send(Message::text(json!({ "type": "ack", "seq": seq }).to_string()));
+                }
+                n += 1;
+                if hd.get("x").is_none() {
+                    last = j;
+                }
+            }
+        }
+        if let (Some(d), false) = (out, last.is_empty()) {
+            let _ = std::fs::create_dir_all(d);
+            let _ = std::fs::write(d.join(format!("{name}.jpg")), &last);
+        }
+        n
+    };
+    let mut k = 20;
+    let mut save = |ws: &mut Ws, what: &str| -> Result<Value, String> {
+        k += 1;
+        let t = Instant::now();
+        host(ws, json!({ "action": "save", "id": id, "n": k }))?;
+        let r = read_until(ws, |v| v["type"] == "host" && (v["action"] == "saved" || v["error"].is_string()), Duration::from_secs(20), &mut audio);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        match &r {
+            Ok(v) => println!("  save {what}: {ms:.0} ms, state {}", v["state"].as_str().map(|s| &s[..12.min(s.len())]).unwrap_or("?")),
+            Err(e) => println!("  save {what}: FAILED after {ms:.0} ms ({e})"),
+        }
+        r
+    };
+    println!("menu test: right-click at {:.0},{:.0} of {w:.0}x{h:.0} (scale {scale:.2}), first item at {:.0},{:.0}", at.0, at.1, item.0, item.1);
+    let s0 = save(ws, "before")?;
+    click(ws, at, 2)?;
+    println!("  right-click: {} images in 1 s (menu-open.jpg)", frames_for(ws, 1000, "menu-open"));
+    let s1 = save(ws, "while the menu is open")?;
+    println!("  after that save: {} images in 0.6 s (menu-still-open.jpg)", frames_for(ws, 600, "menu-still-open"));
+    click(ws, item, 0)?;
+    println!("  click on the first item: {} images in 1 s (after-item.jpg)", frames_for(ws, 1000, "after-item"));
+    let s2 = save(ws, "after the item")?;
+    click(ws, at, 2)?;
+    println!("  right-click again: {} images in 1 s (menu-again.jpg)", frames_for(ws, 1000, "menu-again"));
+    for act in ["down", "up"] {
+        let msg = json!({ "type": "input", "kind": "key", "action": act, "key": "Escape", "code": "Escape", "mods": 0 });
+        ws.send(Message::text(msg.to_string())).map_err(|e| e.to_string())?;
+    }
+    println!("  Escape: {} images in 0.8 s (after-escape.jpg)", frames_for(ws, 800, "after-escape"));
+    save(ws, "after Escape")?;
+    click(ws, at, 2)?;
+    frames_for(ws, 800, "menu-third");
+    click(ws, away, 0)?;
+    println!("  click away at {:.0},{:.0}: {} images in 0.8 s (after-away.jpg)", away.0, away.1, frames_for(ws, 800, "after-away"));
+    save(ws, "after the click away")?;
+    // le menu ouvert, puis le plugin retire (watch_test) : l'enfant doit se fermer sans attendre
+    click(ws, at, 2)?;
+    frames_for(ws, 600, "menu-before-remove");
+    println!(
+        "states: before {} · during the menu {} · after the item {}",
+        s0["state"].as_str().unwrap_or("?").get(..12).unwrap_or("?"),
+        s1["state"].as_str().unwrap_or("?").get(..12).unwrap_or("?"),
+        s2["state"].as_str().unwrap_or("?").get(..12).unwrap_or("?")
+    );
+    Ok(())
+}
+
+fn watch_test(ws: &mut Ws, name: &str, secs: f64, out: Option<std::path::PathBuf>, click: Option<(f64, f64)>, menu: Option<(f64, f64)>) -> Result<(), String> {
+    let mut audio = Vec::new();
+    let want = name.to_lowercase();
+    // le scan
+    let t0 = Instant::now();
+    let list = loop {
+        host(ws, json!({ "action": "plugins" }))?;
+        let p = read_until(ws, is_host("plugins"), Duration::from_secs(10), &mut audio)?;
+        if p["scanning"] != true || t0.elapsed() > Duration::from_secs(300) {
+            break p["list"].as_array().cloned().unwrap_or_default();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let pick = list.iter().find(|x| x["name"].as_str().unwrap_or("").to_lowercase().contains(&want)).ok_or(format!("no plugin named like \"{want}\""))?.clone();
+    host(ws, json!({ "action": "add", "plugin": pick["id"], "n": 1 }))?;
+    let added = read_until(ws, |v| v["type"] == "host" && (v["action"] == "added" || v["error"].is_string()), Duration::from_secs(70), &mut audio)?;
+    if added["error"].is_string() {
+        return Err(format!("add: {added}"));
+    }
+    let item = added["item"].clone();
+    let (id, tag) = (item["id"].as_u64().unwrap_or(0), item["tag"].as_u64().unwrap_or(0));
+    println!("added {} (id {id}, pid {}, window {})", pick["name"], item["pid"], item["hwnd"]);
+    // le plugin est retire meme si la mesure echoue (un enfant laisse ouvert garde son menu, sa fenetre)
+    let r = watch_body(ws, id, tag, secs, out, click, menu);
+    let _ = ws.send(Message::text(r#"{"type":"unwatch"}"#.to_string()));
+    let t = Instant::now();
+    host(ws, json!({ "action": "remove", "id": id }))?;
+    let rm = read_until(ws, is_host("removed"), Duration::from_secs(8), &mut audio);
+    println!("removed in {:.0} ms{}", t.elapsed().as_secs_f64() * 1000.0, if rm.is_err() { " (NO answer)" } else { "" });
+    r
+}
+
+fn watch_body(ws: &mut Ws, id: u64, tag: u64, secs: f64, out: Option<std::path::PathBuf>, click: Option<(f64, f64)>, menu: Option<(f64, f64)>) -> Result<(), String> {
+    let mut audio = Vec::new();
+    let t = Instant::now();
+    host(ws, json!({ "action": "view", "id": id, "open": true }))?;
+    // la fenetre dans la liste des fenetres (piste « #<id> »)
+    let win = loop {
+        ws.send(Message::text(r#"{"type":"list"}"#.to_string())).map_err(|e| e.to_string())?;
+        let v = read_until(ws, |v| v["type"] == "windows", Duration::from_secs(5), &mut audio)?;
+        if let Some(w) = v["windows"].as_array().and_then(|l| l.iter().find(|w| w["track"] == format!("#{id}"))) {
+            break w.clone();
+        }
+        if t.elapsed() > Duration::from_secs(15) {
+            return Err(format!("the editor window never showed in the list: {v}"));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    println!("editor open in {:.0} ms: {win}", t.elapsed().as_secs_f64() * 1000.0);
+    let wid = win["id"].as_u64().unwrap_or(0);
+    ws.send(Message::text(json!({ "type": "watch", "id": wid, "fps": 30 }).to_string())).map_err(|e| e.to_string())?;
+    let save = |n: &str, j: &[u8]| {
+        if let Some(d) = &out {
+            let _ = std::fs::create_dir_all(d);
+            let _ = std::fs::write(d.join(n), j);
+        }
+    };
+    let mut frames = 0usize;
+    let mut first = true;
+    let mut last: Vec<u8> = Vec::new();
+    let mut size = (0u64, 0u64);
+    let t_first = epoch_ms() + 300.0;
+    let mut next = 0usize;
+    let end = Instant::now() + Duration::from_secs_f64(secs);
+    let mut times = Vec::new();
+    while Instant::now() < end {
+        if epoch_ms() >= t_first + next as f64 * 500.0 - 60.0 {
+            let tt = t_first + next as f64 * 500.0;
+            let pitch = [48, 55, 60, 64, 67, 72][next % 6];
+            let m = json!({ "type": "midi", "to": format!("tag:{tag}"), "events": [{ "t": tt, "d": [0x90, pitch, 100] }, { "t": tt + 300.0, "d": [0x80, pitch, 0] }] });
+            let _ = ws.send(Message::text(m.to_string()));
+            next += 1;
+        }
+        match read_any(ws) {
+            Got::Text(v) => {
+                if v["type"] == "watching" || v["type"] == "unwatched" {
+                    println!("{v}");
+                    if v["type"] == "unwatched" {
+                        return Err("the companion refused the capture".into());
+                    }
+                }
+            }
+            Got::Frame(h, j) => {
+                frames += 1;
+                times.push(epoch_ms());
+                if let Some(seq) = h["seq"].as_u64() {
+                    let _ = ws.send(Message::text(json!({ "type": "ack", "seq": seq }).to_string()));
+                }
+                if h.get("x").is_none() {
+                    size = (h["w"].as_u64().unwrap_or(0), h["h"].as_u64().unwrap_or(0));
+                    if first {
+                        save("first.jpg", &j);
+                        first = false;
+                    }
+                    last = j;
+                }
+            }
+            Got::Nothing => {}
+        }
+    }
+    if !last.is_empty() {
+        save("last.jpg", &last);
+    }
+    println!("frames in {secs:.0} s while notes played: {frames} (image {}x{})", size.0, size.1);
+    if let Some(m) = menu {
+        if size.0 == 0 {
+            size = (win["w"].as_u64().unwrap_or(0), win["h"].as_u64().unwrap_or(0));
+        }
+        // l'echelle de l'image (2 sur un ecran Retina) : les decalages du menu sont en points
+        let pts = win["w"].as_f64().unwrap_or(size.0 as f64).max(1.0);
+        return menu_steps(ws, id, (size.0.max(1) as f64, size.1.max(1) as f64), size.0 as f64 / pts, m, &out);
+    }
+    if let Some((fx, fy)) = click {
+        // sans image (pas d'autorisation d'enregistrer l'ecran) : la taille de la fenetre dans la liste
+        if size.0 == 0 {
+            size = (win["w"].as_u64().unwrap_or(0), win["h"].as_u64().unwrap_or(0));
+        }
+        let (w, h) = (size.0.max(1) as f64, size.1.max(1) as f64);
+        let (x, y) = (fx * w, fy * h);
+        // l'etat avant le geste (le plugin dit-il un changement apres ? un bouton tourne par le geste)
+        host(ws, json!({ "action": "save", "id": id, "n": 11 }))?;
+        let before = read_until(ws, |v| v["type"] == "host" && (v["action"] == "saved" || v["error"].is_string()), Duration::from_secs(15), &mut audio)?;
+        // (20 nov., Link to controller) le suivi des parametres pendant le geste
+        host(ws, json!({ "action": "param-watch", "id": id, "on": true, "n": 13 }))?;
+        let _ = read_until(ws, |v| v["type"] == "host" && v["action"] == "param-watch", Duration::from_secs(10), &mut audio)?;
+        let t = Instant::now();
+        // un glisser vers le haut (un bouton rotatif), puis le relachement
+        let mut steps = vec![("down", 1, y)];
+        for k in 1..=8 {
+            steps.push(("move", 1, y - 8.0 * k as f64));
+        }
+        steps.push(("up", 0, y - 64.0));
+        for (act, btns, yy) in steps {
+            let m = json!({ "type": "input", "kind": "pointer", "action": act, "x": x, "y": yy, "iw": w, "ih": h, "button": 0, "buttons": btns, "mods": 0 });
+            ws.send(Message::text(m.to_string())).map_err(|e| e.to_string())?;
+            // comme le studio (plugin-ctl.js) : le suivi redemande a l'appui, en meme temps que le geste
+            if act == "down" {
+                host(ws, json!({ "action": "param-watch", "id": id, "on": true, "n": 15 }))?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut after = None;
+        let mut ack = None;
+        let end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < end {
+            match read_any(ws) {
+                Got::Text(v) if v["type"] == "inputack" => {
+                    if ack.is_none() {
+                        ack = Some(v.clone());
+                    }
+                }
+                Got::Frame(h, j) => {
+                    if let Some(seq) = h["seq"].as_u64() {
+                        let _ = ws.send(Message::text(json!({ "type": "ack", "seq": seq }).to_string()));
+                    }
+                    if after.is_none() {
+                        after = Some(t.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    if h.get("x").is_none() {
+                        save("after-click.jpg", &j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        println!("drag at {x:.0},{y:.0}: ack {} ; next image after {:?} ms", ack.map(|v| v.to_string()).unwrap_or("none".into()), after.map(|a| a.round()));
+        host(ws, json!({ "action": "param-changes", "id": id, "n": 14 }))?;
+        let pc = read_until(ws, |v| v["type"] == "host" && v["action"] == "param-changes", Duration::from_secs(5), &mut audio)?;
+        println!("param changes after the drag: {}", pc["items"]);
+        host(ws, json!({ "action": "save", "id": id, "n": 12 }))?;
+        let aft = read_until(ws, |v| v["type"] == "host" && (v["action"] == "saved" || v["error"].is_string()), Duration::from_secs(15), &mut audio)?;
+        println!("state before {} ; after {} → the gesture {} the plugin", before["state"], aft["state"], if before["state"] != aft["state"] { "CHANGED" } else { "did not change" });
+    }
+    Ok(())
 }

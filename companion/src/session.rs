@@ -285,7 +285,7 @@ impl<'a> Conn<'a> {
         let all = plugins::enumerate();
         let mut wins = plugins::plugin_windows(&all);
         // (19 nov., host.rs) les editeurs ouverts des plugins que ce compagnon heberge lui-meme (sans DAW)
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         wins.extend(crate::host::windows());
         // --test-window : la fenetre d'essai du compagnon lui-meme (testwin.rs), proposee comme un plugin
         if let Some(t) = self.sh.test_window {
@@ -1024,7 +1024,7 @@ impl<'a> Conn<'a> {
             },
             ClientMsg::Emitted { id } => self.send_text(crate::plugin_link::emitted_json(&id)),
             // (19 nov.) l'hote VST3 du compagnon (host.rs) : charger un plugin, c'est du code natif — arme seulement
-            ClientMsg::Host { action, plugin, id, state, show, bpm, playing, n, vol, pan, mute, open, frames, rate, job, tail, stream, from, offset, start } => {
+            ClientMsg::Host { action, plugin, id, state, show, bpm, playing, n, vol, pan, mute, open, frames, rate, job, tail, stream, from, offset, start, p, value, on } => {
                 if self.disarmed() {
                     crate::log("REFUSED a plugin host request: remote control is off");
                     return self.send_text(json!({ "type": "host", "action": action, "error": crate::arming::REFUSAL, "code": crate::arming::CODE, "n": n }).to_string());
@@ -1037,17 +1037,17 @@ impl<'a> Conn<'a> {
                 if action == "fx-live" || action == "fx-stop" {
                     return self.on_fx(&action, id, rate, stream, n);
                 }
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 {
                     if self.host_gen == 0 {
                         self.host_gen = crate::host::generation();
                     }
-                    crate::host::request(json!({ "action": action, "plugin": plugin, "id": id, "state": state, "show": show, "bpm": bpm, "playing": playing, "n": n, "vol": vol, "pan": pan, "mute": mute, "open": open, "from": from, "offset": offset, "rate": rate }), self.host_tx.clone());
+                    crate::host::request(json!({ "action": action, "plugin": plugin, "id": id, "state": state, "show": show, "bpm": bpm, "playing": playing, "n": n, "vol": vol, "pan": pan, "mute": mute, "open": open, "from": from, "offset": offset, "rate": rate, "start": start, "p": p, "v": value, "on": on }), self.host_tx.clone());
                     Ok(())
                 }
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "macos")))]
                 {
-                    let _ = (plugin, id, state, show, bpm, playing, vol, pan, mute, open, frames, rate, job, tail, stream, from, offset, start);
+                    let _ = (plugin, id, state, show, bpm, playing, vol, pan, mute, open, frames, rate, job, tail, stream, from, offset, start, p, value, on);
                     self.send_text(json!({ "type": "host", "action": action, "error": "hosting plugins without a DAW is Windows only for now", "n": n }).to_string())
                 }
             }
@@ -1126,13 +1126,13 @@ impl<'a> Conn<'a> {
                 }
                 // (20 nov., relecture de securite) le numero vient d'un compteur commun a tout le compagnon : deux connexions
                 // (deux onglets, une reconnexion pendant un rendu abandonne) n'ecrivent jamais les memes fichiers
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 let j = crate::host::next_job_id();
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "macos")))]
                 let j = { let j = self.next_job; self.next_job = self.next_job.wrapping_add(1).max(1); j };
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 let paths = crate::host::job_paths(j);
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "macos")))]
                 let paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
                 let Some((input, output)) = paths else { return self.send_text(err("no folder for the render")) };
                 // (20 nov., relecture) jobs/ ne grossit pas sans fin : au-dela de JOBS_MAX_BYTES (les rendus en cours et ceux
@@ -1140,7 +1140,7 @@ impl<'a> Conn<'a> {
                 // (20 nov., 2e relecture) la place est reservee ici, pour l'entree et la sortie (stereo f32, la queue comprise),
                 // et rendue quand le rendu se termine : des connexions simultanees ne depassent pas la borne ensemble
                 let need = (frames + (30.0 * rate as f64) as u64) * 8 * 2;
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 {
                     let before = JOBS_RESERVED.fetch_add(need, Ordering::SeqCst);
                     if crate::host::jobs_bytes() + before + need > JOBS_MAX_BYTES {
@@ -1152,7 +1152,7 @@ impl<'a> Conn<'a> {
                 let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&input) {
                     Ok(f) => f,
                     Err(e) => {
-                        #[cfg(windows)]
+                        #[cfg(any(windows, target_os = "macos"))]
                         JOBS_RESERVED.fetch_sub(need, Ordering::SeqCst);
                         return self.send_text(err(&format!("cannot write the render's input ({e})")));
                     }
@@ -1177,10 +1177,10 @@ impl<'a> Conn<'a> {
                 let (tx, rx) = mpsc::channel();
                 let (fx, input, output, frames, rate, bpm, tail, start) = (r.fx, r.input.clone(), r.output.clone(), r.frames, r.rate, r.bpm, r.tail, r.start);
                 std::thread::spawn(move || {
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "macos"))]
                     let res = crate::host::render(fx, &input, &output, frames, rate, bpm, tail, start);
-                    #[cfg(not(windows))]
-                    let res: Result<serde_json::Value, String> = { let _ = (fx, &input, &output, frames, rate, bpm, tail, start); Err("Windows only".into()) };
+                    #[cfg(not(any(windows, target_os = "macos")))]
+                    let res: Result<serde_json::Value, String> = { let _ = (fx, &input, &output, frames, rate, bpm, tail, start); Err("hosting plugins without a DAW needs Windows or macOS".into()) };
                     // (20 nov., relecture) personne n'attend plus ce rendu (la tache abandonnee, la connexion fermee) : sa sortie
                     // est effacee ici, une fois que l'enfant l'a ecrite
                     if tx.send(res).is_err() {
@@ -1223,10 +1223,10 @@ impl<'a> Conn<'a> {
         self.fx.push(FxStream { stream: k, fx, gen, rate, rx, seq: 0, budget: rate as f64 * FX_BURST_SECONDS, at: Instant::now(), got: 0, sent: 0, over: 0, full: 0 });
         let reply = self.host_tx.clone();
         std::thread::spawn(move || {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             let r = crate::host::fx_live(fx, rate, gen, tx);
-            #[cfg(not(windows))]
-            let r: Result<serde_json::Value, String> = { let _ = tx; Err("hosting plugins without a DAW is Windows only for now".into()) };
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let r: Result<serde_json::Value, String> = { let _ = tx; Err("hosting plugins without a DAW needs Windows or macOS".into()) };
             let m = match r {
                 Ok(v) => json!({ "type": "host", "action": "fx-live", "stream": k, "id": fx, "gen": gen, "on": true, "latency": v["latency"], "rate": v["rate"], "n": n }),
                 Err(e) => json!({ "type": "host", "action": "fx-live", "stream": k, "id": fx, "gen": gen, "on": false, "error": e, "n": n }),
@@ -1273,9 +1273,9 @@ impl<'a> Conn<'a> {
         s.budget -= frames as f64;
         s.got += 1;
         let x: Vec<f32> = b[FX_HEADER..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         crate::host::fx_input(s.fx, s.gen, pos, &x);
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = (pos, x);
         true
     }
@@ -1441,9 +1441,9 @@ impl<'a> Conn<'a> {
         for s in self.streams.iter_mut() {
             if s.feed.is_none() && s.retry <= Instant::now() {
                 s.retry = Instant::now() + STREAM_RETRY;
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 let pick = crate::host::return_target(s.hosted);
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "macos")))]
                 let pick: Option<String> = None;
                 let r = match (pick, crate::plugin_link::hub()) {
                     (Some(t), Some(h)) => h.start_feed(&t, s.rate, crate::audio::packet::SampleFormat::F32, s.ms).map(|f| (t, f)),
@@ -1505,7 +1505,7 @@ impl<'a> Conn<'a> {
         while let Ok(m) = self.host_rx.try_recv() {
             self.send_text(m)?;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if self.host_gen != 0 {
             let g = crate::host::generation();
             if g != self.host_gen {
@@ -1899,6 +1899,9 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     // (19 nov., etape 2) les flux par plugin heberge (audio stream 1..N) : un studio qui ne les voit pas
                     // (un compagnon d'avant) n'heberge qu'un plugin
                     "hostStreams": if host_available() { HOST_STREAMS } else { 0 },
+                    // (20 nov., Link to controller) les parametres des plugins heberges : params, param-set, param-watch,
+                    // param-changes (un studio qui ne le voit pas, un compagnon d'avant, ne les demande pas)
+                    "hostParams": host_available(),
                     // (19 nov., etape 3b) les effets heberges en direct : flux first..first+count-1, maxFrames trames par paquet
                     "hostFxLive": if host_available() { json!({ "first": FX_STREAM_FIRST, "count": FX_STREAMS, "maxFrames": FX_MAX_FRAMES }) } else { serde_json::Value::Null },
                     // (9 nov., audit F1) la capture, les gestes et le son : seulement armes dans le compagnon (« armed »
@@ -3005,11 +3008,11 @@ mod tests {
     }
 }
 
-/// (19 nov.) le compagnon heberge-t-il des plugins VST3 sans DAW (host.rs, Windows) ?
+/// (19 nov.) le compagnon heberge-t-il des plugins VST3 sans DAW (host.rs, Windows ; macOS depuis le 20 nov.) ?
 fn host_available() -> bool {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     return crate::host::available();
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     false
 }
 
@@ -3073,7 +3076,7 @@ struct FxStream {
 impl Drop for FxStream {
     fn drop(&mut self) {
         crate::log(&format!("live effect {}: stream {} closed ({} packets in, {} out, {} over the rate, {} dropped: socket full)", self.fx, self.stream, self.got, self.sent, self.over, self.full));
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         crate::host::fx_stop(self.fx, self.gen);
     }
 }
@@ -3083,10 +3086,10 @@ impl Drop for FxStream {
 const JOB_MAX_SECONDS: f64 = 600.0;
 /// (20 nov., relecture) la place que peuvent prendre tous les rendus de jobs/ ensemble (2 Gio) ; au-dela, un nouveau rendu
 /// est refuse
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const JOBS_MAX_BYTES: u64 = 2 << 30;
 /// (20 nov., 2e relecture) la place reservee par les rendus ouverts, toutes connexions comprises
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 static JOBS_RESERVED: AtomicU64 = AtomicU64::new(0);
 pub const JOB_CHUNK_FRAMES: usize = 16384;
 /// Le son envoye par le studio : des morceaux sous la taille maximale d'un message (MAX_TEXT_MESSAGE, 16 Ko : la limite
@@ -3125,16 +3128,19 @@ fn hosted_shortcut(ev: &InputEvent) -> bool {
         InputEvent::Key { key, code, mods, .. } => {
             let f = |s: &str| s.len() >= 2 && s.as_bytes()[0] == b'F' && s[1..].bytes().all(|b| b.is_ascii_digit());
             mods & (2 | 4 | 8) != 0 || f(key) || f(code) || matches!(key.as_str(), "Alt" | "Control" | "Meta" | "ContextMenu" | "Help")
+                || key.chars().any(|c| ('\u{F700}'..='\u{F8FF}').contains(&c))
         }
         InputEvent::Pointer { mods, .. } | InputEvent::Wheel { mods, .. } => mods & (2 | 4 | 8) != 0,
-        InputEvent::Text { .. } => false,
+        // (20 nov., relecture macOS) AppKit range ses touches de fonction (F1…, fleches, Suppr) en U+F700–U+F8FF : un
+        // texte qui en porte serait une touche F deguisee
+        InputEvent::Text { text } => text.chars().any(|c| ('\u{F700}'..='\u{F8FF}').contains(&c)),
     }
 }
 
 impl Drop for RenderJob {
     fn drop(&mut self) {
         self.file = None;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         JOBS_RESERVED.fetch_sub(self.reserved, Ordering::SeqCst);
         let _ = std::fs::remove_file(&self.input);
         // la sortie : le fil de rendu peut l'ecrire encore (une tache abandonnee) ; effacee aussi au demarrage suivant

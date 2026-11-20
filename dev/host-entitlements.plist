@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- uppwind-link-host (macOS) : le seul programme d'Uppwind Link qui charge des plugins VST 3 d'autres editeurs. Sous le
+     « hardened runtime », macOS refuse une bibliotheque signee par une autre equipe sans cette autorisation (tous les
+     DAW l'ont). Rien d'autre : ni allow-jit, ni allow-unsigned-executable-memory, ni allow-dyld-environment-variables.
+     Le compagnon (uppwind-companion) reste signe sans aucune autorisation. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

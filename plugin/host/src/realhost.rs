@@ -11,13 +11,14 @@
 //! - IComponentHandler : un bouton tourne dans l'editeur revient au fil audio (inputParameterChanges) ;
 //! - IBStream en memoire : getState / setState du composant et du controleur ;
 //! - les bus tels que le plugin les declare (des tampons pour chacun, la sortie principale en stereo) ;
-//! - l'editeur : IPlugView dans une fenetre a nous (Windows), IPlugFrame::resizeView, la mise a l'echelle.
+//! - l'editeur : IPlugView dans une fenetre a nous (Windows ; macOS depuis le 20 nov., macui.rs), IPlugFrame::resizeView,
+//!   la mise a l'echelle.
 
 use crate::vsthost::{param_changes, EventList, Module};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::Steinberg::Vst::IAttributeList_::AttrID;
@@ -316,6 +317,10 @@ pub struct Handler {
     pub edits: AtomicU32,
     pub gestures: AtomicU32,
     pub restarts: Mutex<Vec<i32>>,
+    /// (20 nov., Link to controller) le studio suit les parametres : chaque performEdit de l'editeur est aussi note ici
+    /// (le fil du suivi, child.rs, les envoie au compagnon) ; partages par Arc avec ce fil
+    pub watch: Arc<AtomicBool>,
+    pub touched: Arc<Mutex<Vec<(u32, f64)>>>,
 }
 
 impl Class for Handler {
@@ -332,6 +337,13 @@ impl IComponentHandlerTrait for Handler {
         let mut p = self.pending.lock().unwrap();
         if p.len() < 4096 {
             p.push((id, value));
+        }
+        drop(p);
+        if self.watch.load(Ordering::Relaxed) {
+            let mut t = self.touched.lock().unwrap();
+            if t.len() < 1024 {
+                t.push((id, value));
+            }
         }
         kResultOk
     }
@@ -475,6 +487,57 @@ impl Instance {
 
     pub fn param_count(&self) -> i32 {
         self.ctrl.as_ref().map(|c| unsafe { c.getParameterCount() }).unwrap_or(0)
+    }
+
+    /// (20 nov., Link to controller) les parametres que le studio peut lier, a partir de l'indice `start`, `max` au plus :
+    /// (indice, id, titre, valeur normalisee) — ni caches, ni en lecture seule, ni le changement de programme ; l'indice
+    /// est celui du controleur (0..4095, le « p » du protocole). → (la page, l'indice suivant s'il en reste)
+    pub fn param_page(&self, start: usize, max: usize) -> (Vec<(u32, u32, String, f64)>, Option<usize>) {
+        let Some(c) = &self.ctrl else { return (Vec::new(), None) };
+        let n = (unsafe { c.getParameterCount() }).clamp(0, 4096) as usize;
+        let mut v = Vec::new();
+        let mut i = start;
+        while i < n {
+            if v.len() >= max {
+                return (v, Some(i));
+            }
+            let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+            if unsafe { c.getParameterInfo(i as i32, &mut info) } == kResultOk {
+                let hidden = info.flags & (ParameterInfo_::ParameterFlags_::kIsHidden | ParameterInfo_::ParameterFlags_::kIsReadOnly | ParameterInfo_::ParameterFlags_::kIsProgramChange) != 0;
+                if !hidden {
+                    let t: Vec<u16> = info.title.iter().take_while(|c| **c != 0).map(|c| *c as u16).collect();
+                    let name: String = String::from_utf16_lossy(&t).chars().filter(|c| !c.is_control()).take(64).collect();
+                    let val = unsafe { c.getParamNormalized(info.id) };
+                    v.push((i as u32, info.id, if name.is_empty() { format!("Parameter {}", i + 1) } else { name }, if val.is_finite() { val.clamp(0.0, 1.0) } else { 0.0 }));
+                }
+            }
+            i += 1;
+        }
+        (v, None)
+    }
+
+    /// L'id du parametre d'indice `p` (None : hors de la liste, cache, en lecture seule).
+    pub fn param_id(&self, p: u32) -> Option<u32> {
+        let c = self.ctrl.as_ref()?;
+        if p as i32 >= unsafe { c.getParameterCount() } {
+            return None;
+        }
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        (unsafe { c.getParameterInfo(p as i32, &mut info) } == kResultOk
+            && info.flags & (ParameterInfo_::ParameterFlags_::kIsHidden | ParameterInfo_::ParameterFlags_::kIsReadOnly | ParameterInfo_::ParameterFlags_::kIsProgramChange) == 0)
+            .then_some(info.id)
+    }
+
+    /// Poser un parametre comme un DAW : au controleur (l'editeur suit), et au processeur au prochain bloc (le son suit).
+    pub fn set_param(&self, id: u32, v: f64) {
+        let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { return };
+        if let Some(c) = &self.ctrl {
+            unsafe { c.setParamNormalized(id, v) };
+        }
+        let mut p = self.handler.pending.lock().unwrap();
+        if p.len() < 4096 {
+            p.push((id, v));
+        }
     }
 
     /// La valeur (normalisee) de chaque parametre, lue au controleur : pour verifier qu'un etat recharge remet le son.
@@ -795,6 +858,8 @@ impl IPlugFrameTrait for Frame {
         let r = *new_size;
         #[cfg(windows)]
         size_window(self.hwnd.load(Ordering::Relaxed), r.right - r.left, r.bottom - r.top);
+        #[cfg(target_os = "macos")]
+        crate::macui::size_window(self.hwnd.load(Ordering::Relaxed), r.right - r.left, r.bottom - r.top);
         if let Some(v) = ComRef::from_raw(view) {
             let mut r2 = r;
             v.onSize(&mut r2);

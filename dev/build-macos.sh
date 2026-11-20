@@ -116,8 +116,15 @@ done
 lipo -create -output "$OUT/uppwind-companion" \
   "$HERE/companion/target/aarch64-apple-darwin/release/uppwind-companion" \
   "$HERE/companion/target/x86_64-apple-darwin/release/uppwind-companion"
+# (20 Nov 2026) uppwind-link-host, the program that loads hosted VST 3 plugins (companion/src/bin): built with the
+# companion, put next to it; the release signs it with dev/host-entitlements.plist (macos-build.yml)
+lipo -create -output "$OUT/uppwind-link-host" \
+  "$HERE/companion/target/aarch64-apple-darwin/release/uppwind-link-host" \
+  "$HERE/companion/target/x86_64-apple-darwin/release/uppwind-link-host"
 if [ "${UWL_NO_ADHOC:-0}" != "1" ]; then
   codesign --force --sign - "$OUT/uppwind-companion"
+  codesign --force --sign - "$OUT/uppwind-link-host"
 fi
 lipo -info "$OUT/uppwind-companion"
+lipo -info "$OUT/uppwind-link-host"
 echo "macOS build in $OUT"
