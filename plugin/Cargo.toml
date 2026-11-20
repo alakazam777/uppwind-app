@@ -6,13 +6,14 @@
 #
 #   proto/     le protocole plugin <-> compagnon (sans dependance ; le compagnon s'en sert aussi)
 #   plugins/   « Uppwind Link Return » et « Uppwind Link Notes » (nice-plug), une seule DLL
+#   host/      (19 nov.) uwl-vst3host : heberger un plugin VST3 du commerce (le compagnon, --plug-host ; uwl-host)
 #   testhost/  un petit hote VST3 d'essai (charge le .vst3, joue des blocs en temps reel, mesure) et le bundler
 #
 # Construire (depuis la racine du depot, pour .cargo/config.toml) : cargo build --release --locked --manifest-path
 # plugin/Cargo.toml ; une version publiee : RELEASING.md (le remappage des chemins, comme le compagnon).
 [workspace]
 resolver = "2"
-members = ["proto", "plugins", "testhost"]
+members = ["proto", "plugins", "testhost", "host"]
 # (10 nov.) la copie corrigee de clap-wrapper (ci-dessous) n'est pas un membre : construite seulement par l'option auv2
 exclude = ["vendor"]
 

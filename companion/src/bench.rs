@@ -162,14 +162,25 @@ mod win {
     }
 
     pub fn run(name: &str, clicks: &[(f64, f64)], out: Option<&str>, seconds: f64) -> i32 {
-        let wins = plugins::plugin_windows(&plugins::enumerate());
-        let needle = name.to_lowercase();
-        let Some(w) = wins.iter().find(|w| w.title.to_lowercase().contains(&needle)) else {
-            println!("No Live plugin window whose title contains \"{name}\"");
-            return 2;
+        // (19 nov., essai de l'hote VST3) « hwnd:<n> » : une fenetre nommee par son handle (celle de `uwl-host edit`,
+        // qui n'est pas une fenetre de Live) ; la console seulement, le studio ne passe jamais par ici
+        let hwnd = if let Some(n) = name.strip_prefix("hwnd:") {
+            let Ok(h) = n.trim().parse::<u64>() else {
+                println!("hwnd:<number>");
+                return 2;
+            };
+            println!("bench hwnd {h}");
+            h
+        } else {
+            let wins = plugins::plugin_windows(&plugins::enumerate());
+            let needle = name.to_lowercase();
+            let Some(w) = wins.iter().find(|w| w.title.to_lowercase().contains(&needle)) else {
+                println!("No Live plugin window whose title contains \"{name}\"");
+                return 2;
+            };
+            println!("bench \"{}\" ({}×{})", w.title, w.w, w.h);
+            w.id
         };
-        let hwnd = w.id;
-        println!("bench \"{}\" ({}×{})", w.title, w.w, w.h);
         let mut print = match capture::open(hwnd, Some("print")) {
             Ok(c) => c,
             Err(e) => {
@@ -279,6 +290,31 @@ mod win {
                 "same_pixels": eq,
             })
         );
+
+        // (19 nov., essai de l'hote VST3) des images noires ? (une fenetre hors de l'ecran ou masquee peut ne plus etre
+        // dessinee) ; et Windows.Graphics.Capture : accepte-t-il la fenetre, livre-t-il des images (seulement quand elle change)
+        let lit = |f: &Frame| -> f64 {
+            let n = (f.w * f.h) as usize;
+            let on = f.bgra.chunks_exact(4).filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16).count();
+            if n == 0 { 0.0 } else { (on as f64 / n as f64 * 1000.0).round() / 1000.0 }
+        };
+        let dx_lit = dx.as_mut().ok().and_then(|d| d.grab().ok().flatten()).map(|f| lit(&f));
+        let wgc = match capture::open(hwnd, Some("wgc")) {
+            Ok(mut c) => {
+                let t0 = Instant::now();
+                let (mut frames, mut last) = (0u32, None);
+                while t0.elapsed() < Duration::from_secs(3) {
+                    if let Ok(Some(f)) = c.grab() {
+                        frames += 1;
+                        last = Some(lit(&f));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                json!({ "ok": true, "frames3s": frames, "lit": last })
+            }
+            Err(e) => json!({ "ok": false, "error": e }),
+        };
+        println!("{}", json!({ "lit": { "print": lit(&base), "dwm": dx_lit }, "wgc": wgc }));
 
         // ── 2. la cadence du plugin (surface DWM, toutes les 2 ms) ──────────────────────────────────────────
         if let Ok(d) = dx.as_mut() {

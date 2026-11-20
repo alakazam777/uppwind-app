@@ -19,6 +19,8 @@ path = "src/bundle.rs"
 [dependencies]
 vst3 = "0.3"
 uwl-proto = { path = "../proto" }
+# (19 nov.) le code d'hote partage avec le compagnon (vsthost, realhost)
+uwl-vst3host = { path = "../host" }
 serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # (29 oct.) le nonce du studio d'essai (l'appairage v2)
@@ -26,4 +28,5 @@ getrandom = "0.4"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
-features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading"]
+# (19 nov.) l'essai de l'hote VST3 (realhost.rs) : la fenetre de l'editeur, DPI, DWM (cloak), OLE, la memoire du processus
+features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_HiDpi", "Win32_System_Ole", "Win32_System_Com", "Win32_System_ProcessStatus"]

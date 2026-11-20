@@ -1,0 +1,22 @@
+Uppwind Link companion -- additional permission under GNU GPL version 3 section 7 (the plug-ins it hosts)
+
+This permission applies to the Uppwind Link companion: the folder companion/ and the program uppwind-companion built
+from it, and to the plug-in hosting code it is built with (the folder plugin/host), which are under the GNU General
+Public License version 3 or later (LICENSE).
+
+Since 19 November 2026 the companion can host VST 3 plug-ins itself, without a digital audio workstation: it loads a
+plug-in's module into a separate process that it starts itself (uppwind-companion --plug-host), calls it through the
+VST 3 plug-in interfaces, plays it and shows its window. Most of these plug-ins are not free software.
+
+As an additional permission under GNU GPL version 3 section 7, you may combine the companion with any plug-in that it
+loads through the VST 3 plug-in interfaces, whatever that plug-in's licence, and convey the companion for that use.
+This combination does not bring the plug-in under the GNU GPL, and the Corresponding Source of the companion need not
+include the plug-in's code. You must follow the GNU GPL in all respects for the companion itself, and for the code of
+plugin/host.
+
+You may extend this additional permission to your version of the companion, but you are not obliged to do so. If you
+do not wish to, delete this permission from your version; the GNU General Public License version 3 or later then
+applies to it alone.
+
+VST is a registered trademark of Steinberg Media Technologies GmbH. This project is not affiliated with or endorsed
+by Steinberg.

@@ -30,6 +30,33 @@ The scripts for Ableton Live and FL Studio (ableton/UppwindLink/, fl-studio/, sh
 licence (LICENSE-MIT), also the copies that the companion embeds and installs (--setup). They, the dev tool
 and the tests use only the Python standard library.
 
+Since 19 Nov 2026 the companion can host VST 3 plugins itself (Windows): it uses the vst3 crate (bindings
+generated from Steinberg's VST 3 SDK headers, MIT OR Apache-2.0, used under the MIT option). VST is a registered
+trademark of Steinberg Media Technologies GmbH. The plug-ins it hosts keep their own licences: see the
+additional permission under GNU GPL version 3 section 7 in LICENSE-EXCEPTION-HOST.txt.
+
+The VST 3 interfaces that the vst3 crate's bindings are generated from (the pluginterfaces headers of Steinberg's
+VST 3 SDK) are under the MIT licence, as published with the SDK (pluginterfaces/LICENSE.txt, VST 3 SDK 3.8):
+
+    MIT License
+
+    Copyright (c) 2026, Steinberg Media Technologies GmbH
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+    documentation files (the "Software"), to deal in the Software without restriction, including without
+    limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the
+    Software, and to permit persons to whom the Software is furnished to do so, subject to the following
+    conditions:
+
+    The above copyright notice and this permission notice shall be included in all copies or substantial portions
+    of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+    TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+    CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
 Crates linked into uppwind-companion.exe (Windows, x86_64-pc-windows-msvc)
 --------------------------------------------------------------------------
   bitflags             2.13.2    MIT OR Apache-2.0
@@ -50,6 +77,9 @@ Crates linked into uppwind-companion.exe (Windows, x86_64-pc-windows-msvc)
   cmov                 0.5.4     Apache-2.0 OR MIT
       Copyright (c) 2022-2026 The RustCrypto Project Developers
       https://github.com/RustCrypto/utils
+  com-scrape-types     0.1.1     MIT OR Apache-2.0
+      authors: Micah Johnston
+      https://github.com/coupler-rs/vst3-rs
   const-oid            0.10.2    Apache-2.0 OR MIT
       Copyright (c) 2020-2026 The RustCrypto Project Developers
       https://github.com/RustCrypto/formats
@@ -244,6 +274,9 @@ Crates linked into uppwind-companion.exe (Windows, x86_64-pc-windows-msvc)
   utf8_iter            1.0.4     Apache-2.0 OR MIT
       Copyright Mozilla Foundation
       https://github.com/hsivonen/utf8_iter
+  vst3                 0.3.0     MIT OR Apache-2.0
+      authors: Micah Johnston
+      https://github.com/coupler-rs/vst3-rs
   webview2-com         0.39.1    MIT
       https://github.com/wravery/webview2-rs
   webview2-com-sys     0.39.1    MIT
@@ -551,6 +584,21 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+--- MIT (standard text: the crate ships none) licence, as shipped by: com-scrape-types 0.1.1, webview2-com 0.39.1, webview2-com-sys 0.39.1, block2 0.6.2, dispatch2 0.3.1, objc2 0.6.5, objc2-app-kit 0.3.2, objc2-core-foundation 0.3.2, objc2-core-graphics 0.3.2, objc2-encode 4.1.0, objc2-exception-helper 0.1.1, objc2-foundation 0.3.2, objc2-web-kit 0.3.2
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 --- MIT licence, as shipped by: const-oid 0.10.2, cpufeatures 0.3.1
 
@@ -1545,7 +1593,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
---- MIT licence, as shipped by: itoa 1.0.18, once_cell 1.21.4, serde 1.0.229, serde_core 1.0.229, serde_json 1.0.154, thiserror 2.0.21, zmij 1.0.23, adler2 2.0.1
+--- MIT licence, as shipped by: itoa 1.0.18, once_cell 1.21.4, serde 1.0.229, serde_core 1.0.229, serde_json 1.0.154, thiserror 2.0.21, vst3 0.3.0, zmij 1.0.23, adler2 2.0.1
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -2537,21 +2585,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
-
---- MIT (standard text: the crate ships none) licence, as shipped by: webview2-com 0.39.1, webview2-com-sys 0.39.1, block2 0.6.2, dispatch2 0.3.1, objc2 0.6.5, objc2-app-kit 0.3.2, objc2-core-foundation 0.3.2, objc2-core-graphics 0.3.2, objc2-encode 4.1.0, objc2-exception-helper 0.1.1, objc2-foundation 0.3.2, objc2-web-kit 0.3.2
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of
-the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
-WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 --- MIT licence, as shipped by: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.61.2, windows-threading 0.2.1, windows-version 0.1.7
 

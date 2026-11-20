@@ -219,6 +219,26 @@ WEBVIEW2_LOADER = [
     "allows this link: see the additional permission under GNU GPL version 3 section 7 in LICENSE-EXCEPTION.txt.",
 ]
 
+# (19 Nov 2026) the MIT licence of the VST 3 SDK's interfaces: in both notices (the plugins, and the companion that
+# hosts VST 3 plugins itself)
+STEINBERG_MIT = [
+    "The VST 3 interfaces that the vst3 crate's bindings are generated from (the pluginterfaces headers of Steinberg's",
+    "VST 3 SDK) are under the MIT licence, as published with the SDK (pluginterfaces/LICENSE.txt, VST 3 SDK 3.8):", "",
+    "    MIT License", "",
+    "    Copyright (c) 2026, Steinberg Media Technologies GmbH", "",
+    "    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated",
+    "    documentation files (the \"Software\"), to deal in the Software without restriction, including without",
+    "    limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the",
+    "    Software, and to permit persons to whom the Software is furnished to do so, subject to the following",
+    "    conditions:", "",
+    "    The above copyright notice and this permission notice shall be included in all copies or substantial portions",
+    "    of the Software.", "",
+    "    THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED",
+    "    TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL",
+    "    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF",
+    "    CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER",
+    "    DEALINGS IN THE SOFTWARE.", ""]
+
 COMPANION_HEAD = [
     "Uppwind Link companion -- third-party notices", "=" * 46, "",
     "The Uppwind Link companion (uppwind-companion.exe on Windows, uppwind-companion on macOS) is free software under",
@@ -236,7 +256,12 @@ COMPANION_HEAD = [
     "The MPL-2.0 allows its combination with the GPL (its section 3.3).", ""] + WEBVIEW2_LOADER + ["",
     "The scripts for Ableton Live and FL Studio (ableton/UppwindLink/, fl-studio/, shared/) are under the MIT",
     "licence (LICENSE-MIT), also the copies that the companion embeds and installs (--setup). They, the dev tool",
-    "and the tests use only the Python standard library.", ""]
+    "and the tests use only the Python standard library.", "",
+    # (19 Nov 2026) the companion hosts VST3 plugins itself (host.rs, plugin/host): the vst3 crate is linked into it
+    "Since 19 Nov 2026 the companion can host VST 3 plugins itself (Windows): it uses the vst3 crate (bindings",
+    "generated from Steinberg's VST 3 SDK headers, MIT OR Apache-2.0, used under the MIT option). VST is a registered",
+    "trademark of Steinberg Media Technologies GmbH. The plug-ins it hosts keep their own licences: see the",
+    "additional permission under GNU GPL version 3 section 7 in LICENSE-EXCEPTION-HOST.txt.", ""] + STEINBERG_MIT
 
 PLUGIN_HEAD = [
     "Uppwind Link plugins -- third-party notices", "=" * 43, "",
@@ -258,23 +283,10 @@ PLUGIN_HEAD = [
     "the crates: free-audio's clap-wrapper and the CLAP headers (MIT), Apple's AudioUnitSDK (Apache-2.0, unmodified),",
     "ghc::filesystem and {fmt} (MIT). Audio Unit is a plug-in interface of Apple Inc.", "",
     "The test host and the bundler (testhost/: uwl-host, uwl-bundle) are development tools: they are not part of the",
-    "bundle.", "",
-    "The VST 3 interfaces that the vst3 crate's bindings are generated from (the pluginterfaces headers of Steinberg's",
-    "VST 3 SDK) are under the MIT licence, as published with the SDK (pluginterfaces/LICENSE.txt, VST 3 SDK 3.8):", "",
-    "    MIT License", "",
-    "    Copyright (c) 2026, Steinberg Media Technologies GmbH", "",
-    "    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated",
-    "    documentation files (the \"Software\"), to deal in the Software without restriction, including without",
-    "    limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the",
-    "    Software, and to permit persons to whom the Software is furnished to do so, subject to the following",
-    "    conditions:", "",
-    "    The above copyright notice and this permission notice shall be included in all copies or substantial portions",
-    "    of the Software.", "",
-    "    THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED",
-    "    TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL",
-    "    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF",
-    "    CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER",
-    "    DEALINGS IN THE SOFTWARE.", ""]
+    "bundle.", ""] + STEINBERG_MIT
+
+
+
 
 
 # (10 Nov 2026) The C++ code that the clap-wrapper crate compiles into the macOS Audio Units (its build.rs, auv2 feature):

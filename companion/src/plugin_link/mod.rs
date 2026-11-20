@@ -498,9 +498,12 @@ impl Hub {
             "live" | "fl" | "logic" => Some(target),
             _ => return None,
         };
+        let me = own_exe_name();
         self.list()
             .into_iter()
             .filter(|i| i.kind == p::Kind::Return)
+            // (19 nov.) jamais le Return d'un plugin que CE compagnon heberge (host.rs) : il a son propre flux
+            .filter(|i| !is_own_child(&i.host, &me))
             .filter(|i| want.is_none() || crate::audio::procs::daw_of_exe(&i.host) == want)
             .last()
             .map(|i| format!("plugin:{}", i.hex()))
@@ -610,6 +613,30 @@ impl Hub {
         let inst = self.get(id).ok_or("this plugin is not connected")?;
         let mut e = inst.emitted.lock().unwrap();
         Ok(e.drain(..).collect())
+    }
+}
+
+/// (19 nov.) Le nom de l'exe de ce compagnon (« uppwind-companion.exe »), en minuscules.
+fn own_exe_name() -> String {
+    std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase())).unwrap_or_default()
+}
+
+/// (19 nov.) Un plugin dont l'hote est ce compagnon lui-meme (un plugin heberge, host.rs) : `host` tel que le plugin le
+/// dit (un chemin ou un nom d'exe), `me` le nom de l'exe du compagnon.
+pub fn is_own_child(host: &str, me: &str) -> bool {
+    !me.is_empty() && host.to_lowercase().rsplit(['\\', '/']).next() == Some(me)
+}
+
+#[cfg(test)]
+mod own_child_tests {
+    #[test]
+    fn a_hosted_plugin_is_never_the_daws_sound() {
+        let me = "uppwind-companion.exe";
+        assert!(super::is_own_child(r"C:\Users\x\AppData\Local\Uppwind Link\Uppwind-Companion.exe", me));
+        assert!(super::is_own_child("uppwind-companion.exe", me));
+        assert!(!super::is_own_child(r"C:\Program Files\Ableton\Live 12 Suite\Program\Ableton Live 12 Suite.exe", me));
+        assert!(!super::is_own_child("FL64.exe", me));
+        assert!(!super::is_own_child("uppwind-companion.exe", ""));
     }
 }
 

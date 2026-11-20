@@ -129,6 +129,11 @@ pub struct ParamChanges {
     queues: Vec<ComWrapper<ParamQueue>>,
 }
 
+/// (19 nov., essai de l'hote VST3) Les changements d'un bloc, pour un autre hote que `Block` (realhost.rs).
+pub fn param_changes(list: &[(u32, f64)]) -> ComWrapper<ParamChanges> {
+    ComWrapper::new(ParamChanges { queues: list.iter().map(|&(id, value)| ComWrapper::new(ParamQueue { id, value })).collect() })
+}
+
 impl Class for ParamChanges {
     type Interfaces = (IParameterChanges,);
 }
@@ -212,13 +217,14 @@ impl Module {
     #[cfg(windows)]
     pub fn load(bundle: &Path) -> Result<Module, String> {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
         let dll = dll_of_bundle(bundle);
         if !dll.is_file() {
             return Err(format!("no plugin module at {}", dll.display()));
         }
         let wide: Vec<u16> = dll.as_os_str().encode_wide().chain(Some(0)).collect();
-        let lib = unsafe { LoadLibraryW(wide.as_ptr()) };
+        // (19 nov.) comme un DAW : les DLL dont le module depend sont cherchees d'abord dans SON dossier
+        let lib = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
         if lib.is_null() {
             return Err(format!("LoadLibrary failed for {}", dll.display()));
         }
@@ -237,7 +243,7 @@ impl Module {
         }
     }
 
-    fn factory(&self) -> &ComPtr<IPluginFactory> {
+    pub fn factory(&self) -> &ComPtr<IPluginFactory> {
         self.factory.as_ref().unwrap()
     }
 

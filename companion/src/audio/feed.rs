@@ -56,6 +56,11 @@ pub fn follows_returns(target: &str) -> bool {
     matches!(target, "auto" | "live" | "fl")
 }
 
+/// (19 nov., host.rs) La cible « host » du flux principal : du silence seulement. Chaque plugin heberge a son propre flux
+/// (audio stream 1..N, session.rs) : il n'est jamais joue deux fois. Le flux principal garde le bus External du studio
+/// vivant (Calibrate, le son d'essai et le gel y ecoutent).
+pub const HOST_WAITING: &str = "no hosted plugin yet";
+
 impl Drop for Feed {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -79,7 +84,7 @@ impl Feed {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<Value, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let st = stop.clone();
-        let label = if o.demo { "demo sine".to_string() } else { format!("{} (pid {})", o.exe, o.pid) };
+        let label = if o.exe == HOST_WAITING { HOST_WAITING.to_string() } else if o.demo { "demo sine".to_string() } else { format!("{} (pid {})", o.exe, o.pid) };
         std::thread::spawn(move || {
             if o.demo {
                 demo_loop(o, tx, ready_tx, st);
@@ -136,12 +141,14 @@ fn demo_loop(o: Opts, tx: mpsc::Sender<Out>, ready: mpsc::Sender<Result<Value, S
     let t0 = Instant::now();
     let e0 = super::epoch_ms();
     let mut pos = 0u64;
-    let a = packet::amp(-20.0) as f32;
+    // (19 nov.) la cible « host » en attente : du silence, marque comme tel
+    let silent = o.exe == HOST_WAITING;
+    let a = if silent { 0.0 } else { packet::amp(-20.0) as f32 };
     let mut out = Vec::new();
     while !stop.load(Ordering::SeqCst) {
         let s = packet::sine(frames, 2, o.rate, 440.0, a, pos);
         let t = e0 + pos as f64 * 1000.0 / o.rate as f64;
-        pk.push(&packet::Chunk { samples: &s, frames, pos, t_ms: t, silent: false, discontinuity: false }, &mut out);
+        pk.push(&packet::Chunk { samples: &s, frames, pos, t_ms: t, silent, discontinuity: false }, &mut out);
         pos += frames as u64;
         for p in out.drain(..) {
             if tx.send(Out::Packet(p)).is_err() {
@@ -299,6 +306,7 @@ pub fn open(hub: Option<&crate::plugin_link::Hub>, w: &Want) -> Result<Feed, Str
                 }
             }
         }
+        None if w.target == "host" => Feed::start(Opts { pid: 0, exe: HOST_WAITING.into(), tree: true, rate: w.rate, fmt: w.fmt, packet_ms: w.packet_ms, demo: true })?,
         None => start_capture(w)?,
     };
     crate::log(&format!("audio return: {} at {} Hz {} in {:.1} ms packets", f.label, w.rate, w.fmt.name(), w.packet_ms));

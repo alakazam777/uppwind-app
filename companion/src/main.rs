@@ -36,6 +36,9 @@ mod audio;
 mod bench;
 mod capture;
 mod discord;
+// (19 nov.) heberger les plugins VST3 sans DAW (les processus enfants : uwl_vst3host::child)
+#[cfg(windows)]
+mod host;
 mod encode;
 mod input;
 mod install;
@@ -87,6 +90,8 @@ const SCRIPTS_LICENSE_TEXT: &str = include_str!("../../LICENSE-MIT");
 const NOTICES_TEXT: &str = include_str!("../../THIRD-PARTY-NOTICES.txt");
 /// (29 oct.) la permission des plugins (n'importe quel hote VST 3 ou CLAP peut les charger), quand l'exe les embarque
 const PLUGINS_EXCEPTION_TEXT: &str = include_str!("../../LICENSE-EXCEPTION-PLUGINS.txt");
+/// (19 nov.) la permission de l'hote VST3 (host.rs, plugin/host) : le compagnon peut charger tout plugin VST 3
+const HOST_EXCEPTION_TEXT: &str = include_str!("../../LICENSE-EXCEPTION-HOST.txt");
 
 pub const DEFAULT_PORT: u16 = 47410;
 pub const PORT_TRIES: u16 = 10;
@@ -355,7 +360,7 @@ fn parse_args() -> Result<Args, String> {
                 // (29 oct.) ecrit sans println! : une sortie fermee en route (`--license | head`) n'est pas une panique
                 use std::io::Write as _;
                 let mut t = format!(
-                    "Uppwind Link companion {}\n{NOTICE}\nSource code: {}\n\n{LICENSE_TEXT}\n\n{EXCEPTION_TEXT}\n\n{SCRIPTS_LICENSE_TEXT}\n\n{NOTICES_TEXT}\n",
+                    "Uppwind Link companion {}\n{NOTICE}\nSource code: {}\n\n{LICENSE_TEXT}\n\n{EXCEPTION_TEXT}\n\n{HOST_EXCEPTION_TEXT}\n\n{SCRIPTS_LICENSE_TEXT}\n\n{NOTICES_TEXT}\n",
                     env!("CARGO_PKG_VERSION"),
                     env!("CARGO_PKG_REPOSITORY")
                 );
@@ -757,6 +762,23 @@ fn dlls_from_system32_only() {
 }
 
 fn main() {
+    // (19 nov.) un plugin heberge (host.rs) : AVANT dlls_from_system32_only — un plugin charge ses propres DLL depuis son
+    // dossier ; ce processus ne fait rien d'autre (ni journal, ni fichier d'etat, ni serveur)
+    #[cfg(windows)]
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        match raw.first().map(|s| s.as_str()) {
+            Some("--plug-scan") if raw.len() == 2 => std::process::exit(uwl_vst3host::child::scan_main(std::path::Path::new(&raw[1]))),
+            Some("--plug-host") => std::process::exit(match uwl_vst3host::child::HostArgs::parse(&raw[1..]) {
+                Ok(a) => uwl_vst3host::child::host_main(a),
+                Err(e) => {
+                    println!("{}", json!({ "event": "error", "error": e, "fatal": true }));
+                    2
+                }
+            }),
+            _ => {}
+        }
+    }
     #[cfg(windows)]
     dlls_from_system32_only();
     START.get_or_init(Instant::now);
@@ -953,6 +975,11 @@ fn main() {
             }
         }
     };
+    // (19 nov.) l'hote VST3 (host.rs) : seulement avec l'ecoute des plugins (ses plugins heberges s'y connectent)
+    #[cfg(windows)]
+    if plugin_port.is_some() {
+        host::configure(state.clone());
+    }
     let mut st = json!({
         "port": port, "token": token, "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"),
         "protocol": protocol::PROTOCOL_VERSION, "origins": allow.origins(),
@@ -1107,6 +1134,12 @@ fn main() {
     // (9 nov., audit F1/F2) dans une console : « arm », « disarm », « newcode » (sans console, la fenetre d'etat et l'icone)
     if !to_log {
         console_commands(shared.clone());
+    }
+    // (20 nov., relecture de securite) desarme, les editeurs des plugins heberges se ferment (host.rs)
+    #[cfg(windows)]
+    {
+        let sh = shared.clone();
+        host::watch_arming(Box::new(move || sh.arming.armed()));
     }
     // (24 oct.) avec l'icone : l'icone et la fenetre d'etat sur un fil a elles (STA pour WebView2 ; ce fil-ci garde son
     // MTA) ; quand l'icone quitte, tout s'arrete. Le code n'y est que montre (la fenetre, le bouton Copy), jamais ecrit.

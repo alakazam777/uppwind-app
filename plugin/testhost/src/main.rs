@@ -20,6 +20,9 @@
 //!   uwl-host play --state-file F [--to ID] [--pattern scale|pulse] [--bpm 120] [--lead-ms 20] [--channel 1]
 //!       l'essai dans un vrai DAW : une gamme (ou des doubles croches) vers un plugin Notes, par le compagnon dont
 //!       on nomme le fichier d'etat ; dit si le plugin les a placees a l'heure
+//!   uwl-host edit --bundle B [--class NOM] … ; uwl-host e2e --state-file F …
+//!       (19 nov.) l'essai « le compagnon comme hote VST3 » : un vrai plugin (Diva, Serum 2, Kontakt), son editeur dans
+//!       une fenetre a nous, joue sans carte son ; et la latence note → son par le compagnon d'essai (edit.rs)
 //!   uwl-host listen --state-file F [--seconds 10] [--target auto|plugin|plugin:<id>]
 //!       (9 nov.) le studio pour le son seulement : demande le son du DAW (un Return) et mesure ce qui arrive, seconde par
 //!       seconde (paquets, niveau, silences, trous, age) ; le compagnon doit etre arme
@@ -28,7 +31,16 @@
 //! UWL_STATE_FILE=F (le compagnon d'essai) et le passent au plugin charge ; scan lui donne un fichier qui n'existe pas.
 //! Jamais le fichier par defaut (%USERPROFILE%\.uppwind-companion.json) sans qu'on le nomme.
 
-mod vsthost;
+// (19 nov.) le resume d'edit (edit.rs) est un gros json! : le macro a besoin de plus de profondeur
+#![recursion_limit = "256"]
+
+// (19 nov.) vsthost et realhost vivent dans la crate uwl-vst3host (partagee avec le compagnon)
+use uwl_vst3host::{realhost, vsthost};
+// l'essai « le compagnon comme hote VST3 » : edit, e2e
+#[cfg(windows)]
+mod edit;
+// (19 nov., etape 1) le studio de l'essai pour l'hote VST3 du compagnon
+mod hoststudio;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -794,13 +806,15 @@ fn main() {
     // le plugin charge dans ce processus lit UWL_STATE_FILE : qu'il lise le meme fichier que l'hote, ou un fichier
     // qui n'existe pas (scan, ou aucune commande), jamais le fichier par defaut
     match a.first().map(|s| s.as_str()) {
-        Some("return") | Some("notes") | Some("play") | Some("listen") => match explicit_state_file(&a) {
+        Some("return") | Some("notes") | Some("play") | Some("listen") | Some("e2e") | Some("hoststudio") => match explicit_state_file(&a) {
             Ok(p) => std::env::set_var("UWL_STATE_FILE", p),
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
             }
         },
+        // (19 nov.) edit : la chaine du compagnon d'essai seulement si on le nomme (--state-file)
+        Some("edit") if arg(&a, "--state-file").is_some() => std::env::set_var("UWL_STATE_FILE", arg(&a, "--state-file").unwrap()),
         _ => std::env::set_var("UWL_STATE_FILE", std::env::temp_dir().join("uwl-host-no-companion.json")),
     }
     let r = match a.first().map(|s| s.as_str()) {
@@ -809,6 +823,11 @@ fn main() {
         Some("notes") => run_notes(&a),
         Some("play") => run_play(&a),
         Some("listen") => run_listen(&a),
+        Some("hoststudio") => hoststudio::run(&a),
+        #[cfg(windows)]
+        Some("edit") => edit::run_edit(&a),
+        #[cfg(windows)]
+        Some("e2e") => edit::run_e2e(&a),
         _ => {
             println!("uwl-host scan|return|notes --bundle \"Uppwind Link.vst3\" … (see the source header)");
             Ok(())

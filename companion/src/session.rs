@@ -126,6 +126,8 @@ pub fn handshake(stream: TcpStream, sh: &Shared) -> Option<(WebSocket<TcpStream>
 /// La fenetre suivie : son fil de capture et la cadence.
 struct Watch {
     id: u64,
+    /// (20 nov.) une fenetre d'un plugin heberge par le compagnon (pas celle d'un DAW)
+    hosted: bool,
     title: String,
     /// Le processus de la fenetre a l'instant ou elle a ete verifiee (un handle reutilise par une autre fenetre
     /// changerait de processus : les gestes s'arretent). 0 : la fenetre de demonstration.
@@ -187,6 +189,24 @@ struct Conn<'a> {
     audio: Option<crate::audio::feed::Feed>,
     /// (25 oct., sans loopMIDI) le lien du studio avec le Remote Script de Live par son canal local (link_relay.rs)
     link: Option<crate::link_relay::Relay>,
+    /// (19 nov., host.rs) les reponses de l'hote VST3 (un fil par demande) et la generation de sa liste deja dite (0 : ce
+    /// studio ne s'en sert pas, rien n'est pousse)
+    #[cfg_attr(not(windows), allow(dead_code))]
+    host_tx: std::sync::mpsc::Sender<String>,
+    host_rx: std::sync::mpsc::Receiver<String>,
+    host_gen: u64,
+    /// (19 nov., etape 2) les flux des plugins heberges, un par piste du studio (HostStream)
+    streams: Vec<HostStream>,
+    /// (19 nov., etape 3) le rendu d'un effet heberge en cours (un a la fois par connexion)
+    job: Option<RenderJob>,
+    // (20 nov.) sous Windows, le numero des rendus vient de host::next_job_id (commun a toutes les connexions)
+    #[cfg_attr(windows, allow(dead_code))]
+    next_job: u32,
+    /// (19 nov., etape 3b) les effets heberges en direct (le son d'une piste va et revient), et leur prochaine generation
+    fx: Vec<FxStream>,
+    next_fx_gen: u32,
+    /// les flux d'effet fermes depuis peu (k, l'instant) : leurs paquets encore en route sont jetes, sans fermer
+    fx_gone: Vec<(u8, Instant)>,
     /// (29 oct.) la generation des avis (un plugin d'avant refuse, plugin_link) deja dite a ce studio
     notices: u64,
     /// (9 nov., audit F1) la generation de l'armement deja dite a ce studio (arming.rs)
@@ -264,6 +284,9 @@ impl<'a> Conn<'a> {
         }
         let all = plugins::enumerate();
         let mut wins = plugins::plugin_windows(&all);
+        // (19 nov., host.rs) les editeurs ouverts des plugins que ce compagnon heberge lui-meme (sans DAW)
+        #[cfg(windows)]
+        wins.extend(crate::host::windows());
         // --test-window : la fenetre d'essai du compagnon lui-meme (testwin.rs), proposee comme un plugin
         if let Some(t) = self.sh.test_window {
             if let Some(raw) = all.iter().find(|w| w.hwnd == t && w.visible) {
@@ -451,7 +474,10 @@ impl<'a> Conn<'a> {
         let cap = if self.sh.demo {
             None
         } else {
-            match capture::open_plugin(id, &w.plugin, self.sh.capture.as_deref()) {
+            // (19 nov.) un plugin heberge apprend ses captures a part (un « Diva » de Live, fenetre d'outil, a appris que WGC
+            // le refuse ; la fenetre hebergee, elle, n'est pas une fenetre d'outil)
+            let key = if w.host == Some("host") { format!("host:{}", w.plugin) } else { w.plugin.clone() };
+            match capture::open_plugin(id, &key, self.sh.capture.as_deref()) {
                 Ok(c) => Some(c),
                 Err(e) => return self.send_text(json!({ "type": "unwatched", "id": id, "reason": format!("cannot capture: {e}") }).to_string()),
             }
@@ -480,8 +506,10 @@ impl<'a> Conn<'a> {
         let worker = Worker::new(id, w.title.clone(), cap).with_latest_input(self.latest_input.clone());
         std::thread::spawn(move || worker.run(req_rx, resp_tx));
         self.covered_said = false;
+        let hosted = w.host == Some("host");
         self.watch = Some(Watch {
             id,
+            hosted,
             title: w.title,
             pid,
             tx: Some(req_tx),
@@ -634,6 +662,13 @@ impl<'a> Conn<'a> {
             self.stats.refused += 1;
             return self.input_ack(&raw, recv, now_f(), merged, Some("not the window shown"));
         }
+        // (20 nov., 2e relecture) l'editeur d'un plugin heberge (cache, filme) recoit les clics, la molette, la frappe
+        // dans ses champs ; jamais un raccourci (Ctrl, Alt, Meta, les touches F) qui ouvrirait un fichier, un lien, ou
+        // fermerait la fenetre sans etre vu
+        if w.hosted && hosted_shortcut(&ev) {
+            self.stats.refused += 1;
+            return self.input_ack(&raw, recv, now_f(), merged, Some("no keyboard shortcuts in a hosted plugin"));
+        }
         let (top, pid) = (w.id, w.pid);
         let outcome = if self.sh.demo {
             // la fenetre de demonstration n'existe pas : rien n'est injecte, le reste se comporte pareil
@@ -732,6 +767,16 @@ impl<'a> Conn<'a> {
         self.send_text(json!({ "type": "armed", "armed": armed }).to_string())?;
         if !armed {
             self.stop_watch_with(Some(crate::arming::REFUSAL), Some(crate::arming::CODE))?;
+            if let Some(j) = self.job.take() {
+                self.send_text(json!({ "type": "host", "action": "render", "job": j.job, "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string())?;
+            }
+            for s in std::mem::take(&mut self.streams) {
+                self.send_text(json!({ "type": "audio", "stream": s.stream, "state": "off", "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string())?;
+            }
+            for s in std::mem::take(&mut self.fx) {
+                self.fx_gone.push((s.stream, Instant::now()));
+                self.send_text(json!({ "type": "host", "action": "fx-live", "stream": s.stream, "id": s.fx, "on": false, "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string())?;
+            }
             if let Some(f) = self.audio.take() {
                 crate::log(&format!("audio return stopped: remote control is off ({}, {} packets sent)", f.label, f.sent));
                 let off = json!({ "type": "audio", "state": "off", "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string();
@@ -956,11 +1001,16 @@ impl<'a> Conn<'a> {
                 None => self.send_text(protocol::error("bad-mode", "mode is direct or focus")),
             },
             ClientMsg::Input(raw) => self.on_input(raw, recv, 0),
-            ClientMsg::Audio { action, target, rate, format, ms } => {
+            ClientMsg::Audio { action, target, rate, format, ms, stream } => {
                 // (9 nov., audit F1) desarme : le son du DAW ne part pas (arreter, lui, marche toujours)
                 if action == "start" && self.disarmed() {
                     crate::log("REFUSED the audio return: remote control is off");
-                    return self.send_text(json!({ "type": "audio", "state": "off", "error": crate::arming::REFUSAL, "code": crate::arming::CODE }).to_string());
+                    return self.send_text(json!({ "type": "audio", "state": "off", "error": crate::arming::REFUSAL, "code": crate::arming::CODE, "stream": stream }).to_string());
+                }
+                // (19 nov., etape 2) le flux d'un plugin heberge : a cote du flux principal, jamais a sa place
+                if let Some(k) = stream.filter(|k| *k > 0) {
+                    let _ = format;
+                    return self.on_stream(k, &action, target.as_deref(), rate, ms);
                 }
                 let r = crate::audio::feed::on_request(&mut self.audio, &action, target.as_deref(), rate, format.as_deref(), ms, self.sh.demo, crate::audio::test_tone());
                 crate::tray::status::audio_reply(&r); // (24 oct.) la fenetre d'etat : une capture qui echoue
@@ -973,6 +1023,34 @@ impl<'a> Conn<'a> {
                 Err(e) => self.send_text(protocol::error("midi", &e)),
             },
             ClientMsg::Emitted { id } => self.send_text(crate::plugin_link::emitted_json(&id)),
+            // (19 nov.) l'hote VST3 du compagnon (host.rs) : charger un plugin, c'est du code natif — arme seulement
+            ClientMsg::Host { action, plugin, id, state, show, bpm, playing, n, vol, pan, mute, open, frames, rate, job, tail, stream, from, offset, start } => {
+                if self.disarmed() {
+                    crate::log("REFUSED a plugin host request: remote control is off");
+                    return self.send_text(json!({ "type": "host", "action": action, "error": crate::arming::REFUSAL, "code": crate::arming::CODE, "n": n }).to_string());
+                }
+                // (19 nov., etape 3) le rendu d'un effet : la session porte la tache (le son arrive en binaire)
+                if action.starts_with("render-") {
+                    return self.on_render(&action, id, frames, rate, bpm, tail, job, n, start);
+                }
+                // (19 nov., etape 3b) un effet en direct : la session porte le flux (le son arrive en binaire, « UWF1 »)
+                if action == "fx-live" || action == "fx-stop" {
+                    return self.on_fx(&action, id, rate, stream, n);
+                }
+                #[cfg(windows)]
+                {
+                    if self.host_gen == 0 {
+                        self.host_gen = crate::host::generation();
+                    }
+                    crate::host::request(json!({ "action": action, "plugin": plugin, "id": id, "state": state, "show": show, "bpm": bpm, "playing": playing, "n": n, "vol": vol, "pan": pan, "mute": mute, "open": open, "from": from, "offset": offset, "rate": rate }), self.host_tx.clone());
+                    Ok(())
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (plugin, id, state, show, bpm, playing, vol, pan, mute, open, frames, rate, job, tail, stream, from, offset, start);
+                    self.send_text(json!({ "type": "host", "action": action, "error": "hosting plugins without a DAW is Windows only for now", "n": n }).to_string())
+                }
+            }
             // (25 oct., sans loopMIDI) le lien du studio par le canal local du script de Live
             ClientMsg::Link { sysex, stop } => {
                 if stop == Some(true) {
@@ -1030,7 +1108,414 @@ impl<'a> Conn<'a> {
         }
     }
 
+    /// (19 nov., etape 3) Le rendu d'un effet heberge, en trois temps : render-begin {id, frames, rate, bpm, tail} → le
+    /// compagnon ouvre la tache (son numero, son fichier) ; le studio envoie le son en binaire (on_job_data) ; render-end
+    /// {job} → l'enfant rend, le resultat revient en binaire (« UWJ2 », pump_job) puis {action:"rendered"}. render-cancel
+    /// l'abandonne. Une tache par connexion, FREEZE_MAX_SECONDS au plus.
+    #[allow(clippy::too_many_arguments)]
+    fn on_render(&mut self, action: &str, id: Option<u32>, frames: Option<u64>, rate: Option<u32>, bpm: Option<f64>, tail: Option<f64>, job: Option<u32>, n: Option<u64>, start: Option<i64>) -> Result<(), Fatal> {
+        let err = |e: &str| json!({ "type": "host", "action": action, "error": e, "n": n, "job": job }).to_string();
+        match action {
+            "render-begin" => {
+                if self.job.is_some() {
+                    return self.send_text(err("a render is already running"));
+                }
+                let (Some(fx), Some(frames), Some(rate)) = (id, frames, rate) else { return self.send_text(err("id, frames and rate are needed")) };
+                if !(8000..=192_000).contains(&rate) || frames == 0 || frames as f64 > JOB_MAX_SECONDS * rate as f64 {
+                    return self.send_text(err("the sound is empty or longer than 10 minutes"));
+                }
+                // (20 nov., relecture de securite) le numero vient d'un compteur commun a tout le compagnon : deux connexions
+                // (deux onglets, une reconnexion pendant un rendu abandonne) n'ecrivent jamais les memes fichiers
+                #[cfg(windows)]
+                let j = crate::host::next_job_id();
+                #[cfg(not(windows))]
+                let j = { let j = self.next_job; self.next_job = self.next_job.wrapping_add(1).max(1); j };
+                #[cfg(windows)]
+                let paths = crate::host::job_paths(j);
+                #[cfg(not(windows))]
+                let paths: Option<(std::path::PathBuf, std::path::PathBuf)> = None;
+                let Some((input, output)) = paths else { return self.send_text(err("no folder for the render")) };
+                // (20 nov., relecture) jobs/ ne grossit pas sans fin : au-dela de JOBS_MAX_BYTES (les rendus en cours et ceux
+                // qu'un enfant ecrit encore), le rendu est refuse
+                // (20 nov., 2e relecture) la place est reservee ici, pour l'entree et la sortie (stereo f32, la queue comprise),
+                // et rendue quand le rendu se termine : des connexions simultanees ne depassent pas la borne ensemble
+                let need = (frames + (30.0 * rate as f64) as u64) * 8 * 2;
+                #[cfg(windows)]
+                {
+                    let before = JOBS_RESERVED.fetch_add(need, Ordering::SeqCst);
+                    if crate::host::jobs_bytes() + before + need > JOBS_MAX_BYTES {
+                        JOBS_RESERVED.fetch_sub(need, Ordering::SeqCst);
+                        return self.send_text(err("too many renders at once: try again in a moment"));
+                    }
+                }
+                // create_new : jamais un fichier deja la (celui d'un autre rendu)
+                let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&input) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        #[cfg(windows)]
+                        JOBS_RESERVED.fetch_sub(need, Ordering::SeqCst);
+                        return self.send_text(err(&format!("cannot write the render's input ({e})")));
+                    }
+                };
+                self.job = Some(RenderJob {
+                    job: j, fx, frames, rate, bpm: bpm.filter(|b| (20.0..=999.0).contains(b)).unwrap_or(120.0), tail: tail.filter(|t| t.is_finite()).unwrap_or(0.0).clamp(0.0, 30.0),
+                    start: start.filter(|s| (-(1i64 << 53)..=(1i64 << 53)).contains(s)).unwrap_or(0),
+                    received: 0, input, output, file: Some(file), phase: JobPhase::Receiving, reserved: need,
+                });
+                crate::log(&format!("render {j}: effect {fx}, {frames} frames at {rate} Hz"));
+                self.send_text(json!({ "type": "host", "action": "render-begin", "job": j, "n": n, "chunk": JOB_IN_CHUNK_FRAMES }).to_string())
+            }
+            "render-end" => {
+                let ok = matches!(&self.job, Some(r) if Some(r.job) == job && matches!(r.phase, JobPhase::Receiving) && r.received == r.frames);
+                if !ok {
+                    let got = self.job.as_ref().map(|r| (r.received, r.frames));
+                    self.job = None;
+                    return self.send_text(err(&format!("the render's sound is incomplete ({got:?})")));
+                }
+                let r = self.job.as_mut().unwrap();
+                r.file = None;
+                let (tx, rx) = mpsc::channel();
+                let (fx, input, output, frames, rate, bpm, tail, start) = (r.fx, r.input.clone(), r.output.clone(), r.frames, r.rate, r.bpm, r.tail, r.start);
+                std::thread::spawn(move || {
+                    #[cfg(windows)]
+                    let res = crate::host::render(fx, &input, &output, frames, rate, bpm, tail, start);
+                    #[cfg(not(windows))]
+                    let res: Result<serde_json::Value, String> = { let _ = (fx, &input, &output, frames, rate, bpm, tail, start); Err("Windows only".into()) };
+                    // (20 nov., relecture) personne n'attend plus ce rendu (la tache abandonnee, la connexion fermee) : sa sortie
+                    // est effacee ici, une fois que l'enfant l'a ecrite
+                    if tx.send(res).is_err() {
+                        let _ = std::fs::remove_file(&output);
+                    }
+                });
+                r.phase = JobPhase::Rendering(rx);
+                Ok(())
+            }
+            _ => {
+                // render-cancel
+                if self.job.as_ref().map(|r| Some(r.job) == job).unwrap_or(false) {
+                    self.job = None;
+                }
+                self.send_text(json!({ "type": "host", "action": "render-cancel", "job": job, "n": n }).to_string())
+            }
+        }
+    }
+
+    /// (19 nov., etape 3b) fx-live {id, rate, stream k} : l'effet heberge `id` traite le son du flux k (9..16) au fil de
+    /// l'eau → {action:"fx-live", stream, on:true, latency, rate} (ou error) ; fx-stop {stream}. Un flux par effet.
+    fn on_fx(&mut self, action: &str, id: Option<u32>, rate: Option<u32>, stream: Option<u8>, n: Option<u64>) -> Result<(), Fatal> {
+        let Some(k) = stream.filter(|k| (FX_STREAM_FIRST..FX_STREAM_FIRST + FX_STREAMS).contains(k)) else {
+            return self.send_text(json!({ "type": "host", "action": action, "error": format!("stream is {FX_STREAM_FIRST}..{}", FX_STREAM_FIRST + FX_STREAMS - 1), "n": n }).to_string());
+        };
+        let now = Instant::now();
+        for s in self.fx.iter().filter(|s| s.stream == k || Some(s.fx) == id) {
+            self.fx_gone.push((s.stream, now));
+        }
+        self.fx.retain(|s| s.stream != k && Some(s.fx) != id);
+        if action == "fx-stop" {
+            return self.send_text(json!({ "type": "host", "action": "fx-stop", "stream": k, "n": n }).to_string());
+        }
+        let (Some(fx), Some(rate)) = (id, rate.filter(|r| (8000..=192_000).contains(r))) else {
+            return self.send_text(json!({ "type": "host", "action": action, "stream": k, "error": "id and rate (8000..192000) are needed", "n": n }).to_string());
+        };
+        let gen = self.next_fx_gen;
+        self.next_fx_gen = self.next_fx_gen.wrapping_add(1).max(1);
+        let (tx, rx) = mpsc::sync_channel(FX_OUT_QUEUE);
+        self.fx.push(FxStream { stream: k, fx, gen, rate, rx, seq: 0, budget: rate as f64 * FX_BURST_SECONDS, at: Instant::now(), got: 0, sent: 0, over: 0, full: 0 });
+        let reply = self.host_tx.clone();
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            let r = crate::host::fx_live(fx, rate, gen, tx);
+            #[cfg(not(windows))]
+            let r: Result<serde_json::Value, String> = { let _ = tx; Err("hosting plugins without a DAW is Windows only for now".into()) };
+            let m = match r {
+                Ok(v) => json!({ "type": "host", "action": "fx-live", "stream": k, "id": fx, "gen": gen, "on": true, "latency": v["latency"], "rate": v["rate"], "n": n }),
+                Err(e) => json!({ "type": "host", "action": "fx-live", "stream": k, "id": fx, "gen": gen, "on": false, "error": e, "n": n }),
+            };
+            let _ = reply.send(m.to_string());
+        });
+        Ok(())
+    }
+
+    /// (19 nov., etape 3b) Un paquet du son d'une piste pour un effet en direct : « UWF1 », le flux k (u8), 3 octets
+    /// nuls, la trame du studio (u64), le nombre de trames (u16), 2 octets nuls, puis f32 stereo entrelaces. Faux (la
+    /// connexion se ferme) desarme, hors d'un flux ouvert, mal forme ; au-dela du debit du flux : jete et compte.
+    fn on_fx_data(&mut self, b: &[u8]) -> bool {
+        if b.len() < FX_HEADER || &b[..4] != b"UWF1" {
+            return false;
+        }
+        let k = b[4];
+        // un flux ferme depuis moins de FX_GRACE (un fx-stop, le desarmement) : ses paquets encore en route sont jetes
+        self.fx_gone.retain(|(_, t)| t.elapsed() < FX_GRACE);
+        let open = self.fx.iter().any(|s| s.stream == k);
+        let gone = self.fx_gone.iter().any(|(g, _)| *g == k);
+        // desarme : rien ne part ; un flux ouvert (il va se fermer) ou tout juste ferme : jete, sinon la connexion se ferme
+        if !self.sh.arming.armed() {
+            return open || gone;
+        }
+        if !open {
+            return gone;
+        }
+        let pos = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+        let frames = u16::from_le_bytes([b[16], b[17]]) as usize;
+        if frames == 0 || frames > FX_MAX_FRAMES || b.len() != FX_HEADER + frames * 8 {
+            return false;
+        }
+        let Some(s) = self.fx.iter_mut().find(|s| s.stream == k) else { return false };
+        // le debit : celui du son (et un quart de plus), une demi-seconde d'avance au plus
+        let now = Instant::now();
+        let cap = s.rate as f64 * FX_BURST_SECONDS;
+        s.budget = (s.budget + now.duration_since(s.at).as_secs_f64() * s.rate as f64 * 1.25).min(cap);
+        s.at = now;
+        if s.budget < frames as f64 {
+            s.over += 1;
+            return true;
+        }
+        s.budget -= frames as f64;
+        s.got += 1;
+        let x: Vec<f32> = b[FX_HEADER..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        #[cfg(windows)]
+        crate::host::fx_input(s.fx, s.gen, pos, &x);
+        #[cfg(not(windows))]
+        let _ = (pos, x);
+        true
+    }
+
+    /// (19 nov., etape 3b) Le son des effets en direct : des paquets « UWA1 » (octet 33 : le flux k), dates de la trame du
+    /// studio qu'ils prolongent (sa latence retiree). Le socket plein : jete, comme les autres flux.
+    fn pump_fx(&mut self) -> Result<(), Fatal> {
+        use crate::audio::packet::{encode, Header, SampleFormat};
+        let mut out: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (si, s) in self.fx.iter_mut().enumerate() {
+            for _ in 0..64 {
+                let Ok(o) = s.rx.try_recv() else { break };
+                if o.gen != s.gen || o.pos < 0 || o.data.is_empty() || o.data.len() % 2 != 0 {
+                    continue;
+                }
+                s.seq = s.seq.wrapping_add(1);
+                let h = Header { seq: s.seq, pos: o.pos as u64, t_ms: 0.0, rate: s.rate, frames: (o.data.len() / 2) as u16, channels: 2, fmt: SampleFormat::F32.code(), flags: 0 };
+                let mut p = encode(&h, &o.data, SampleFormat::F32);
+                p[33] = s.stream;
+                out.push((si, p));
+            }
+        }
+        for (si, p) in out {
+            if self.pending_flush {
+                self.fx[si].full += 1;
+                continue;
+            }
+            self.fx[si].sent += 1;
+            self.push(Message::binary(p))?;
+        }
+        Ok(())
+    }
+
+    /// (19 nov., etape 3) Un morceau du son d'un rendu : « UWJ1 », le numero de la tache, la trame de debut (u32), puis
+    /// des echantillons f32 stereo entrelaces. Faux (la connexion se ferme) hors d'une tache qui recoit, desarme, hors
+    /// d'ordre, au-dela de ce qui a ete annonce.
+    fn on_job_data(&mut self, b: &[u8]) -> bool {
+        if b.len() < 12 || &b[..4] != b"UWJ1" || !self.sh.arming.armed() {
+            return false;
+        }
+        let job = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let at = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as u64;
+        let body = &b[12..];
+        let Some(r) = self.job.as_mut() else { return false };
+        if r.job != job || !matches!(r.phase, JobPhase::Receiving) || at != r.received || body.len() % 8 != 0 {
+            return false;
+        }
+        let n = (body.len() / 8) as u64;
+        if n == 0 || r.received + n > r.frames {
+            return false;
+        }
+        let Some(f) = r.file.as_mut() else { return false };
+        if std::io::Write::write_all(f, body).is_err() {
+            return false;
+        }
+        r.received += n;
+        true
+    }
+
+    /// (19 nov., etape 3) Le rendu fini : son resultat part en morceaux (« UWJ2 », la tache, la trame, les echantillons),
+    /// sans perte (on attend que le socket se vide), puis {action:"rendered"}.
+    fn pump_job(&mut self) -> Result<(), Fatal> {
+        let Some(r) = self.job.as_mut() else { return Ok(()) };
+        if let JobPhase::Rendering(rx) = &r.phase {
+            match rx.try_recv() {
+                Ok(Ok(info)) => match std::fs::File::open(&r.output).and_then(|f| f.metadata().map(|m| (f, m.len() as usize))) {
+                    Ok((file, len)) => r.phase = JobPhase::Sending { file, len: len - len % 8, offset: 0, info },
+                    Err(e) => {
+                        let m = json!({ "type": "host", "action": "render", "job": r.job, "error": format!("cannot read the render ({e})") }).to_string();
+                        self.job = None;
+                        return self.send_text(m);
+                    }
+                },
+                Ok(Err(e)) => {
+                    let m = json!({ "type": "host", "action": "render", "job": r.job, "error": e }).to_string();
+                    self.job = None;
+                    return self.send_text(m);
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let m = json!({ "type": "host", "action": "render", "job": r.job, "error": "the render stopped" }).to_string();
+                    self.job = None;
+                    return self.send_text(m);
+                }
+            }
+        }
+        // le socket n'a pas fini d'envoyer le morceau d'avant : on attend (rien n'est jete, la memoire reste bornee)
+        if self.pending_flush {
+            return self.flush();
+        }
+        let mut chunks = Vec::new();
+        let mut done = None;
+        if let Some(r) = self.job.as_mut() {
+            if let JobPhase::Sending { file, len, offset, info } = &mut r.phase {
+                let mut cut = false;
+                for _ in 0..2 {
+                    if *offset >= *len {
+                        break;
+                    }
+                    let end = (*offset + JOB_CHUNK_FRAMES * 8).min(*len);
+                    let mut m = vec![0u8; 12 + end - *offset];
+                    m[..4].copy_from_slice(b"UWJ2");
+                    m[4..8].copy_from_slice(&r.job.to_le_bytes());
+                    m[8..12].copy_from_slice(&((*offset / 8) as u32).to_le_bytes());
+                    if std::io::Read::read_exact(file, &mut m[12..]).is_err() {
+                        // (20 nov., 2e relecture) le fichier rendu se lit mal : le rendu echoue, jamais un son tronque
+                        cut = true;
+                        break;
+                    }
+                    chunks.push(m);
+                    *offset = end;
+                }
+                if cut {
+                    done = Some(json!({ "type": "host", "action": "render", "job": r.job, "error": "the rendered sound could not be read back" }).to_string());
+                } else if *offset >= *len {
+                    let mut v = info.clone();
+                    v["type"] = json!("host");
+                    v["action"] = json!("rendered");
+                    v["job"] = json!(r.job);
+                    done = Some(v.to_string());
+                }
+            }
+        }
+        for m in chunks {
+            self.push(Message::binary(m))?;
+        }
+        if let Some(m) = done {
+            if let Some(r) = self.job.take() {
+                crate::log(&format!("render {}: sent", r.job));
+            }
+            self.send_text(m)?;
+        }
+        Ok(())
+    }
+
+    /// (19 nov., etape 2) start / stop du flux `k` d'un plugin heberge (target « host:<id> », resolu ici : le Return de
+    /// l'enfant change quand le plugin se rouvre). → {type:"audio", stream:k, state:"on"|"waiting"|"off", …}
+    fn on_stream(&mut self, k: u8, action: &str, target: Option<&str>, rate: Option<u32>, ms: Option<f64>) -> Result<(), Fatal> {
+        if k as usize > HOST_STREAMS {
+            return self.send_text(json!({ "type": "audio", "stream": k, "state": "off", "error": format!("stream is 1..{HOST_STREAMS}") }).to_string());
+        }
+        self.streams.retain(|s| s.stream != k);
+        if action != "start" {
+            return self.send_text(json!({ "type": "audio", "stream": k, "state": "off" }).to_string());
+        }
+        let Some(hosted) = target.and_then(|t| t.strip_prefix("host:")).and_then(|n| n.parse::<u32>().ok()) else {
+            return self.send_text(json!({ "type": "audio", "stream": k, "state": "off", "error": "target is host:<id>" }).to_string());
+        };
+        let rate = rate.filter(|r| (8000..=192_000).contains(r)).unwrap_or(48000);
+        let ms = ms.filter(|m| m.is_finite() && (2.5..=20.0).contains(m)).unwrap_or(5.0);
+        self.streams.push(HostStream { stream: k, hosted, rate, ms, feed: None, retry: Instant::now(), said: String::new(), sent: 0 });
+        Ok(())
+    }
+
+    /// (19 nov., etape 2) Les paquets des flux des plugins heberges, marques de leur numero (octet 33). Un flux sans
+    /// Return (le plugin s'ouvre, se rouvre) attend : un essai toutes les STREAM_RETRY, le studio le sait (« waiting »).
+    fn pump_streams(&mut self) -> Result<(), Fatal> {
+        if self.streams.is_empty() {
+            return Ok(());
+        }
+        let mut say: Vec<String> = Vec::new();
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for s in self.streams.iter_mut() {
+            if s.feed.is_none() && s.retry <= Instant::now() {
+                s.retry = Instant::now() + STREAM_RETRY;
+                #[cfg(windows)]
+                let pick = crate::host::return_target(s.hosted);
+                #[cfg(not(windows))]
+                let pick: Option<String> = None;
+                let r = match (pick, crate::plugin_link::hub()) {
+                    (Some(t), Some(h)) => h.start_feed(&t, s.rate, crate::audio::packet::SampleFormat::F32, s.ms).map(|f| (t, f)),
+                    _ => Err("waiting for the plugin".to_string()),
+                };
+                let (state, msg) = match r {
+                    Ok((t, f)) => {
+                        crate::log(&format!("audio stream {}: hosted plugin {} ({t})", s.stream, s.hosted));
+                        s.feed = Some(f);
+                        ("on", json!({ "type": "audio", "stream": s.stream, "state": "on", "hosted": s.hosted, "rate": s.rate }))
+                    }
+                    Err(e) => ("waiting", json!({ "type": "audio", "stream": s.stream, "state": "waiting", "hosted": s.hosted, "reason": e })),
+                };
+                if s.said != state {
+                    s.said = state.to_string();
+                    say.push(msg.to_string());
+                }
+            }
+            let mut ended = false;
+            if let Some(f) = s.feed.as_mut() {
+                for _ in 0..64 {
+                    match f.next() {
+                        Some(crate::audio::feed::Out::Packet(mut p)) => {
+                            if p.len() > 36 {
+                                p[33] = s.stream;
+                            }
+                            s.sent += 1;
+                            out.push(p);
+                        }
+                        Some(crate::audio::feed::Out::Ended(_)) => {
+                            ended = true;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            if ended {
+                s.feed = None;
+                s.retry = Instant::now() + STREAM_RETRY;
+            }
+        }
+        for m in say {
+            self.send_text(m)?;
+        }
+        for p in out {
+            // le socket plein : le paquet est jete (comme le flux principal), le suivant passera
+            if self.pending_flush {
+                continue;
+            }
+            self.push(Message::binary(p))?;
+        }
+        Ok(())
+    }
+
     /// (25 oct.) Ce que le relais du lien a pour le studio.
+    /// (19 nov., host.rs) les reponses de l'hote VST3, et « changed » quand sa liste change (un plugin pret, parti, plante)
+    fn poll_host(&mut self) -> Result<(), Fatal> {
+        while let Ok(m) = self.host_rx.try_recv() {
+            self.send_text(m)?;
+        }
+        #[cfg(windows)]
+        if self.host_gen != 0 {
+            let g = crate::host::generation();
+            if g != self.host_gen {
+                self.host_gen = g;
+                self.send_text(json!({ "type": "host", "event": "changed" }).to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     fn poll_link(&mut self) -> Result<(), Fatal> {
         let Some(r) = &self.link else { return Ok(()) };
         for o in r.poll() {
@@ -1222,6 +1707,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
     let Some((ws, origin)) = handshake(stream, &sh) else { return };
     let _ = ws.get_ref().set_nonblocking(true);
     let (ed_tx, ed_rx) = mpsc::channel();
+    let (host_tx, host_rx) = mpsc::channel();
     let mut c = Conn {
         ws,
         sh: &sh,
@@ -1244,6 +1730,15 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         last_devices: None,
         audio: None,
         link: None,
+        host_tx,
+        host_rx,
+        host_gen: 0,
+        streams: Vec::new(),
+        job: None,
+        next_job: 1,
+        fx: Vec::new(),
+        next_fx_gen: 1,
+        fx_gone: Vec::new(),
         notices: 0,
         arm_gen: 0,
         rev_gen,
@@ -1399,6 +1894,13 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     "plugins": crate::plugin_link::available(),
                     // (25 oct.) le lien du studio par le canal local du script de Live (« link », « routes ») : sans loopMIDI
                     "linkTransport": true,
+                    // (19 nov., host.rs) ce compagnon heberge lui-meme des plugins VST3 (sans DAW)
+                    "host": host_available(),
+                    // (19 nov., etape 2) les flux par plugin heberge (audio stream 1..N) : un studio qui ne les voit pas
+                    // (un compagnon d'avant) n'heberge qu'un plugin
+                    "hostStreams": if host_available() { HOST_STREAMS } else { 0 },
+                    // (19 nov., etape 3b) les effets heberges en direct : flux first..first+count-1, maxFrames trames par paquet
+                    "hostFxLive": if host_available() { json!({ "first": FX_STREAM_FIRST, "count": FX_STREAMS, "maxFrames": FX_MAX_FRAMES }) } else { serde_json::Value::Null },
                     // (9 nov., audit F1) la capture, les gestes et le son : seulement armes dans le compagnon (« armed »
                     // suit chaque changement) ; (audit F2) « unpair » fait changer le code du compagnon
                     "arming": true, "armed": armed, "unpair": true,
@@ -1481,9 +1983,15 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     }
                 }
                 Ok(Message::Close(_)) => break 'outer,
-                Ok(Message::Binary(_)) => {
-                    c.close(CLOSE_PROTOCOL, "no binary from the studio");
-                    break 'outer;
+                // (19 nov., etape 3) seulement le son d'un rendu ouvert par le compagnon (« UWJ1 », dans l'ordre, borne) ;
+                // tout autre binaire ferme la connexion, comme avant
+                Ok(Message::Binary(b)) => {
+                    // (19 nov., etape 3b) « UWF1 » : le son d'un effet en direct ; « UWJ1 » : celui d'un rendu
+                    let ok = if b.starts_with(b"UWF1") { c.on_fx_data(&b) } else { c.on_job_data(&b) };
+                    if !ok {
+                        c.close(CLOSE_PROTOCOL, "no binary from the studio");
+                        break 'outer;
+                    }
                 }
                 Ok(_) => {}
                 Err(WsError::Io(e)) if e.kind() == ErrorKind::WouldBlock => break,
@@ -1496,7 +2004,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 break;
             }
         }
-        if c.poll_arming().is_err() || c.poll_presence().is_err() || c.poll_surface().is_err() || c.poll_mixer().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump().is_err() || c.flush().is_err() {
+        if c.poll_arming().is_err() || c.poll_presence().is_err() || c.poll_surface().is_err() || c.poll_mixer().is_err() || c.poll_probe().is_err() || c.poll_editors().is_err() || c.poll_link().is_err() || c.poll_host().is_err() || c.poll_notices().is_err() || c.flush().is_err() || c.pump_audio().is_err() || c.pump_streams().is_err() || c.pump_fx().is_err() || c.pump_job().is_err() || c.pump().is_err() || c.flush().is_err() {
             break;
         }
         c.report_activity();
@@ -1504,7 +2012,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         // 1 ms apres leur arrivee) ; (25 oct.) et quand un plugin Uppwind Link Notes attend des notes (mesure : sinon
         // une note jouee « tout de suite » attendait jusqu'a 10 ms ici)
         // ; (26 oct.) et quand le lien de Live passe par ici (link_relay : une commande, sa reponse, sans 2 x 10 ms)
-        let busy = c.watch.is_some() || c.audio.is_some() || crate::plugin_link::notes_connected() || c.link.is_some();
+        let busy = c.watch.is_some() || c.audio.is_some() || crate::plugin_link::notes_connected() || c.link.is_some() || !c.fx.is_empty();
         std::thread::sleep(Duration::from_millis(if busy { 1 } else { 10 }));
     }
     c.log_inputs(true);
@@ -2232,6 +2740,58 @@ mod tests {
         assert_eq!(binary, 0, "nothing after the disarming");
         ws.send(Message::text(r#"{"type":"input","kind":"pointer","action":"up","x":5,"y":5,"n":3}"#.to_string())).unwrap();
         assert_eq!(text_of(&mut ws, "inputack")["ok"], false, "no gesture either");
+
+        // (19 nov., host.rs) desarme : l'hote VST3 ne charge ni ne liste rien (du code natif a la demande d'une page)
+        for action in ["add", "plugins", "list", "save", "editor", "scan", "render-begin", "fx-live"] {
+            ws.send(Message::text(json!({"type": "host", "action": action, "plugin": "695b9dd3afd6fa421234567844695661", "id": 1, "n": 7}).to_string())).unwrap();
+            let r = text_where(&mut ws, "host", |v| v["action"] == action);
+            assert_eq!((r["code"].as_str(), r["error"].as_str(), r["n"].as_u64()), (Some(crate::arming::CODE), Some(crate::arming::REFUSAL), Some(7)), "{action}: {r}");
+        }
+        // (19 nov., etape 2) le flux d'un plugin heberge non plus
+        ws.send(Message::text(r#"{"type":"audio","action":"start","target":"host:1","rate":48000,"format":"f32","ms":5,"stream":2}"#.to_string())).unwrap();
+        let au = text_where(&mut ws, "audio", |v| v["stream"] == 2);
+        assert_eq!((au["state"].as_str(), au["code"].as_str()), (Some("off"), Some(crate::arming::CODE)), "{au}");
+        // (19 nov., etape 3b) le son d'un effet en direct, desarme (et sans flux ouvert) : la connexion se ferme
+        let mut p = b"UWF1".to_vec();
+        p.extend_from_slice(&[9, 0, 0, 0]);
+        p.extend_from_slice(&0u64.to_le_bytes());
+        p.extend_from_slice(&4u16.to_le_bytes());
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(&[0u8; 32]);
+        ws.send(Message::binary(p)).unwrap();
+        assert_eq!(close_code(&mut ws), Some(CLOSE_PROTOCOL));
+    }
+
+    /// (19 nov., etape 3b) Un effet en direct arrete (fx-stop) : ses paquets encore en route sont jetes, la connexion
+    /// reste ; un paquet d'un flux jamais ouvert la ferme ; un flux hors de 9..16 est refuse.
+    #[test]
+    fn live_effect_packets_after_a_stop_are_dropped_but_a_stream_never_opened_closes() {
+        let (port, _sh) = server_shared(true, true, 50, MAX_CONNECTIONS, None, false);
+        let (mut ws, _) = pair_v2(port);
+        let uwf = |k: u8| {
+            let mut p = b"UWF1".to_vec();
+            p.extend_from_slice(&[k, 0, 0, 0]);
+            p.extend_from_slice(&0u64.to_le_bytes());
+            p.extend_from_slice(&4u16.to_le_bytes());
+            p.extend_from_slice(&[0, 0]);
+            p.extend_from_slice(&[0u8; 32]);
+            p
+        };
+        ws.send(Message::text(json!({"type": "host", "action": "fx-live", "id": 1, "rate": 48000, "stream": 3, "n": 1}).to_string())).unwrap();
+        let r = text_where(&mut ws, "host", |v| v["action"] == "fx-live");
+        assert!(r["error"].is_string(), "{r}");
+        ws.send(Message::text(json!({"type": "host", "action": "fx-live", "id": 1, "rate": 48000, "stream": 9, "n": 2}).to_string())).unwrap();
+        // (sans plugin heberge : la reponse dit l'erreur, le flux reste ouvert jusqu'a fx-stop)
+        let _ = text_where(&mut ws, "host", |v| v["action"] == "fx-live" && v["stream"] == 9);
+        ws.send(Message::text(json!({"type": "host", "action": "fx-stop", "stream": 9, "n": 3}).to_string())).unwrap();
+        assert_eq!(text_where(&mut ws, "host", |v| v["action"] == "fx-stop")["stream"], 9);
+        for _ in 0..3 {
+            ws.send(Message::binary(uwf(9))).unwrap();
+        }
+        ws.send(Message::text(r#"{"type":"list"}"#.to_string())).unwrap();
+        assert!(text_of(&mut ws, "windows").is_object(), "still connected after the late packets");
+        ws.send(Message::binary(uwf(10))).unwrap();
+        assert_eq!(close_code(&mut ws), Some(CLOSE_PROTOCOL));
     }
 
     /// Le prochain message d'un type donne qui remplit une condition (les autres passent).
@@ -2442,5 +3002,142 @@ mod tests {
         drop(ws);
         crate::discord::fake::until("cleared when Music left", || !sh.presence.snapshot().shown);
         assert_eq!(seen.lock().unwrap().activities.last().unwrap(), &None);
+    }
+}
+
+/// (19 nov.) le compagnon heberge-t-il des plugins VST3 sans DAW (host.rs, Windows) ?
+fn host_available() -> bool {
+    #[cfg(windows)]
+    return crate::host::available();
+    #[cfg(not(windows))]
+    false
+}
+
+/// (19 nov., etape 2) Des flux de plugins heberges par connexion, au plus (les sorties du worklet du studio).
+pub const HOST_STREAMS: usize = 8;
+/// Un flux sans son Return : un nouvel essai.
+const STREAM_RETRY: Duration = Duration::from_millis(400);
+
+/// (19 nov., etape 2) Le son d'un plugin heberge, pour une piste du studio.
+struct HostStream {
+    stream: u8,
+    hosted: u32,
+    rate: u32,
+    ms: f64,
+    feed: Option<crate::audio::feed::Feed>,
+    retry: Instant,
+    /// le dernier etat dit au studio (« on », « waiting »)
+    said: String,
+    sent: u64,
+}
+
+/// (19 nov., etape 3b) Les flux des effets en direct : 9..16 (apres ceux des instruments, 1..8).
+pub const FX_STREAM_FIRST: u8 = 9;
+pub const FX_STREAMS: u8 = 8;
+/// Les trames d'un paquet du studio, au plus (le paquet entier : 4 Ko, sous MAX_TEXT_MESSAGE).
+pub const FX_MAX_FRAMES: usize = 512;
+const FX_HEADER: usize = 20;
+/// Les paquets sortis de l'effet en attente d'envoi (5 ms chacun).
+const FX_OUT_QUEUE: usize = 256;
+/// L'avance qu'un flux peut prendre sur le temps reel, en secondes de son.
+const FX_BURST_SECONDS: f64 = 0.5;
+/// Les paquets d'un flux d'effet tout juste ferme, encore en route : jetes sans fermer la connexion, pendant ce temps.
+const FX_GRACE: Duration = Duration::from_secs(2);
+
+/// (19 nov., etape 3b) Le son d'un effet en direct, sorti de l'enfant : `pos` la trame du studio (le plugin l'a gardee,
+/// sa latence retiree : negative au tout debut), des echantillons stereo entrelaces.
+pub struct FxOut {
+    pub gen: u32,
+    pub pos: i64,
+    pub data: Vec<f32>,
+}
+
+/// (19 nov., etape 3b) Un effet heberge en direct, pour une piste du studio.
+struct FxStream {
+    stream: u8,
+    fx: u32,
+    gen: u32,
+    rate: u32,
+    rx: mpsc::Receiver<FxOut>,
+    seq: u32,
+    /// le debit permis (des trames), recharge au fil du temps
+    budget: f64,
+    at: Instant,
+    got: u64,
+    sent: u64,
+    over: u64,
+    /// jetes au retour : le socket plein
+    full: u64,
+}
+
+impl Drop for FxStream {
+    fn drop(&mut self) {
+        crate::log(&format!("live effect {}: stream {} closed ({} packets in, {} out, {} over the rate, {} dropped: socket full)", self.fx, self.stream, self.got, self.sent, self.over, self.full));
+        #[cfg(windows)]
+        crate::host::fx_stop(self.fx, self.gen);
+    }
+}
+
+/// (19 nov., etape 3) Un rendu : 10 minutes au plus (FREEZE_MAX_SECONDS du studio) ; le resultat part en morceaux de
+/// JOB_CHUNK_FRAMES trames (128 Ko).
+const JOB_MAX_SECONDS: f64 = 600.0;
+/// (20 nov., relecture) la place que peuvent prendre tous les rendus de jobs/ ensemble (2 Gio) ; au-dela, un nouveau rendu
+/// est refuse
+#[cfg(windows)]
+const JOBS_MAX_BYTES: u64 = 2 << 30;
+/// (20 nov., 2e relecture) la place reservee par les rendus ouverts, toutes connexions comprises
+#[cfg(windows)]
+static JOBS_RESERVED: AtomicU64 = AtomicU64::new(0);
+pub const JOB_CHUNK_FRAMES: usize = 16384;
+/// Le son envoye par le studio : des morceaux sous la taille maximale d'un message (MAX_TEXT_MESSAGE, 16 Ko : la limite
+/// de la connexion reste la meme pour tout), 2000 trames stereo f32 et l'en-tete.
+pub const JOB_IN_CHUNK_FRAMES: usize = (protocol::MAX_TEXT_MESSAGE - 12) / 8 - 40;
+
+enum JobPhase {
+    Receiving,
+    Rendering(mpsc::Receiver<Result<serde_json::Value, String>>),
+    // (20 nov., relecture) le fichier rendu, lu par morceaux au fil de l'envoi
+    Sending { file: std::fs::File, len: usize, offset: usize, info: serde_json::Value },
+}
+
+/// (19 nov., etape 3) La tache de rendu d'une connexion ; ses fichiers sont effaces quand elle part.
+struct RenderJob {
+    job: u32,
+    fx: u32,
+    frames: u64,
+    rate: u32,
+    bpm: f64,
+    tail: f64,
+    /// (19 nov., la mesure en direct) la trame du morceau de la premiere trame rendue
+    start: i64,
+    received: u64,
+    input: std::path::PathBuf,
+    output: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    phase: JobPhase,
+    /// (20 nov., 2e relecture) la place reservee dans jobs/ (JOBS_RESERVED), rendue par Drop
+    reserved: u64,
+}
+
+/// (20 nov., 2e relecture) un raccourci clavier, refuse dans l'editeur d'un plugin heberge
+fn hosted_shortcut(ev: &InputEvent) -> bool {
+    match ev {
+        InputEvent::Key { key, code, mods, .. } => {
+            let f = |s: &str| s.len() >= 2 && s.as_bytes()[0] == b'F' && s[1..].bytes().all(|b| b.is_ascii_digit());
+            mods & (2 | 4 | 8) != 0 || f(key) || f(code) || matches!(key.as_str(), "Alt" | "Control" | "Meta" | "ContextMenu" | "Help")
+        }
+        InputEvent::Pointer { mods, .. } | InputEvent::Wheel { mods, .. } => mods & (2 | 4 | 8) != 0,
+        InputEvent::Text { .. } => false,
+    }
+}
+
+impl Drop for RenderJob {
+    fn drop(&mut self) {
+        self.file = None;
+        #[cfg(windows)]
+        JOBS_RESERVED.fetch_sub(self.reserved, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&self.input);
+        // la sortie : le fil de rendu peut l'ecrire encore (une tache abandonnee) ; effacee aussi au demarrage suivant
+        let _ = std::fs::remove_file(&self.output);
     }
 }

@@ -880,6 +880,17 @@ dependencies = [
  "serde_json",
  "tungstenite",
  "uwl-proto",
+ "uwl-vst3host",
+ "vst3",
+ "windows-sys",
+]
+
+[[package]]
+name = "uwl-vst3host"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
  "vst3",
  "windows-sys",
 ]

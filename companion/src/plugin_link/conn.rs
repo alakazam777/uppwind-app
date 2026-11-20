@@ -288,7 +288,7 @@ fn log_stats(inst: &Instance) {
         p::Kind::Return => {
             let ages = inst.age_summary();
             crate::log(&format!(
-                "plugin {} {}: {} frames in, DAW callback jitter sd {:.3} ms (max {:.2}), {} frames dropped, arrival age median {} ms (p90 {}), {} listener(s)",
+                "plugin {} {}: {} frames in, DAW callback jitter sd {:.3} ms (max {:.2}), {} frames dropped, arrival age median {} ms (p90 {}, max {}), {} listener(s)",
                 inst.name,
                 inst.hex(),
                 inst.frames_in.load(Ordering::Relaxed),
@@ -297,6 +297,7 @@ fn log_stats(inst: &Instance) {
                 f("dropped"),
                 ages["median"],
                 ages["p90"],
+                ages["max"],
                 inst.subs.lock().map(|s| s.len()).unwrap_or(0)
             ));
         }

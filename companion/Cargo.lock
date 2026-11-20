@@ -178,6 +178,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "com-scrape-types"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ce183b975b8fc736a20919c4002717255fbd867df575c792aeefa9a56a73ad0"
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2366,7 +2372,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "uppwind-companion"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "getrandom",
  "jpeg-encoder",
@@ -2376,6 +2382,7 @@ dependencies = [
  "tray-icon",
  "tungstenite",
  "uwl-proto",
+ "uwl-vst3host",
  "windows",
  "windows-core",
  "wry",
@@ -2408,6 +2415,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "uwl-vst3host"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.1",
+ "vst3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2418,6 +2435,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vst3"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31e3fe7a6f028ded8c5a9984cf283319e6dc63572c9b71da1d4ee9d71d3b6bf"
+dependencies = [
+ "com-scrape-types",
+]
 
 [[package]]
 name = "walkdir"
