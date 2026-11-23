@@ -113,7 +113,34 @@ pub fn is_state_name(s: &str) -> bool {
 
 // ── --plug-scan ─────────────────────────────────────────────────────────────────────────────────────────────────
 
+/// (23 nov., 0.4.14, relecture macOS « un scan bloque survit au compagnon ») Le scan s'arrete de lui-meme passe ce delai
+/// (le compagnon l'abandonne a 25 s) : sur Mac il n'y a pas de Job object, un module bloque ne tourne jamais plus.
+pub const SCAN_SELF_LIMIT: Duration = Duration::from_secs(40);
+
+/// Un arret immediat, sans destructeurs ni gestionnaires de sortie du plugin (Windows : TerminateProcess ; Mac : _exit).
+fn hard_exit(code: i32) -> ! {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn _exit(code: i32) -> !;
+        }
+        _exit(code);
+    }
+    #[allow(unreachable_code)]
+    std::process::abort()
+}
+
 pub fn scan_main(module: &Path) -> i32 {
+    std::thread::spawn(|| {
+        std::thread::sleep(SCAN_SELF_LIMIT);
+        hard_exit(3);
+    });
+    safe_dll_search();
     match Module::load(module) {
         Ok(m) => {
             let list: Vec<Value> = classes(&m)
@@ -130,6 +157,70 @@ pub fn scan_main(module: &Path) -> i32 {
             1
         }
     }
+}
+
+/// (23 nov., 0.4.14, relecture « l'ordre de recherche des DLL ») Windows : le dossier courant retire de la recherche des
+/// DLL (SetDllDirectoryW("")) avant de charger un module ; ses propres DLL restent cherchees d'abord dans son dossier.
+pub fn safe_dll_search() {
+    #[cfg(windows)]
+    unsafe {
+        let empty = [0u16];
+        windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(empty.as_ptr());
+    }
+}
+
+/// (23 nov., 0.4.14) La plus longue ligne du compagnon (un paquet de son en direct : 512 trames stereo en base64 en font
+/// 5 500 octets environ).
+pub const LINE_MAX: usize = 16384;
+
+/// (23 nov., 0.4.14, relecture « l'enfant lit une ligne entiere avant de verifier sa taille ») La ligne suivante dans
+/// `buf`, sans sa fin (LF ou CR LF), en ne gardant jamais plus de `max` octets : Some(true) une ligne, Some(false) une
+/// ligne trop longue (jetee jusqu'a sa fin, `buf` vide), None la fin de l'entree.
+pub fn next_line<R: BufRead>(r: &mut R, max: usize, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut over = false;
+    let mut any = false;
+    loop {
+        let avail = match r.fill_buf() {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            // la fin : une derniere ligne sans LF compte encore
+            return Ok(if !any { None } else { Some(fin(buf, over, max)) });
+        }
+        any = true;
+        let (chunk, done) = match avail.iter().position(|b| *b == b'\n') {
+            Some(i) => (&avail[..i], Some(i + 1)),
+            None => (avail, None),
+        };
+        if !over {
+            if buf.len() + chunk.len() > max + 1 {
+                over = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        let used = done.unwrap_or(avail.len());
+        r.consume(used);
+        if done.is_some() {
+            return Ok(Some(fin(buf, over, max)));
+        }
+    }
+}
+
+/// la fin d'une ligne : sans son CR ; plus longue que `max`, jetee
+fn fin(buf: &mut Vec<u8>, over: bool, max: usize) -> bool {
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    if over || buf.len() > max {
+        buf.clear();
+        return false;
+    }
+    true
 }
 
 /// (20 nov., relecture) le delai apres la fermeture de l'entree, avant que l'enfant ne s'arrete de lui-meme
@@ -297,6 +388,7 @@ fn write_state(dir: &Path, path: &Path, blob: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn host_main(a: HostArgs) -> i32 {
+    safe_dll_search();
     // (20 nov., relecture de securite) une panique arrete l'enfant aussitot : derouler le fil de l'interface liberait le
     // plugin pendant que le fil audio ou celui du direct l'appelle encore (ses pointeurs bruts, SendBox). Seulement dans
     // l'enfant : les plugins Uppwind Link charges par un DAW gardent leur comportement.
@@ -462,11 +554,15 @@ fn run(a: HostArgs) -> Result<(), String> {
         let lv = live.clone();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let Ok(l) = line else { break };
-                if l.len() > 16384 {
+            let mut rd = stdin.lock();
+            let mut buf = Vec::new();
+            // (23 nov., 0.4.14) une ligne trop longue n'est jamais gardee en memoire : jetee au fil de la lecture
+            while let Ok(Some(ok)) = next_line(&mut rd, LINE_MAX, &mut buf) {
+                if !ok {
                     continue;
                 }
+                let Ok(l) = std::str::from_utf8(&buf) else { continue };
+                let l = l.to_string();
                 // (19 nov., etape 3b) le son d'un effet en direct : tout droit au fil du direct, jamais par l'interface
                 if l.starts_with("{\"cmd\":\"in\"") {
                     live_in(&lv, &l);
@@ -648,7 +744,8 @@ fn run(a: HostArgs) -> Result<(), String> {
                         };
                         // le direct s'arrete le temps du rendu (le meme processeur), et reprend
                         let _g = live.busy.lock().unwrap();
-                        let r = render(&mut inst, &job);
+                        // (23 nov., 0.4.14, relecture) une defense de plus : seulement les fichiers de rendu du compagnon
+                        let r = if job_paths_ok(&job.input, &job.output, &a.states_dir) { render(&mut inst, &job) } else { Err("these are not the companion's render files".into()) };
                         if live.on.load(Ordering::Relaxed) {
                             let lr = f64::from_bits(live.rate_bits.load(Ordering::Relaxed));
                             if inst.start_mode(lr, LIVE_BLOCK as i32, false).is_ok() {
@@ -798,6 +895,24 @@ pub struct RenderJob {
 /// Plafonds d'un rendu : 10 minutes d'entree (FREEZE_MAX_SECONDS du studio), 30 s de queue.
 pub const RENDER_MAX_SECONDS: f64 = 600.0;
 pub const RENDER_TAIL_MAX_SECONDS: f64 = 30.0;
+
+/// (23 nov., 0.4.14, relecture « les chemins in et out du rendu ne sont pas controles cote enfant ») Les fichiers d'un
+/// rendu sont ceux que le compagnon nomme (host.rs, job_paths) : dans le dossier jobs/ voisin de --states-dir,
+/// « job-<pid>-<n>.in » et le « .out » du meme nom. Rien d'autre n'est lu ni ecrit.
+pub fn job_paths_ok(input: &Path, output: &Path, states_dir: &Path) -> bool {
+    let Some(jobs) = states_dir.parent().map(|d| d.join("jobs")) else { return false };
+    let name_ok = |p: &Path, ext: &str| -> Option<String> {
+        if p.parent()? != jobs {
+            return None;
+        }
+        let n = p.file_name()?.to_str()?;
+        let stem = n.strip_prefix("job-")?.strip_suffix(ext)?;
+        let (pid, k) = stem.split_once('-')?;
+        let digits = |x: &str| !x.is_empty() && x.len() <= 10 && x.bytes().all(|b| b.is_ascii_digit());
+        (digits(pid) && digits(k)).then(|| stem.to_string())
+    };
+    matches!((name_ok(input, ".in"), name_ok(output, ".out")), (Some(a), Some(b)) if a == b)
+}
 
 /// Le rendu, dans le fil de l'interface (l'editeur ne se dessine pas pendant, quelques secondes au plus) : le plugin
 /// passe en kOffline a la frequence du son, recoit d'abord la valeur de chaque parametre telle que son editeur la
@@ -1000,8 +1115,12 @@ fn live_loop(lv: Arc<Live>, tr: Arc<Transport>, proc_ptr: SendBox<*mut IAudioPro
             }
         }
         let lat = lv.latency.load(Ordering::Relaxed) as i64;
+        let gen = lv.gen.load(Ordering::Relaxed);
         lv.done.fetch_add(1, Ordering::Relaxed);
-        out(json!({ "event": "out", "gen": lv.gen.load(Ordering::Relaxed), "pos": pos as i64 - lat, "d": crate::b64::encode_f32(&y) }));
+        // (23 nov., 0.4.14, relecture) le processeur rendu AVANT d'ecrire : un compagnon qui lit lentement ne bloque
+        // jamais un rendu ni l'arret du direct
+        drop(_g);
+        out(json!({ "event": "out", "gen": gen, "pos": pos as i64 - lat, "d": crate::b64::encode_f32(&y) }));
     }
 }
 
@@ -1347,5 +1466,54 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left.len(), 1, "no temporary file left: {left:?}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // (23 nov., 0.4.14) une ligne trop longue est jetee sans etre gardee, les suivantes passent
+    #[test]
+    fn long_lines_are_dropped_as_they_come() {
+        let mut long = vec![b'x'; 100_000];
+        long.push(b'\n');
+        let mut data = b"{\"cmd\":\"a\"}\r\n".to_vec();
+        data.extend_from_slice(&long);
+        data.extend_from_slice(b"\n{\"cmd\":\"b\"}");
+        // un petit tampon : la longue ligne arrive en beaucoup de morceaux
+        let mut r = std::io::BufReader::with_capacity(64, &data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), Some(true));
+        assert_eq!(buf, b"{\"cmd\":\"a\"}");
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), Some(false));
+        // la ligne fait 100 000 octets ; le tampon ne passe jamais deux fois LINE_MAX (sa croissance par doublement)
+        assert!(buf.capacity() <= 2 * (LINE_MAX + 64), "never kept: {}", buf.capacity());
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), Some(true));
+        assert!(buf.is_empty(), "the empty line");
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), Some(true));
+        assert_eq!(buf, b"{\"cmd\":\"b\"}", "the last line, without its newline");
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), None);
+        // exactement LINE_MAX octets : gardee ; un de plus : jetee
+        let mut edge = vec![b'y'; LINE_MAX];
+        edge.extend_from_slice(b"\r\n");
+        edge.extend_from_slice(&vec![b'z'; LINE_MAX + 1]);
+        edge.push(b'\n');
+        let mut r = std::io::BufReader::with_capacity(100, &edge[..]);
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), Some(true));
+        assert_eq!(buf.len(), LINE_MAX);
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), Some(false));
+        assert_eq!(next_line(&mut r, LINE_MAX, &mut buf).unwrap(), None);
+    }
+
+    // (23 nov., 0.4.14) seulement les fichiers de rendu que le compagnon nomme
+    #[test]
+    fn only_the_companion_render_files() {
+        let data = std::env::temp_dir().join("uw-data");
+        let states = data.join("plugin-states");
+        let jobs = data.join("jobs");
+        assert!(job_paths_ok(&jobs.join("job-1234-7.in"), &jobs.join("job-1234-7.out"), &states));
+        assert!(!job_paths_ok(&jobs.join("job-1234-7.in"), &jobs.join("job-1234-8.out"), &states), "the same job");
+        assert!(!job_paths_ok(&jobs.join("job-1234-7.in"), &data.join("job-1234-7.out"), &states), "in jobs/");
+        assert!(!job_paths_ok(&jobs.join("job-1234-7.in"), &jobs.join("..").join("x.out"), &states));
+        assert!(!job_paths_ok(&jobs.join("job-1234-7.in"), &jobs.join("evil.dll"), &states));
+        assert!(!job_paths_ok(&jobs.join("job-a-7.in"), &jobs.join("job-a-7.out"), &states));
+        assert!(!job_paths_ok(Path::new(""), Path::new(""), &states));
+        assert!(!job_paths_ok(&jobs.join("job-1-1.in"), &jobs.join("job-1-1.out"), Path::new("")), "no data folder");
     }
 }

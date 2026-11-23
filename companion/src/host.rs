@@ -252,7 +252,7 @@ pub fn configure(state_file: PathBuf) {
     };
     // (20 nov.) un compagnon d'essai : nos plugins d'une autre version (celle de la branche), jamais ceux de la page —
     // seulement l'environnement de qui lance le compagnon
-    let link_bundle = std::env::var_os("UWL_HOST_LINK_BUNDLE").map(PathBuf::from).filter(|p| p.join("Contents").is_dir()).unwrap_or(link_bundle);
+    let link_bundle = uwl_vst3host::dev_env("UWL_HOST_LINK_BUNDLE").map(PathBuf::from).filter(|p| p.join("Contents").is_dir()).unwrap_or(link_bundle);
     // (20 nov., relecture de securite macOS) sur Mac, les plugins se chargent dans uppwind-link-host (src/bin), le seul
     // programme signe avec l'autorisation de charger des bibliotheques d'autres editeurs ; le compagnon reste strict. Pose
     // a cote du compagnon (le .dmg, --install) ; absent (une construction depuis les sources), le compagnon lui-meme.
@@ -372,6 +372,42 @@ pub fn find_modules(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 }
 
 /// La taille et la date d'un module (un paquet : celles du binaire qu'il contient).
+/// (23 nov., 0.4.14, relecture macOS « le controle du cache ne verifie pas forcement le bon binaire ») Sur Mac, CFBundle
+/// charge le binaire que nomme l'Info.plist, pas forcement Contents/MacOS/<nom> : l'empreinte d'un paquet y est faite
+/// de TOUT Contents/MacOS et de Contents/Info.plist (la somme des tailles, la date la plus recente).
+#[cfg(target_os = "macos")]
+fn stamp(p: &Path) -> (u64, u64) {
+    if !p.is_dir() {
+        return (0, 0);
+    }
+    bundle_stamp(p)
+}
+
+/// L'empreinte d'un paquet Mac : Contents/Info.plist et les fichiers de Contents/MacOS (sans suivre les liens).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bundle_stamp(p: &Path) -> (u64, u64) {
+    let secs = |m: &std::fs::Metadata| m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let (mut size, mut time) = (0u64, 0u64);
+    let mut add = |m: std::fs::Metadata| {
+        if m.is_file() {
+            size = size.wrapping_add(m.len());
+            time = time.max(secs(&m));
+        }
+    };
+    if let Ok(m) = std::fs::symlink_metadata(p.join("Contents").join("Info.plist")) {
+        add(m);
+    }
+    if let Ok(rd) = std::fs::read_dir(p.join("Contents").join("MacOS")) {
+        for e in rd.flatten().take(256) {
+            if let Ok(m) = std::fs::symlink_metadata(e.path()) {
+                add(m);
+            }
+        }
+    }
+    (size, time)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn stamp(p: &Path) -> (u64, u64) {
     let bin = uwl_vst3host::vsthost::dll_of_bundle(p);
     let m = std::fs::metadata(&bin).or_else(|_| std::fs::metadata(p));
@@ -787,7 +823,7 @@ fn add(plugin: &str, state: Option<&str>, rate: Option<u32>) -> Result<Value, St
     }
     cmd.env("UWL_STATE_FILE", &c.state_file).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     // (20 nov.) les essais des menus (UWL_HOST_MENU_LOG=1, macui) : ce que l'enfant ecrit va au journal du compagnon
-    if std::env::var("UWL_HOST_MENU_LOG").as_deref() == Ok("1") {
+    if uwl_vst3host::dev_env("UWL_HOST_MENU_LOG").is_some_and(|v| v == "1") {
         cmd.stderr(Stdio::inherit());
     }
     hidden(&mut cmd);
@@ -1109,8 +1145,57 @@ fn status_json() -> Value {
 
 /// Une demande du studio (deja armee, verifiee par session.rs). La reponse part par `reply` (un fil a part : charger un
 /// plugin prend des secondes, la connexion ne s'arrete jamais).
+/// (23 nov., 0.4.14, relecture « un fil par message et sans limite ») Au plus tant de demandes en cours a la fois, toutes
+/// connexions comprises, et au plus MAX_PER_PLUGIN pour un meme plugin heberge (une demande avec `id`) : un plugin fige
+/// n'occupe que ses places, les autres continuent. Au-dela, la demande est refusee tout de suite (« busy »), sans fil.
+pub const MAX_IN_FLIGHT: usize = 64;
+pub const MAX_PER_PLUGIN: usize = 8;
+static IN_FLIGHT: Mutex<(usize, Vec<(u32, usize)>)> = Mutex::new((0, Vec::new()));
+
+/// Une place, rendue quand la demande se termine (meme sur une panique).
+struct Place(Option<u32>);
+
+impl Place {
+    fn take(id: Option<u32>) -> Option<Place> {
+        let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0 >= MAX_IN_FLIGHT {
+            return None;
+        }
+        if let Some(id) = id {
+            match g.1.iter_mut().find(|(k, _)| *k == id) {
+                Some((_, n)) if *n >= MAX_PER_PLUGIN => return None,
+                Some((_, n)) => *n += 1,
+                None => g.1.push((id, 1)),
+            }
+        }
+        g.0 += 1;
+        Some(Place(id))
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = g.0.saturating_sub(1);
+        if let Some(id) = self.0 {
+            if let Some(at) = g.1.iter().position(|(k, _)| *k == id) {
+                g.1[at].1 -= 1;
+                if g.1[at].1 == 0 {
+                    g.1.swap_remove(at);
+                }
+            }
+        }
+    }
+}
+
 pub fn request(v: Value, reply: Sender<String>) {
+    let Some(place) = Place::take(v["id"].as_u64().map(|x| x.min(u32::MAX as u64) as u32)) else {
+        let msg = json!({ "type": "host", "action": v["action"], "error": "the companion is busy: too many requests at once", "n": v["n"], "id": v["id"], "plugin": v["plugin"] });
+        let _ = reply.send(msg.to_string());
+        return;
+    };
     std::thread::spawn(move || {
+        let _place = place;
         let action = v["action"].as_str().unwrap_or("").to_string();
         let r: Result<Value, String> = (|| {
             cfg()?;
@@ -1316,5 +1401,48 @@ mod tests {
         assert!(!ok(i64::MIN));
         assert!(!ok(i64::MAX));
         assert!(ok(-(1i64 << 53)) && ok(1i64 << 53) && ok(0));
+    }
+
+    // (23 nov., 0.4.14) au plus MAX_PER_PLUGIN demandes pour un plugin, MAX_IN_FLIGHT en tout ; une place rendue se reprend
+    #[test]
+    fn requests_in_flight_are_capped() {
+        let mut frozen = Vec::new();
+        while let Some(s) = Place::take(Some(7)) {
+            frozen.push(s);
+            assert!(frozen.len() <= MAX_PER_PLUGIN);
+        }
+        assert_eq!(frozen.len(), MAX_PER_PLUGIN, "a frozen plugin holds only its own places");
+        let other = Place::take(Some(8));
+        assert!(other.is_some(), "another plugin still gets one");
+        drop(other);
+        let mut all = Vec::new();
+        while let Some(s) = Place::take(None) {
+            all.push(s);
+            assert!(all.len() + frozen.len() <= MAX_IN_FLIGHT);
+        }
+        assert!(Place::take(Some(9)).is_none(), "the global cap holds too");
+        all.pop();
+        assert!(Place::take(None).is_some(), "a returned place is taken again");
+        drop(all);
+        frozen.pop();
+        assert!(Place::take(Some(7)).is_some());
+    }
+
+    // (23 nov., 0.4.14) l'empreinte d'un paquet Mac change avec n'importe quel binaire de Contents/MacOS ou l'Info.plist
+    #[test]
+    fn a_bundle_stamp_covers_every_binary() {
+        let d = std::env::temp_dir().join(format!("uw-host-stamp-p{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let b = d.join("Synth.vst3");
+        std::fs::create_dir_all(b.join("Contents").join("MacOS")).unwrap();
+        std::fs::write(b.join("Contents").join("Info.plist"), b"<plist/>").unwrap();
+        std::fs::write(b.join("Contents").join("MacOS").join("Synth"), b"abc").unwrap();
+        let a = bundle_stamp(&b);
+        assert_eq!(a.0, 8 + 3);
+        std::fs::write(b.join("Contents").join("MacOS").join("SynthReal"), b"defgh").unwrap();
+        assert_eq!(bundle_stamp(&b).0, 8 + 3 + 5, "the binary the Info.plist names may be another one");
+        std::fs::write(b.join("Contents").join("Info.plist"), b"<plist>x</plist>").unwrap();
+        assert_ne!(bundle_stamp(&b).0, 8 + 3 + 5);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

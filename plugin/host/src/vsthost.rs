@@ -344,6 +344,10 @@ impl Module {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH};
         let dll = dll_of_bundle(bundle);
+        // (23 nov., 0.4.14, relecture) un chemin absolu seulement : LOAD_WITH_ALTERED_SEARCH_PATH n'est defini que pour lui
+        if !dll.is_absolute() {
+            return Err(format!("not an absolute path: {}", dll.display()));
+        }
         if !dll.is_file() {
             return Err(format!("no plugin module at {}", dll.display()));
         }

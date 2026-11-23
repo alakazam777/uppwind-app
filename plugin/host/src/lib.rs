@@ -16,3 +16,14 @@ pub mod vsthost;
 pub mod child;
 #[cfg(target_os = "macos")]
 pub mod macui;
+
+/// (23 nov., 0.4.14, relecture macOS) Une variable d'environnement d'essai (UWL_HOST_LINK_BUNDLE, UWL_HOST_MENU_LOG,
+/// UWL_HOST_SNAP_DIR, UWL_HOST_PARK) : lue seulement par une version de developpement (debug, ou construite avec
+/// UWL_DEV_BUILD=1 : les scripts d'essai de docs/handoff/hote-vst3-macos-*) ; une version publiee ne la voit jamais.
+pub fn dev_env(name: &str) -> Option<std::ffi::OsString> {
+    if cfg!(debug_assertions) || matches!(option_env!("UWL_DEV_BUILD"), Some("1")) {
+        std::env::var_os(name)
+    } else {
+        None
+    }
+}

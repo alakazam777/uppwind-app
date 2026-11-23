@@ -113,7 +113,25 @@ fn refresh(w: Win) {
         *FRAME.lock().unwrap() = [r.o.x, r.o.y, r.s.w, r.s.h];
         WIN_NUM.store(send!(w as Id, c"windowNumber" => isize), Ordering::Relaxed);
     }
+    TITLEBAR.store(titlebar(w).to_bits(), Ordering::Relaxed);
     WIN_PTR.store(w, Ordering::Relaxed);
+}
+
+/// (23 nov., 0.4.14) la hauteur de la barre de titre (points), relue avec le cadre : les gestes du studio restent sous elle
+static TITLEBAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (23 nov., 0.4.14, relecture macOS « un glisser sur la barre de titre cachee deplace l'editeur ») Un point du studio
+/// (points, haut a gauche de la fenetre, barre de titre comprise). AppKit ne deplace une fenetre que sur un APPUI dans sa
+/// barre de titre : un appui hors de la zone de l'editeur (x dans [0, fw], y dans [tb, fh]) est jete (None). Un
+/// deplacement, un glisser ou un relachement passe tel quel (un potard qu'on tire au-dela du bord tourne encore).
+pub fn bound_point(x: f64, y: f64, fw: f64, fh: f64, tb: f64, press: bool) -> Option<(f64, f64)> {
+    let (fw, fh) = (fw.max(0.0), fh.max(0.0));
+    let tb = tb.clamp(0.0, fh);
+    let inside = (0.0..=fw).contains(&x) && (tb..=fh).contains(&y);
+    if press && !inside {
+        return None;
+    }
+    Some((x.clamp(-16384.0, 16384.0), y.clamp(-16384.0, 16384.0)))
 }
 
 /// Le genre d'evenement « defini par l'appli » (NSEventTypeApplicationDefined) et nos sous-types (data1).
@@ -139,10 +157,10 @@ pub enum Park {
 const PARK_DEFAULT: Park = Park::Behind;
 
 pub fn park_mode() -> Park {
-    match std::env::var("UWL_HOST_PARK").as_deref() {
-        Ok("offscreen") => Park::Offscreen,
-        Ok("alpha") => Park::Alpha,
-        Ok("behind") => Park::Behind,
+    match crate::dev_env("UWL_HOST_PARK").and_then(|v| v.into_string().ok()).as_deref() {
+        Some("offscreen") => Park::Offscreen,
+        Some("alpha") => Park::Alpha,
+        Some("behind") => Park::Behind,
         _ => PARK_DEFAULT,
     }
 }
@@ -251,7 +269,7 @@ fn t_log() -> f64 {
 }
 
 fn menu_log() -> bool {
-    *MENU_LOG.get_or_init(|| std::env::var("UWL_HOST_MENU_LOG").map(|v| v == "1").unwrap_or(false))
+    *MENU_LOG.get_or_init(|| crate::dev_env("UWL_HOST_MENU_LOG").is_some_and(|v| v == "1"))
 }
 
 /// Un menu du plugin est-il ouvert (en cours de suivi) ?
@@ -655,7 +673,7 @@ extern "C" {
 /// (20 nov., l'essai) les images de nos fenetres (l'editeur et les menus ouverts) en PNG dans UWL_HOST_SNAP_DIR : un
 /// processus filme ses propres fenetres sans l'autorisation « Enregistrement de l'ecran » (les essais par ssh).
 extern "C" fn menu_snap(_this: Id, _sel: Sel, _arg: Id) {
-    let Ok(dir) = std::env::var("UWL_HOST_SNAP_DIR") else { return };
+    let Some(dir) = crate::dev_env("UWL_HOST_SNAP_DIR").and_then(|v| v.into_string().ok()) else { return };
     type CreateImage = unsafe extern "C" fn(Rect, u32, u32, u32) -> *mut c_void;
     unsafe {
         let p = dlsym(-2isize as *mut c_void, c"CGWindowListCreateImage".as_ptr()); // RTLD_DEFAULT
@@ -1073,7 +1091,8 @@ pub fn gesture(v: &serde_json::Value) {
     if wn <= 0 {
         return;
     }
-    let [fx, fy, _fw, fh] = *FRAME.lock().unwrap();
+    let [fx, fy, fw, fh] = *FRAME.lock().unwrap();
+    let tb = f64::from_bits(TITLEBAR.load(Ordering::Relaxed));
     let num = |k: &str| v[k].as_f64().filter(|x| x.is_finite()).unwrap_or(0.0);
     if menu_log() {
         eprintln!("uwl-menu {:.3}: gesture {} ty {} menu open {}", t_log(), v["cmd"], v["ty"], menu_open());
@@ -1102,6 +1121,12 @@ pub fn gesture(v: &serde_json::Value) {
                     objc_autoreleasePoolPop(pool);
                     return;
                 }
+                // (0.4.14) hors d'un menu : un appui dans la zone de l'editeur seulement (jamais sur la barre de titre cachee)
+                let Some((bx, by)) = bound_point(num("x"), num("y"), fw, fh, tb, matches!(ty, 1 | 3 | 25)) else {
+                    objc_autoreleasePoolPop(pool);
+                    return;
+                };
+                let loc = Pt { x: bx, y: fh - by };
                 send!(class(c"NSEvent"), c"mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:",
                     usize = ty, Pt = loc, usize = flags as usize, f64 = now, isize = wn, Id = std::ptr::null_mut(), isize = 0, isize = clicks, f32 = pressure => Id)
             }
@@ -1114,6 +1139,8 @@ pub fn gesture(v: &serde_json::Value) {
                 }
                 // l'ecran : le point de la fenetre en coordonnees Cocoa (bas a gauche de l'ecran principal), puis
                 // CoreGraphics (haut a gauche)
+                let (bx, by) = bound_point(num("x"), num("y"), fw, fh, tb, false).unwrap_or((0.0, tb));
+                let loc = Pt { x: bx, y: fh - by };
                 let main_h = CGDisplayBounds(CGMainDisplayID()).s.h;
                 CGEventSetLocation(ce, Pt { x: fx + loc.x, y: main_h - (fy + loc.y) });
                 CGEventSetFlags(ce, flags);
@@ -1154,5 +1181,23 @@ pub fn raise_priority() {
     // QOS_CLASS_USER_INTERACTIVE
     unsafe {
         pthread_set_qos_class_self_np(0x21, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bound_point;
+
+    // (23 nov., 0.4.14) un appui sur la barre de titre cachee est jete ; un glisser y est ramene sous elle
+    #[test]
+    fn gestures_stay_under_the_title_bar() {
+        // une fenetre de 400 x 300 points, barre de titre de 28
+        assert_eq!(bound_point(10.0, 5.0, 400.0, 300.0, 28.0, true), None, "a press on the title bar");
+        assert_eq!(bound_point(-1.0, 100.0, 400.0, 300.0, 28.0, true), None);
+        assert_eq!(bound_point(401.0, 100.0, 400.0, 300.0, 28.0, true), None);
+        assert_eq!(bound_point(10.0, 100.0, 400.0, 300.0, 28.0, true), Some((10.0, 100.0)));
+        assert_eq!(bound_point(10.0, 5.0, 400.0, 300.0, 28.0, false), Some((10.0, 5.0)), "a drag passes as before");
+        assert_eq!(bound_point(-99999.0, 99999.0, 400.0, 300.0, 28.0, false), Some((-16384.0, 16384.0)));
+        assert_eq!(bound_point(1.0, 1.0, 0.0, 0.0, 28.0, true), None, "no frame yet: no press");
     }
 }
