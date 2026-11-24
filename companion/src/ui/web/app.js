@@ -459,9 +459,10 @@
             h('div', { class: 'uw-card-title' }, `Uppwind Link ${s.version}`),
             h('div', { class: 'uw-card-body is-flush' }, line, updButtons, last,
                 check('Update automatically', !!U.auto, (v) => send('autoupdate', { on: v }), {
-                    disabled: !running || !U.supported,
-                    sub: U.supported ? 'Checks GitHub every 6 hours and installs a newer version by itself, while the studio is not connected. Off until you tick it.'
-                        : 'Updates from the app are for Windows: download the new version from its release page.',
+                    disabled: !running || !U.supported || U.auto_available === false,
+                    sub: !U.supported ? 'Updates from the app are for Windows: download the new version from its release page.'
+                        : U.auto_available === false ? 'Not available yet: updates are not signed yet, so an update is installed only when you click Update.'
+                        : 'Checks GitHub every 6 hours and installs a newer version by itself, while the studio is not connected. Off until you tick it.',
                 }),
                 h('p', { class: 'uw-small' }, 'Updates are the only time Uppwind Link itself goes on the internet, and only to its GitHub releases (github.com/alakazam777/uppwind-app). Show on Discord, when you turn it on, hands what you play to the Discord app on this computer, and Discord publishes it on your profile. Each download is checked against the SHA-256 published with the release before it is installed. The program is not code-signed yet, so the check proves the file is the one published there, not who published it.')));
         return [

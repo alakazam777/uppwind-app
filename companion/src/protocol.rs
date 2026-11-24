@@ -175,6 +175,46 @@ pub enum ClientMsg {
 pub const MAX_LINK_CHUNK_HEX: usize = 2 * 212;
 pub const MAX_LINK_CHUNKS: usize = 32;
 
+/// (24 nov., audit M2) Les commandes du lien qui changent le projet du DAW sans retour simple : ADD (une piste et un
+/// instrument charge), REMOVE (une piste effacee), PARAM_SET (un parametre d'un plugin). Seulement arme (session.rs) ;
+/// les autres (la liste, jouer, le volume, le tempo) comme avant. Les codes : shared/uwlink_protocol.py.
+pub const LINK_ARMED_ONLY: &[u8] = &[0x42, 0x44, 0x36];
+/// Au plus tant de morceaux du lien par seconde et par connexion (une rafale d'ADD figeait Live).
+pub const MAX_LINK_CHUNKS_PER_SEC: u32 = 64;
+
+/// La commande d'un morceau du lien (deja verifie par `link_chunk_ok`) : l'octet qui suit F0 7D 55 57 <version>.
+pub fn link_chunk_cmd(h: &str) -> Option<u8> {
+    h.get(10..12).and_then(|c| u8::from_str_radix(c, 16).ok())
+}
+
+/// (24 nov., relecture) La reponse du lien a une demande refusee desarme : un vrai message ERROR du protocole (F0 7D 55 57
+/// 01 7F <req> 00 01 {"code":"unsupported","msg":…} F7), un par demande refusee, pour que le studio la rejette tout de
+/// suite avec ce texte (link.js), au lieu d'attendre sa reponse 20 s.
+pub fn link_refusals(chunks: &[String], msg: &str) -> Vec<String> {
+    let mut reqs: Vec<u8> = Vec::new();
+    for h in chunks.iter().filter(|h| link_chunk_ok(h)) {
+        let (Some(cmd), Some(req)) = (link_chunk_cmd(h), h.get(12..14).and_then(|c| u8::from_str_radix(c, 16).ok())) else { continue };
+        if LINK_ARMED_ONLY.contains(&cmd) && req != 0 && !reqs.contains(&req) {
+            reqs.push(req);
+        }
+    }
+    let text: String = msg.chars().filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '"' && *c != '\\').take(150).collect();
+    let data = format!("{{\"code\":\"unsupported\",\"msg\":\"{text}\"}}");
+    reqs.into_iter()
+        .map(|req| {
+            let mut b = vec![0xF0u8, 0x7D, 0x55, 0x57, 0x01, 0x7F, req, 0x00, 0x01];
+            b.extend_from_slice(data.as_bytes());
+            b.push(0xF7);
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        })
+        .collect()
+}
+
+/// Un message du lien porte-t-il une commande permise seulement arme ?
+pub fn link_needs_arming(chunks: &[String]) -> bool {
+    chunks.iter().filter(|h| link_chunk_ok(h)).any(|h| link_chunk_cmd(h).is_some_and(|c| LINK_ARMED_ONLY.contains(&c)))
+}
+
 pub fn link_chunk_ok(h: &str) -> bool {
     let b = h.as_bytes();
     b.len() >= 20
@@ -497,6 +537,19 @@ mod tests {
         assert_eq!(parse(r#"{"type":"bank","dir":"right"}"#), Ok(ClientMsg::Bank { dir: "right".into() }));
         assert!(parse(r#"{"type":"bank"}"#).is_err(), "a direction is needed");
         assert!(parse(r#"{"type":"link","sysex":[1,2]}"#).is_err());
+        // (24 nov., audit M2) ADD, REMOVE, PARAM_SET : armé seulement ; LIST, SET, TEMPO : comme avant
+        let chunk = |cmd: &str| format!("f07d555701{cmd}010001{}f7", "7b7d");
+        assert_eq!(link_chunk_cmd(&chunk("42")), Some(0x42));
+        assert!(link_needs_arming(&[chunk("10"), chunk("42")]), "an ADD in the message");
+        assert!(link_needs_arming(&[chunk("44")]) && link_needs_arming(&[chunk("36")]));
+        assert!(!link_needs_arming(&[chunk("10"), chunk("30"), chunk("50"), chunk("20")]), "LIST, SET, TEMPO, BIND");
+        // (24 nov., relecture) le refus : un ERROR du protocole, par demande refusee (son numero), lisible par le studio
+        let r = link_refusals(&[chunk("10"), chunk("42")], "needs \"Remote control\"");
+        assert_eq!(r.len(), 1);
+        assert!(link_chunk_ok(&r[0]) && r[0].len() <= MAX_LINK_CHUNK_HEX, "{}", r[0]);
+        assert_eq!(&r[0][..18], "f07d5557017f010001", "ERROR, req 1, seq 0, last");
+        let json: Vec<u8> = (18..r[0].len() - 2).step_by(2).map(|i| u8::from_str_radix(&r[0][i..i + 2], 16).unwrap()).collect();
+        assert_eq!(String::from_utf8(json).unwrap(), r#"{"code":"unsupported","msg":"needs Remote control"}"#);
         assert!(!link_chunk_ok("f07d55570101010001"), "too short");
         assert!(link_chunk_ok("F07D555701010100017b7df7"));
         assert!(!link_chunk_ok("f07d555701010100017b7df"), "odd length");

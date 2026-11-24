@@ -965,7 +965,7 @@ def merged_script_opens_plugin_windows_and_keeps_the_midi_link():
     s = UppwindLink.create_instance(c)
     try:
         st = uwlink_dev.read_state(state)
-        assert st["script"] == "UppwindLink" and st["version"] == "1.3.1" and st["editor"] == EC.EDITOR_VERSION, st
+        assert st["script"] == "UppwindLink" and st["version"] == "1.3.2" and st["editor"] == EC.EDITOR_VERSION, st
         assert st["link"] == 2, "the companion learns that LINK is served here, and that an empty read may wait"
         assert st["port"] == s._uw_chan.port and len(st["token"]) == 64
         # le compagnon : LIST, EDITOR_OPEN / STATE / CLOSE, EVENTS — par le vrai UDP

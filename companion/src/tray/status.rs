@@ -50,7 +50,9 @@ fn now() -> u64 {
 }
 
 fn origin_text(o: &str) -> String {
-    o.chars().filter(|c| !c.is_control()).take(120).collect()
+    // (24 nov., audit F16) ni caractere de controle, ni caractere qui retourne le sens d'ecriture ou
+    // se cache (U+202E…) : un nom de piste ou de plugin ne reecrit pas la ligne de la fenetre d'etat
+    o.chars().filter(|c| !c.is_control() && !crate::discord::invisible(*c)).take(120).collect()
 }
 
 /// session.rs : un studio vient de s'appairer (le bon jeton).

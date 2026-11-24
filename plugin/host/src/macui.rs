@@ -195,6 +195,12 @@ unsafe fn key_event(ty: usize, flags: usize, text: &str, kc: u16) -> Id {
         usize = ty, Pt = Pt { x: 0.0, y: 0.0 }, usize = flags, f64 = now, isize = WIN_NUM.load(Ordering::Relaxed), Id = std::ptr::null_mut(), Id = s, Id = s, i8 = 0, u16 = kc => Id)
 }
 
+/// (24 nov., audit M9) Une touche permise pendant qu'un menu du plugin est ouvert : les fleches, Entree (les deux) et
+/// Echap, sans texte.
+pub fn menu_key_ok(kc: u16, text: &str) -> bool {
+    matches!(kc, 123..=126 | 36 | 76 | 53) && text.chars().all(|c| c.is_control() || ('\u{F700}'..='\u{F8FF}').contains(&c))
+}
+
 extern "C" fn key_now(_this: Id, _sel: Sel, _arg: Id) {
     let q: Vec<(usize, usize, String, u16)> = KEY_Q.lock().unwrap().drain(..).collect();
     unsafe {
@@ -210,7 +216,12 @@ extern "C" fn key_now(_this: Id, _sel: Sel, _arg: Id) {
                 continue;
             }
             if menu_open() {
-                send!(a, c"postEvent:atStart:", Id = e, i8 = 0 => ());
+                // (24 nov., audit M9) pendant un menu, seulement ce qui s'y deplace (fleches, Entree, Echap), sans texte :
+                // une frappe mise en file ici serait lue, une fois le menu ferme, par la boite de dialogue que son article
+                // ouvre (« Save as… »), que le studio ne voit pas
+                if menu_key_ok(kc, &text) {
+                    send!(a, c"postEvent:atStart:", Id = e, i8 = 0 => ());
+                }
                 continue;
             }
             let held = !send!(a, c"modalWindow" => Id).is_null() || !send!(w, c"attachedSheet" => Id).is_null();
@@ -348,6 +359,8 @@ extern "C" fn menu_ended(_this: Id, _sel: Sel, note: Id) {
             eprintln!("uwl-menu {:.3}: ended depth {d} highlighted {:?}", t_log(), if h.is_null() { None } else { Some(utf8(send!(h, c"title" => Id))) });
         }
         if d == 0 {
+            // (24 nov., audit M9) les touches encore en file pour le menu ne vont a rien d'autre (une boite qu'il ouvre)
+            send!(app(), c"discardEventsMatchingMask:beforeEvent:", usize = (1usize << 10) | (1usize << 11), Id = std::ptr::null_mut() => ());
             MENU_ROOT.store(0, Ordering::SeqCst);
             PRESSED.with(|p| p.set(None));
             crate::child::out(serde_json::json!({ "event": "menu", "open": false }));
@@ -470,8 +483,7 @@ unsafe fn menu_mouse_one(ty: usize, p: Pt, flags: usize, clicks: isize) {
     let up = matches!(ty, 2 | 4 | 26);
     if !menu_open() {
         // le menu s'est ferme entre-temps : le geste va a la fenetre, comme les autres (le point, relatif a elle)
-        let [fx, fy, _, _] = *FRAME.lock().unwrap();
-        post_mouse_main(ty, Pt { x: p.x - fx, y: p.y - fy }, flags, clicks);
+        post_mouse_bounded(ty, p, flags, clicks, down);
         return;
     }
     let hit = menu_hit(p);
@@ -482,8 +494,7 @@ unsafe fn menu_mouse_one(ty: usize, p: Pt, flags: usize, clicks: isize) {
         if down {
             // hors des menus : le clic les ferme (pose tel quel, la boucle de suivi le prend pour un clic a cote)
             PRESSED.with(|c| c.set(None));
-            let [fx, fy, _, _] = *FRAME.lock().unwrap();
-            post_mouse_main(ty, Pt { x: p.x - fx, y: p.y - fy }, flags, clicks);
+            post_mouse_bounded(ty, p, flags, clicks, down);
         }
         return;
     };
@@ -514,6 +525,16 @@ unsafe fn menu_mouse_one(ty: usize, p: Pt, flags: usize, clicks: isize) {
     for (kc, ch) in keys {
         post_key_main(kc, ch);
     }
+}
+
+/// (24 nov., relecture des corrections) Un geste venu du chemin des menus, pour la fenetre : `p` le point de l'ecran (Cocoa). Un appui
+/// hors de la zone de l'editeur (sur la barre de titre cachee) est jete, comme hors d'un menu (bound_point).
+unsafe fn post_mouse_bounded(ty: usize, p: Pt, flags: usize, clicks: isize, press: bool) {
+    let [fx, fy, fw, fh] = *FRAME.lock().unwrap();
+    let tb = f64::from_bits(TITLEBAR.load(Ordering::Relaxed));
+    let (x, y_img) = (p.x - fx, fh - (p.y - fy));
+    let Some((bx, by)) = bound_point(x, y_img, fw, fh, tb, press) else { return };
+    post_mouse_main(ty, Pt { x: bx, y: fh - by }, flags, clicks);
 }
 
 /// (fil principal) poser un geste de souris pour notre fenetre (le point dans la fenetre, Cocoa : bas a gauche)

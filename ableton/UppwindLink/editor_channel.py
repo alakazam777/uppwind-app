@@ -166,7 +166,13 @@ class LocalChannel(object):
         data.update(self.info)
         try:
             tmp = self.path + ".tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # (24 nov., audit F20) un fichier temporaire neuf, a nous, en 0600 : jamais un reste (ou un lien) pose avant,
+            # dont les droits seraient gardes
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
             if os.path.exists(self.path):
@@ -244,7 +250,9 @@ class LocalChannel(object):
             self.rejected += 1
             return None
         tok = req.get("token")
-        if not isinstance(tok, str) or not hmac.compare_digest(tok.encode("utf-8"), self.token.encode("ascii")):
+        # (24 nov., audit F5) un jeton qui ne s'ecrit pas en UTF-8 (une moitie de caractere seule) levait une exception
+        # ici, avant la comparaison : elle arretait la lecture rapide du canal. Seul un jeton ASCII se compare.
+        if not isinstance(tok, str) or not tok.isascii() or not hmac.compare_digest(tok.encode("ascii"), self.token.encode("ascii")):
             self.rejected += 1
             return None
         hold = self._hold(req)

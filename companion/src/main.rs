@@ -940,7 +940,9 @@ fn main() {
     // (12 nov.) la surface Mackie Control pour Logic Pro : off tant que la personne ne l'a pas permise ici (« mackie on »)
     let mackie_surface = state_file::read(&state).map(|v| v[mcu::STATE_KEY] == json!(true)).unwrap_or(false);
     // (11 nov., update.rs) la case « Update automatically » : off tant que la personne ne l'a pas cochee ici
-    let auto_update = state_file::read(&state).map(|v| v[update::STATE_KEY] == json!(true)).unwrap_or(false);
+    // (24 nov., relecture) tant que la case n'est pas proposee (update::AUTO_AVAILABLE), une case cochee par une version
+    // d'avant est oubliee : le jour ou elle reviendra, elle sera decochee
+    let auto_update = update::AUTO_AVAILABLE && state_file::read(&state).map(|v| v[update::STATE_KEY] == json!(true)).unwrap_or(false);
     // la machine elle-meme, et rien d'autre (un seul socket a l'ecoute, sur 127.0.0.1)
     let listener = match bind(args.port) {
         Ok(l) => l,
@@ -1140,8 +1142,8 @@ fn main() {
     // sur Mac aussi
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let sh = shared.clone();
-        host::watch_arming(Box::new(move || sh.arming.armed()));
+        let (sh, sh2) = (shared.clone(), shared.clone());
+        host::watch_arming(Box::new(move || sh.arming.armed()), Box::new(move || sh2.arming.studios()));
     }
     // (24 oct.) avec l'icone : l'icone et la fenetre d'etat sur un fil a elles (STA pour WebView2 ; ce fil-ci garde son
     // MTA) ; quand l'icone quitte, tout s'arrete. Le code n'y est que montre (la fenetre, le bouton Copy), jamais ecrit.

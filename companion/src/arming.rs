@@ -158,6 +158,12 @@ impl Arming {
     }
 
     /// Les minutes avant le desarmement d'inactivite (None : un studio est connecte, desarme, ou --demo).
+    /// (23 nov., 0.4.15) les studios appaires connectes en ce moment (host.rs : desarme et sans studio, les plugins
+    /// heberges se dechargent)
+    pub fn studios(&self) -> u32 {
+        self.lock().sessions
+    }
+
     pub fn idle_left(&self) -> Option<Duration> {
         let mut s = self.lock();
         let now = Instant::now();

@@ -111,6 +111,15 @@ pub fn run(a: &[String]) -> Result<(), String> {
         let _ = ws.close(None);
         return r;
     }
+    // (24 nov., 0.4.15) --unsaved NOM --phase open|back|reopen [--id N] [--p P] [--state SHA] : un reglage que le studio
+    // n'a pas enregistre survit-il au dechargement ? open : ouvert, enregistre, un parametre change, parti sans enregistrer
+    // (le plugin reste) ; back : la liste, l'instance --id encore la ?, enregistree, le parametre --p relu ; reopen : rouvert
+    // avec --state, le parametre --p relu, puis retire
+    if let Some(name) = arg(a, "--unsaved") {
+        let r = unsaved_test(&mut ws, &name, &arg(a, "--phase").unwrap_or_default(), arg(a, "--id").and_then(|x| x.parse().ok()), arg(a, "--p").and_then(|x| x.parse().ok()), arg(a, "--state"));
+        let _ = ws.close(None);
+        return r;
+    }
     // (19 nov., etape 3b) --fxlive NOM [--secs 60] : un effet heberge en direct, le son date aller-retour
     if let Some(name) = arg(a, "--fxlive") {
         let secs = num(a, "--secs", 60.0)?;
@@ -129,7 +138,10 @@ pub fn run(a: &[String]) -> Result<(), String> {
         let click = pair("--click");
         // (20 nov.) --menu X,Y : un clic droit au point (un menu contextuel), puis ce que le studio en fait (menu_steps)
         let menu = pair("--menu");
-        let r = watch_test(&mut ws, &name, secs, out, click, menu);
+        // (24 nov., 0.4.15) --hold SECS : a la fin, le menu laisse ouvert et le plugin garde, SECS secondes (l'essai de
+        // l'enfant orphelin pendant un menu : on tue le compagnon entre-temps)
+        let hold = num(a, "--hold", 0.0)?;
+        let r = watch_test(&mut ws, &name, secs, out, click, menu, hold);
         let _ = ws.close(None);
         return r;
     }
@@ -854,7 +866,7 @@ fn menu_steps(ws: &mut Ws, id: u64, size: (f64, f64), scale: f64, m: (f64, f64),
     Ok(())
 }
 
-fn watch_test(ws: &mut Ws, name: &str, secs: f64, out: Option<std::path::PathBuf>, click: Option<(f64, f64)>, menu: Option<(f64, f64)>) -> Result<(), String> {
+fn watch_test(ws: &mut Ws, name: &str, secs: f64, out: Option<std::path::PathBuf>, click: Option<(f64, f64)>, menu: Option<(f64, f64)>, hold: f64) -> Result<(), String> {
     let mut audio = Vec::new();
     let want = name.to_lowercase();
     // le scan
@@ -878,6 +890,14 @@ fn watch_test(ws: &mut Ws, name: &str, secs: f64, out: Option<std::path::PathBuf
     println!("added {} (id {id}, pid {}, window {})", pick["name"], item["pid"], item["hwnd"]);
     // le plugin est retire meme si la mesure echoue (un enfant laisse ouvert garde son menu, sa fenetre)
     let r = watch_body(ws, id, tag, secs, out, click, menu);
+    if hold > 0.0 {
+        println!("holding: the menu stays open, the plugin loaded, for {hold:.0} s");
+        let end = Instant::now() + Duration::from_secs_f64(hold);
+        while Instant::now() < end {
+            let _ = read_any(ws);
+        }
+        return r;
+    }
     let _ = ws.send(Message::text(r#"{"type":"unwatch"}"#.to_string()));
     let t = Instant::now();
     host(ws, json!({ "action": "remove", "id": id }))?;
@@ -1026,6 +1046,75 @@ fn watch_body(ws: &mut Ws, id: u64, tag: u64, secs: f64, out: Option<std::path::
         host(ws, json!({ "action": "save", "id": id, "n": 12 }))?;
         let aft = read_until(ws, |v| v["type"] == "host" && (v["action"] == "saved" || v["error"].is_string()), Duration::from_secs(15), &mut audio)?;
         println!("state before {} ; after {} → the gesture {} the plugin", before["state"], aft["state"], if before["state"] != aft["state"] { "CHANGED" } else { "did not change" });
+    }
+    Ok(())
+}
+
+/// (24 nov., 0.4.15) --unsaved : voir run.
+fn unsaved_test(ws: &mut Ws, name: &str, phase: &str, id: Option<u64>, p: Option<u64>, state: Option<String>) -> Result<(), String> {
+    let mut audio = Vec::new();
+    let read_p = |ws: &mut Ws, id: u64, p: u64, audio: &mut Vec<(f64, f32, f64)>| -> Result<f64, String> {
+        host(ws, json!({ "action": "params", "id": id, "start": p, "n": 4 }))?;
+        let r = read_until(ws, |v| v["type"] == "host" && v["action"] == "params", Duration::from_secs(10), audio)?;
+        r["items"].as_array().and_then(|a| a.iter().find(|x| x["p"].as_u64() == Some(p))).and_then(|x| x["v"].as_f64()).ok_or(format!("params: {r}"))
+    };
+    let save = |ws: &mut Ws, id: u64, audio: &mut Vec<(f64, f32, f64)>| -> Result<String, String> {
+        host(ws, json!({ "action": "save", "id": id, "n": 7 }))?;
+        let v = read_until(ws, |v| v["type"] == "host" && (v["action"] == "saved" || v["action"] == "save"), Duration::from_secs(20), audio)?;
+        v["state"].as_str().map(str::to_string).ok_or(format!("save: {v}"))
+    };
+    let add = |ws: &mut Ws, state: Option<&str>, audio: &mut Vec<(f64, f32, f64)>| -> Result<u64, String> {
+        loop {
+            host(ws, json!({ "action": "status" }))?;
+            let v = read_until(ws, is_host("status"), Duration::from_secs(10), audio)?;
+            if v["scanning"] != true && v["total"].as_u64().unwrap_or(0) > 0 && v["done"] == v["total"] {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        host(ws, json!({ "action": "plugins" }))?;
+        let pl = read_until(ws, is_host("plugins"), Duration::from_secs(10), audio)?;
+        let want = name.to_lowercase();
+        let pick = pl["list"].as_array().and_then(|l| l.iter().find(|x| x["name"].as_str().unwrap_or("").to_lowercase().contains(&want)).cloned()).ok_or(format!("no plugin like {name}"))?;
+        host(ws, json!({ "action": "add", "plugin": pick["id"], "state": state, "n": 1 }))?;
+        let added = read_until(ws, |v| v["type"] == "host" && (v["action"] == "added" || v["action"] == "add"), Duration::from_secs(70), audio)?;
+        added["item"]["id"].as_u64().ok_or(format!("add: {added}"))
+    };
+    match phase {
+        "open" => {
+            let id = add(ws, None, &mut audio)?;
+            let s1 = save(ws, id, &mut audio)?;
+            host(ws, json!({ "action": "params", "id": id, "start": 0, "n": 10 }))?;
+            let r = read_until(ws, |v| v["type"] == "host" && v["action"] == "params", Duration::from_secs(15), &mut audio)?;
+            let all = r["items"].as_array().cloned().unwrap_or_default();
+            let t = all.iter().find(|x| x["name"].as_str().unwrap_or("").to_lowercase().contains("cutoff")).or(all.first()).cloned().ok_or("no parameter")?;
+            let (p, v0) = (t["p"].as_u64().unwrap(), t["v"].as_f64().unwrap_or(0.0));
+            let v1 = if v0 > 0.5 { 0.2 } else { 0.8 };
+            host(ws, json!({ "action": "param-set", "id": id, "p": p, "v": v1 }))?;
+            std::thread::sleep(Duration::from_millis(400));
+            let back = read_p(ws, id, p, &mut audio)?;
+            println!("open: id {id}, saved S1 {s1}, param {p} ({}) {v0:.3} -> {v1:.3}, read {back:.3} ; leaving WITHOUT saving", t["name"]);
+        }
+        "back" => {
+            let id = id.ok_or("--id")?;
+            host(ws, json!({ "action": "list" }))?;
+            let l = read_until(ws, |v| v["type"] == "host" && v["action"] == "list", Duration::from_secs(5), &mut audio)?;
+            let there = l["items"].as_array().is_some_and(|a| a.iter().any(|x| x["id"].as_u64() == Some(id)));
+            println!("back: instance {id} still loaded: {there}");
+            if there {
+                let s2 = save(ws, id, &mut audio)?;
+                let v = read_p(ws, id, p.ok_or("--p")?, &mut audio)?;
+                println!("back: saved S2 {s2}, param {} = {v:.3}", p.unwrap());
+            }
+        }
+        "reopen" => {
+            let id = add(ws, state.as_deref(), &mut audio)?;
+            let v = read_p(ws, id, p.ok_or("--p")?, &mut audio)?;
+            println!("reopen with {}: param {} = {v:.3}", state.as_deref().unwrap_or("-"), p.unwrap());
+            host(ws, json!({ "action": "remove", "id": id }))?;
+            let _ = read_until(ws, |v| v["type"] == "host" && (v["action"] == "removed" || v["action"] == "remove"), Duration::from_secs(10), &mut audio);
+        }
+        _ => return Err("--phase open|back|reopen".into()),
     }
     Ok(())
 }

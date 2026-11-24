@@ -140,10 +140,15 @@ mod imp {
         std::thread::spawn(move || loop {
             let hs = [HANDLE(show as _), HANDLE(quit as _)];
             let w = unsafe { WaitForMultipleObjects(&hs, false, INFINITE) };
+            // (24 nov., audit F4) seulement « Quit » quitte : une attente en echec (un evenement qui n'a pas pu etre cree,
+            // un objet de ce nom pris par un autre programme) arrete l'ecoute, pas le compagnon
             if w == WAIT_OBJECT_0 {
                 on(true);
-            } else {
+            } else if w.0 == WAIT_OBJECT_0.0 + 1 {
                 on(false);
+                break;
+            } else {
+                crate::log("single instance: cannot wait for Show and Quit (another program holds their names?): the window opens from the tray icon only");
                 break;
             }
         });

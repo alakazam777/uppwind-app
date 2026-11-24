@@ -557,6 +557,14 @@ mod win {
             if w <= 0 || h <= 0 {
                 return Ok(None); // reduite
             }
+            // (24 nov., audit F7) la taille du tampon en usize, verifiee, et bornee : w * h * 4 en i32 debordait au-dela de
+            // 23 170 pixels de cote (un tampon trop petit pour GetDIBits)
+            if w > 16384 || h > 16384 {
+                return Err(format!("the window is too large to capture ({w}×{h})"));
+            }
+            let Some(len) = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)) else {
+                return Err("the window is too large to capture".into());
+            };
             unsafe {
                 let hdc = GetDC(Some(self.hwnd));
                 let mem = CreateCompatibleDC(Some(hdc));
@@ -573,7 +581,7 @@ mod win {
                     biCompression: BI_RGB.0,
                     ..Default::default()
                 };
-                let mut buf = vec![0u8; (w * h * 4) as usize];
+                let mut buf = vec![0u8; len];
                 let lines = GetDIBits(mem, bmp, 0, h as u32, Some(buf.as_mut_ptr() as *mut core::ffi::c_void), &mut bi, DIB_RGB_COLORS);
                 SelectObject(mem, old);
                 let _ = DeleteObject(bmp.into());

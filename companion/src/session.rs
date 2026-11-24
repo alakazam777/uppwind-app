@@ -88,6 +88,18 @@ pub fn handshake(stream: TcpStream, sh: &Shared) -> Option<(WebSocket<TcpStream>
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // (24 nov., audit F1) la poignee de main HTTP entiere en HANDSHAKE_MAX au plus (le delai de 5 s vaut par lecture : un
+    // octet toutes les 3 s gardait la place sans fin, et 16 places bloquaient le studio)
+    // (24 nov., relecture) le fil de surveillance attend sur un canal, pas un sommeil : il se termine (et lache sa copie
+    // de la connexion) des que la poignee de main finit, au lieu de rester 5 s par connexion, meme refusee en 1 ms
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    if let Ok(s2) = stream.try_clone() {
+        let _ = std::thread::Builder::new().name("uwc-handshake-timer".into()).spawn(move || {
+            if wait.recv_timeout(HANDSHAKE_MAX) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                let _ = s2.shutdown(std::net::Shutdown::Both);
+            }
+        });
+    }
     let mut origin_seen = String::new();
     let port = sh.port;
     let allow = &sh.allow;
@@ -98,11 +110,11 @@ pub fn handshake(stream: TcpStream, sh: &Shared) -> Option<(WebSocket<TcpStream>
         match security::check_handshake(host, origin, port, allow) {
             Ok(()) => Ok(resp),
             Err(Refusal::BadHost) => {
-                crate::log(&format!("REFUSED {peer}: Host {:?} is not 127.0.0.1:{port}", host.unwrap_or("<none>")));
+                log_refused(&format!("REFUSED {peer}: Host {:?} is not 127.0.0.1:{port}", cut(host.unwrap_or("<none>"))));
                 Err(refuse(403, "bad host"))
             }
             Err(Refusal::BadOrigin) => {
-                crate::log(&format!("REFUSED {peer}: Origin {:?} is not allowed", origin.unwrap_or("<none>")));
+                log_refused(&format!("REFUSED {peer}: Origin {:?} is not allowed", cut(origin.unwrap_or("<none>"))));
                 Err(refuse(403, "origin not allowed"))
             }
         }
@@ -111,15 +123,47 @@ pub fn handshake(stream: TcpStream, sh: &Shared) -> Option<(WebSocket<TcpStream>
         .max_message_size(Some(protocol::MAX_TEXT_MESSAGE))
         .max_frame_size(Some(protocol::MAX_TEXT_MESSAGE))
         .max_write_buffer_size(MAX_WRITE_BUFFER);
-    match tungstenite::accept_hdr_with_config(stream, cb, Some(cfg)) {
+    let r = tungstenite::accept_hdr_with_config(stream, cb, Some(cfg));
+    drop(done);
+    match r {
         Ok(ws) => Some((ws, origin_seen)),
         Err(e) => {
             let s = e.to_string();
             if !s.contains("Handshake not finished") {
-                crate::log(&format!("handshake failed ({s})"));
+                log_refused(&format!("handshake failed ({})", cut(&s)));
             }
             None
         }
+    }
+}
+
+/// (24 nov., relecture) Ce que le studio montre quand un ajout, un retrait ou un reglage de parametre est refuse desarme.
+pub const LINK_DISARMED: &str = "Remote control is off in Uppwind Link: adding or removing an instrument, or setting a plugin parameter, needs it (its window or its icon)";
+
+/// (24 nov., audit F1) La poignee de main HTTP entiere, au plus.
+pub const HANDSHAKE_MAX: Duration = Duration::from_secs(5);
+
+/// (24 nov., audit F3) Ce qu'un refus recopie d'un en-tete : 120 caracteres au plus.
+fn cut(s: &str) -> String {
+    s.chars().take(120).collect()
+}
+
+/// (24 nov., audit F3) Les refus d'une poignee de main dans le journal : 10 par minute au plus, puis leur nombre (une page
+/// web qui boucle sur new WebSocket remplissait le journal sans fin).
+fn log_refused(msg: &str) {
+    static W: std::sync::Mutex<(Option<Instant>, u32, u64)> = std::sync::Mutex::new((None, 0, 0));
+    let mut w = W.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+        if w.2 > 0 {
+            crate::log(&format!("({} more refused connections in the last minute, not written)", w.2));
+        }
+        *w = (Some(Instant::now()), 0, 0);
+    }
+    if w.1 < 10 {
+        w.1 += 1;
+        crate::log(msg);
+    } else {
+        w.2 += 1;
     }
 }
 
@@ -1068,7 +1112,34 @@ impl<'a> Conn<'a> {
                         Err(e) => return self.send_text(protocol::error("link", &e)),
                     }
                 }
-                match self.link.as_ref().unwrap().send(sysex.unwrap_or_default()) {
+                let sysex = sysex.unwrap_or_default();
+                // (24 nov., audit M2) ajouter ou retirer une piste, regler le parametre d'un plugin : arme seulement ; et
+                // pas plus de MAX_LINK_CHUNKS_PER_SEC morceaux par seconde (une rafale figeait Live)
+                if protocol::link_needs_arming(&sysex) && self.disarmed() {
+                    log_refused("REFUSED a change of the DAW's set from the studio (add, remove, plugin parameter): remote control is off");
+                    // (24 nov., relecture) la reponse du protocole du lien : le studio rejette la demande tout de suite
+                    let replies = protocol::link_refusals(&sysex, LINK_DISARMED);
+                    if !replies.is_empty() {
+                        return self.send_text(json!({ "type": "link", "sysex": replies }).to_string());
+                    }
+                    return self.send_text(json!({ "type": "error", "code": crate::arming::CODE, "message": crate::arming::REFUSAL, "link": true }).to_string());
+                }
+                // (24 nov., relecture) un compte commun a toutes les connexions (16 connexions ne font pas 16 fois la limite)
+                let over = {
+                    static W: std::sync::Mutex<Option<(Instant, u32)>> = std::sync::Mutex::new(None);
+                    let mut w = W.lock().unwrap_or_else(|e| e.into_inner());
+                    let (t0, n) = w.get_or_insert((Instant::now(), 0));
+                    if t0.elapsed() >= Duration::from_secs(1) {
+                        *t0 = Instant::now();
+                        *n = 0;
+                    }
+                    *n = n.saturating_add(sysex.len() as u32);
+                    *n > protocol::MAX_LINK_CHUNKS_PER_SEC
+                };
+                if over {
+                    return self.send_text(protocol::error("link", "too many link messages: slow down"));
+                }
+                match self.link.as_ref().unwrap().send(sysex) {
                     Ok(()) => Ok(()),
                     Err(e) => self.send_text(protocol::error("link", &e)),
                 }
@@ -1660,6 +1731,16 @@ fn log_v1_refused(origin: &str) {
     }
 }
 
+/// (24 nov., audit F19) Un studio appaire connecte, pour l'armement : `session_closed` a la fin de la connexion, quelle
+/// qu'elle soit.
+struct StudioCount(Arc<Shared>);
+
+impl Drop for StudioCount {
+    fn drop(&mut self) {
+        self.0.arming.session_closed();
+    }
+}
+
 /// La place d'une connexion dans le compte de `serve` (rendue quand le fil se termine, meme sur une panique).
 struct Slot(Arc<AtomicUsize>);
 
@@ -1680,7 +1761,7 @@ pub fn serve(listener: TcpListener, sh: Arc<Shared>, max: usize) {
                 if active.load(Ordering::SeqCst) >= max {
                     refused += 1;
                     if refused == 1 || refused % 100 == 0 {
-                        crate::log(&format!("REFUSED a connection: {max} are already open ({refused} refused so far)"));
+                        log_refused(&format!("REFUSED a connection: {max} are already open ({refused} refused so far)"));
                     }
                     drop(s);
                     continue;
@@ -1692,7 +1773,7 @@ pub fn serve(listener: TcpListener, sh: Arc<Shared>, max: usize) {
                     run(s, sh);
                 });
             }
-            Err(e) => crate::log(&format!("accept: {e}")),
+            Err(e) => log_refused(&format!("accept: {e}")),
         }
     }
 }
@@ -1764,9 +1845,12 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         return;
     }
     let t0 = Instant::now();
+    // (24 nov., audit F19) ce studio compte pour l'arret de l'armement apres 10 minutes sans studio ; il cesse de compter
+    // quand la connexion se termine, de quelque facon que ce soit (une panique du fil comprise : Drop)
+    let mut studio_count: Option<StudioCount> = None;
     loop {
         if t0.elapsed() > HELLO_TIMEOUT {
-            crate::log("no hello within 10 s: closed");
+            log_refused("no hello within 10 s: closed");
             c.close(CLOSE_PROTOCOL, "no hello");
             return;
         }
@@ -1782,7 +1866,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                         (version, token, v, nonce, proof)
                     }
                     _ => {
-                        crate::log("REFUSED: the first message is not hello");
+                        log_refused("REFUSED: the first message is not hello");
                         let _ = c.send_text(protocol::error("not-paired", "the first message must be hello with the pairing proof"));
                         c.close(CLOSE_PROTOCOL, "hello first");
                         return;
@@ -1834,12 +1918,12 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     drop(guard);
                     if locked {
                         std::thread::sleep(LOCKED_DELAY);
-                        crate::log("REFUSED: wrong pairing token while pairing is slowed down (too many wrong tokens)");
+                        log_refused("REFUSED: wrong pairing token while pairing is slowed down (too many wrong tokens)");
                         let _ = c.send_text(protocol::error("locked", "too many wrong pairing codes: wait 30 s"));
                         c.close(CLOSE_LOCKED, "locked");
                     } else {
                         let what = if v2 { "wrong pairing proof" } else if token.is_some() { "wrong pairing token" } else { "missing pairing token" };
-                        crate::log(&format!("REFUSED: {what} from {origin}"));
+                        log_refused(&format!("REFUSED: {what} from {origin}"));
                         let _ = c.send_text(protocol::error("bad-token", "wrong pairing code: copy it again from the companion window"));
                         c.close(CLOSE_BAD_TOKEN, "bad token");
                     }
@@ -1877,6 +1961,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 // (9 nov., audit F1) ce studio compte (les minutes sans studio s'arretent), puis l'etat de l'armement tel
                 // qu'il le lit ; tout changement ensuite lui est dit (« armed », poll_arming)
                 sh.arming.session_opened();
+                studio_count = Some(StudioCount(sh.clone()));
                 c.arm_gen = sh.arming.generation();
                 let armed = sh.arming.armed();
                 // (12 nov.) la surface : sa generation avant son etat (un changement entre les deux repart, sans perte)
@@ -1920,7 +2005,6 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                     hello["proof"] = json!(security::hex(&security::companion_proof_for_studio(&k, sh.port, ns, &nonce_c)));
                 }
                 if c.send_text(hello.to_string()).is_err() {
-                    sh.arming.session_closed();
                     return;
                 }
                 if v2 {
@@ -2032,7 +2116,8 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
     }
     crate::log(&format!("studio {origin} disconnected"));
     crate::tray::status::closed(&origin); // (24 oct.) la fenetre d'etat
-    sh.arming.session_closed(); // (9 nov., audit F1) les minutes sans studio comptent a partir d'ici
+    // (9 nov., audit F1) les minutes sans studio comptent a partir d'ici (24 nov. : StudioCount, en sortant)
+    drop(studio_count);
 }
 
 /// De vraies connexions sur 127.0.0.1 (un port au hasard), le compagnon en mode demo : ce que le studio vivra.
@@ -3135,6 +3220,13 @@ fn hosted_shortcut(ev: &InputEvent) -> bool {
         // texte qui en porte serait une touche F deguisee
         InputEvent::Text { text } => text.chars().any(|c| ('\u{F700}'..='\u{F8FF}').contains(&c)),
     }
+}
+
+/// (24 nov., audit E1) Une touche ou un texte qui serait un raccourci (Ctrl, Alt, Cmd, touches F) : refuses aussi vers une
+/// fenetre de DAW sur Mac (input.rs), ou ils iraient au DAW lui-meme. Les gestes de la souris ne sont pas concernes.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn key_shortcut(ev: &InputEvent) -> bool {
+    matches!(ev, InputEvent::Key { .. } | InputEvent::Text { .. }) && hosted_shortcut(ev)
 }
 
 impl Drop for RenderJob {

@@ -87,14 +87,20 @@ fn armed_now() -> bool {
     // (20 nov., relecture macOS) sans surveillance branchee (main.rs), « desarme » : un oubli refuse, il n'ouvre rien
     ARMED.get().map(|f| f()).unwrap_or(false)
 }
+/// (23 nov., 0.4.15) desarme ET sans aucun studio connecte depuis ce temps : les plugins heberges se dechargent (leur
+/// fil audio, leur processus). Un studio ouvert, meme desarme, les garde (fenetres fermees) : rearme, il les retrouve
+/// avec leurs reglages ; un studio qui revient apres le dechargement les rouvre, comme apres un redemarrage du compagnon.
+pub const UNLOAD_AFTER: Duration = Duration::from_secs(60);
+
 /// main.rs, une fois l'armement cree : le fil qui le surveille ferme les editeurs a chaque desarmement (la personne, ou
-/// l'arret automatique apres 10 minutes sans studio).
-pub fn watch_arming(probe: Box<dyn Fn() -> bool + Send + Sync>) {
+/// l'arret automatique apres 10 minutes sans studio), et decharge les plugins desarme sans studio (UNLOAD_AFTER).
+pub fn watch_arming(probe: Box<dyn Fn() -> bool + Send + Sync>, studios: Box<dyn Fn() -> u32 + Send + Sync>) {
     if ARMED.set(probe).is_err() {
         return;
     }
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         let mut was = armed_now();
+        let mut alone: Option<Instant> = None;
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let now = armed_now();
@@ -102,8 +108,85 @@ pub fn watch_arming(probe: Box<dyn Fn() -> bool + Send + Sync>) {
                 close_editors();
             }
             was = now;
+            if now || studios() > 0 {
+                alone = None;
+            } else if unload_due(alone.get_or_insert_with(Instant::now).elapsed()) {
+                unload_all(&|| !armed_now() && studios() == 0);
+                // (24 nov.) ceux qui restent (des reglages que le studio n'a pas) : redemandes dans une minute
+                alone = Some(Instant::now());
+            }
         }
     });
+}
+
+/// desarme et sans studio depuis `alone` : l'heure de decharger ?
+fn unload_due(alone: Duration) -> bool {
+    alone >= UNLOAD_AFTER
+}
+
+/// Le temps qu'a un plugin pour donner ses reglages avant d'etre decharge (le fil de l'armement attend : court).
+const UNLOAD_SAVE_WAIT: Duration = Duration::from_secs(5);
+
+/// (24 nov., 0.4.15) Garder ce plugin charge ? Ses reglages, relus au moment de decharger (`reply`), ne sont pas ceux
+/// que le studio connait (`given` : la derniere empreinte remise ; aucune, et le plugin touche depuis son ouverture) : le
+/// studio le rouvrirait avec les anciens, les gestes faits depuis seraient perdus. Il reste (editeur ferme, desarme : ni
+/// filme ni pilote) jusqu'a ce qu'un studio revienne et les enregistre. Sans reponse, ou une erreur : rien a garder.
+fn keep_loaded(given: Option<&str>, reply: &Value) -> bool {
+    if reply["event"] != "saved" {
+        return false;
+    }
+    match (given, reply["sha"].as_str()) {
+        (Some(g), Some(sha)) => g != sha,
+        (None, _) => reply["touched"].as_bool().unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Decharge chaque plugin heberge pret (un « add » en cours se defait seul : il verifie l'armement a sa fin), sauf ceux
+/// dont le studio n'a pas les derniers reglages (keep_loaded). Chacun donne d'abord ses reglages ; si un studio arrive
+/// ou que l'on rearme entre-temps (`still_alone`), rien n'est decharge. Puis tous recoivent « quit », et une seule
+/// attente (4 s) : au-dela, ils sont tues.
+fn unload_all(still_alone: &dyn Fn() -> bool) {
+    let ready: Vec<Arc<Inst>> = insts().lock().unwrap().iter().filter(|i| i.status.lock().unwrap().as_str() == "ready").cloned().collect();
+    if ready.is_empty() {
+        return;
+    }
+    let mut list = Vec::new();
+    for i in ready {
+        let reply = ask_save(&i, UNLOAD_SAVE_WAIT).unwrap_or(Value::Null);
+        let given = i.given.lock().unwrap().clone();
+        if keep_loaded(given.as_deref(), &reply) {
+            if !i.kept.swap(true, Ordering::Relaxed) {
+                crate::log(&format!("plugin host: {} stays loaded — its settings changed since the studio last saved them", i.name));
+            }
+        } else {
+            list.push(i);
+        }
+    }
+    if list.is_empty() || !still_alone() {
+        return;
+    }
+    for i in &list {
+        *i.status.lock().unwrap() = "removed".into();
+        let _ = send_cmd(i, json!({ "cmd": "quit" }));
+    }
+    let t0 = Instant::now();
+    for i in &list {
+        loop {
+            if let Ok(Some(_)) = i.child.lock().unwrap().try_wait() {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(4) {
+                let _ = i.child.lock().unwrap().kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let gone: Vec<u32> = list.iter().map(|i| i.id).collect();
+    insts().lock().unwrap().retain(|x| !gone.contains(&x.id));
+    changed();
+    crate::log(&format!("plugin host: remote control is off and no studio is connected — {} plugin(s) unloaded", list.len()));
 }
 /// Ferme l'editeur (montre sur le bureau ou ouvert cache pour le studio) de chaque plugin heberge.
 fn close_editors() {
@@ -245,7 +328,11 @@ pub fn configure(state_file: PathBuf) {
     #[cfg(target_os = "macos")]
     let (data, dirs, link_bundle) = {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
-        let Some(data) = state_file.parent().map(Path::to_path_buf) else { return };
+        let Some(parent) = state_file.parent().map(Path::to_path_buf) else { return };
+        // (24 nov., audit M6) le fichier d'etat du compagnon installe est ~/.uppwind-companion.json : son dossier est le
+        // dossier personnel, que le groupe « staff » lit (drwxr-x---). Le scan, les reglages et les rendus vont donc dans
+        // ~/Library/Application Support/Uppwind Link (comme le journal), en 0700 ; un --state-file d'essai garde son dossier
+        let data = mac_data_dir(&home, &parent);
         let user = home.join("Library").join("Audio").join("Plug-Ins").join("VST3");
         let dirs = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3"), user.clone()];
         (data, dirs, user.join("Uppwind Link.vst3"))
@@ -274,8 +361,58 @@ pub fn configure(state_file: PathBuf) {
             exe
         }
     };
+    // (23 nov., 0.4.15) ceux d'un compagnon parti d'un coup (tue, plante) : seulement les vieux (un compagnon d'essai peut
+    // partager ce dossier et ecrire en ce moment)
+    sweep_tmp_states(&data.join("plugin-states"), None, Some(TMP_STALE));
     let _ = CFG.set(Cfg { exe, state_file, data, dirs, link_bundle });
     sweep_jobs();
+}
+
+/// (24 nov., audit M6) Le dossier des donnees de l'hote sur Mac : `~/Library/Application Support/Uppwind Link` quand le
+/// fichier d'etat est dans le dossier personnel (le compagnon installe), sinon le dossier du fichier d'etat (un essai).
+/// Cree en 0700 et remis en 0700 ; les reglages d'avant (`~/plugin-states`, 0.4.13–0.4.15) y sont deplaces une fois.
+#[cfg(target_os = "macos")]
+fn mac_data_dir(home: &Path, state_parent: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let data = data_dir_for(home, state_parent);
+    if data != state_parent {
+        let _ = std::fs::create_dir_all(&data);
+        let _ = std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700));
+        let (old, new) = (home.join("plugin-states"), data.join("plugin-states"));
+        let old_is_dir = std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir());
+        if old_is_dir && std::fs::symlink_metadata(&new).is_err() && std::fs::rename(&old, &new).is_ok() {
+            crate::log("plugin host: the saved plugin settings moved to ~/Library/Application Support/Uppwind Link/plugin-states");
+        }
+        let _ = std::fs::remove_file(home.join("vst3-scan.json"));
+        // (24 nov., relecture) les rendus laisses dans ~/jobs par une 0.4.13 ou 0.4.14 arretee brutalement (lisibles par
+        // les autres comptes) : effaces, puis le dossier s'il est vide
+        if let Ok(rd) = std::fs::read_dir(home.join("jobs")) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("job-") && (n.ends_with(".in") || n.ends_with(".out")) && e.file_type().is_ok_and(|t| t.is_file()) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+            let _ = std::fs::remove_dir(home.join("jobs"));
+        }
+    }
+    data
+}
+
+/// (24 nov., relecture) Un chemin du cache du scan est-il sous un des dossiers VST3, sans « .. » (que `starts_with` ne
+/// resout pas) ?
+fn cached_path_ok(p: &Path, dirs: &[PathBuf]) -> bool {
+    !p.components().any(|c| matches!(c, std::path::Component::ParentDir)) && dirs.iter().any(|d| p.starts_with(d))
+}
+
+/// (pure) Le dossier des donnees de l'hote sur Mac (voir `mac_data_dir`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn data_dir_for(home: &Path, state_parent: &Path) -> PathBuf {
+    if state_parent == home {
+        home.join("Library").join("Application Support").join(crate::install::APP_DIR)
+    } else {
+        state_parent.to_path_buf()
+    }
 }
 
 pub fn available() -> bool {
@@ -323,6 +460,9 @@ fn load_cache(c: &Cfg) -> Vec<ModuleRec> {
         .as_array()
         .map(|a| {
             a.iter()
+                // (24 nov., audit F15) seulement des modules des dossiers VST3 : un cache retouche ne fait pas charger un
+                // autre chemin avant que le scan ne le relise
+                .filter(|m| m["path"].as_str().is_some_and(|p| cached_path_ok(Path::new(p), &c.dirs)))
                 .filter_map(|m| {
                     Some(ModuleRec {
                         path: m["path"].as_str()?.to_string(),
@@ -594,6 +734,11 @@ struct Inst {
     /// (20 nov., Link to controller) les parametres que l'editeur a fait bouger depuis la derniere lecture du studio
     /// (« param » de l'enfant → « param-changes ») : le dernier de chacun, 256 au plus
     param_changes: Mutex<Vec<(u32, f64)>>,
+    /// (24 nov., 0.4.15) la derniere empreinte de ses reglages remise a un studio (« save ») : au dechargement, un plugin
+    /// dont l'etat a change depuis n'est pas decharge (le studio rouvrirait avec l'ancienne : les reglages seraient perdus)
+    given: Mutex<Option<String>>,
+    /// le journal a deja dit qu'il restait charge (une fois, pas chaque minute)
+    kept: AtomicBool,
 }
 
 /// (19 nov., etape 3b) Les lignes en attente vers un enfant (un effet en direct : 200 paquets par seconde ; 512 : 2,5 s).
@@ -736,6 +881,10 @@ fn reader(inst: Arc<Inst>, stdout: std::process::ChildStdout, ready_tx: Sender<R
         }
         // la sortie est fermee : le processus est parti
         let code = inst.child.lock().unwrap().wait().ok().and_then(|s| s.code());
+        // (23 nov., 0.4.15) un enfant tue pendant qu'il ecrivait des reglages laisse son fichier temporaire : retire ici
+        if let Some(c) = CFG.get() {
+            sweep_tmp_states(&c.data.join("plugin-states"), Some(inst.pid), None);
+        }
         {
             let mut st = inst.status.lock().unwrap();
             if *st != "closed" && *st != "removed" {
@@ -854,6 +1003,8 @@ fn add(plugin: &str, state: Option<&str>, rate: Option<u32>) -> Result<Value, St
         ready: Mutex::new(None),
         waiters: Mutex::new(HashMap::new()),
         param_changes: Mutex::new(Vec::new()),
+        given: Mutex::new(None),
+        kept: AtomicBool::new(false),
     });
     insts().lock().unwrap().push(inst.clone());
     changed();
@@ -903,14 +1054,25 @@ fn remove_inst(i: &Arc<Inst>) {
     changed();
 }
 
-fn save(id: u32, n: Value) -> Result<Value, String> {
-    let i = find(id)?;
+/// L'enfant ecrit ses reglages : sa reponse ({"event":"saved",…} ou {"event":"error",…}).
+fn ask_save(i: &Arc<Inst>, wait: Duration) -> Result<Value, String> {
     let k = NEXT_N.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     i.waiters.lock().unwrap().insert(k, tx);
-    send_cmd(&i, json!({ "cmd": "save", "n": k }))?;
-    let v = rx.recv_timeout(SAVE_TIMEOUT).map_err(|_| format!("{} did not give its settings in time", i.name))?;
+    send_cmd(i, json!({ "cmd": "save", "n": k }))?;
+    let r = rx.recv_timeout(wait).map_err(|_| format!("{} did not give its settings in time", i.name));
+    i.waiters.lock().unwrap().remove(&k);
+    r
+}
+
+fn save(id: u32, n: Value) -> Result<Value, String> {
+    let i = find(id)?;
+    let v = ask_save(&i, SAVE_TIMEOUT)?;
     if v["event"] == "saved" {
+        if let Some(sha) = v["sha"].as_str() {
+            *i.given.lock().unwrap() = Some(sha.to_string());
+            i.kept.store(false, Ordering::Relaxed);
+        }
         Ok(json!({ "type": "host", "action": "saved", "id": id, "n": n, "state": v["sha"], "bytes": v["bytes"] }))
     } else {
         Err(no_paths(v["error"].as_str().unwrap_or("the settings could not be saved")))
@@ -1030,6 +1192,37 @@ pub fn jobs_bytes() -> u64 {
 }
 
 /// Les fichiers de rendu laisses par un compagnon d'avant (arrete pendant un rendu) : effaces au demarrage.
+/// (23 nov., 0.4.15) un fichier temporaire de reglages plus vieux que ca n'est plus ecrit par personne
+const TMP_STALE: Duration = Duration::from_secs(10 * 60);
+
+/// Les fichiers temporaires des reglages (child.rs write_state : « .tmp-<pid>-<nom> ») : ceux de `pid`, ou (None) tous
+/// ceux plus vieux que `older`. Seulement des fichiers ordinaires, directement dans `dir` (un lien n'est jamais suivi).
+fn sweep_tmp_states(dir: &Path, pid: Option<u32>, older: Option<Duration>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mine = pid.map(|p| format!(".tmp-{p}-"));
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        let hit = match &mine {
+            Some(m) => n.starts_with(m.as_str()),
+            None => n.starts_with(".tmp-"),
+        };
+        if !hit {
+            continue;
+        }
+        let Ok(md) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !md.file_type().is_file() {
+            continue;
+        }
+        if let Some(age) = older {
+            let old = md.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d >= age);
+            if !old {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
 pub fn sweep_jobs() {
     let Some(c) = CFG.get() else { return };
     if let Ok(rd) = std::fs::read_dir(c.data.join("jobs")) {
@@ -1320,6 +1513,66 @@ pub fn request(v: Value, reply: Sender<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (24 nov., audit M6) le compagnon installe range les donnees de l'hote hors du dossier personnel ; un essai, a cote
+    /// de son fichier d'etat
+    #[test]
+    fn hosted_data_stays_out_of_the_home_folder() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(data_dir_for(home, home), Path::new("/Users/someone/Library/Application Support/Uppwind Link"));
+        assert_eq!(data_dir_for(home, Path::new("/tmp/essai")), Path::new("/tmp/essai"));
+    }
+
+    /// (24 nov., relecture) le cache du scan : seulement sous les dossiers VST3, jamais par « .. »
+    #[test]
+    fn the_scan_cache_keeps_only_paths_under_the_vst3_folders() {
+        let dirs = [PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
+        assert!(cached_path_ok(Path::new("/Library/Audio/Plug-Ins/VST3/Diva.vst3"), &dirs));
+        assert!(!cached_path_ok(Path::new("/Library/Audio/Plug-Ins/VST3/../../../tmp/evil.vst3"), &dirs));
+        assert!(!cached_path_ok(Path::new("/tmp/evil.vst3"), &dirs));
+    }
+
+    #[test]
+    fn a_plugin_whose_settings_the_studio_lacks_stays_loaded() {
+        let saved = |sha: &str, touched: bool| json!({ "event": "saved", "sha": sha, "touched": touched });
+        // le studio a la derniere empreinte : decharge (meme si le plugin a ete touche avant cet enregistrement)
+        assert!(!keep_loaded(Some("aa"), &saved("aa", true)));
+        // touche depuis le dernier enregistrement du studio : garde
+        assert!(keep_loaded(Some("aa"), &saved("bb", true)));
+        // jamais enregistre par un studio : garde seulement s'il a change depuis son ouverture
+        assert!(keep_loaded(None, &saved("cc", true)));
+        assert!(!keep_loaded(None, &saved("cc", false)));
+        // pas de reponse, une erreur : rien a garder
+        assert!(!keep_loaded(Some("aa"), &Value::Null));
+        assert!(!keep_loaded(None, &json!({ "event": "error", "error": "x" })));
+    }
+
+    #[test]
+    fn plugins_unload_only_after_a_minute_disarmed_without_a_studio() {
+        assert!(!unload_due(Duration::from_secs(59)));
+        assert!(unload_due(UNLOAD_AFTER));
+    }
+
+    #[test]
+    fn the_settings_temp_files_go_by_pid_or_by_age_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("uwl-tmp-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [".tmp-42-a.bin", ".tmp-7-b.bin", "abc.bin", "x.tmp-42-c"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.join(".tmp-42-dir")).unwrap();
+        sweep_tmp_states(&dir, Some(42), None);
+        let left = |n: &str| dir.join(n).exists();
+        assert!(!left(".tmp-42-a.bin"), "the dead child's file");
+        assert!(left(".tmp-7-b.bin") && left("abc.bin") && left("x.tmp-42-c") && left(".tmp-42-dir"), "nothing else");
+        // au demarrage : seulement les vieux (un fichier neuf peut etre en cours d'ecriture)
+        sweep_tmp_states(&dir, None, Some(Duration::from_secs(3600)));
+        assert!(left(".tmp-7-b.bin"), "a fresh one stays");
+        sweep_tmp_states(&dir, None, Some(Duration::ZERO));
+        assert!(!left(".tmp-7-b.bin") && left("abc.bin") && left(".tmp-42-dir"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn modules_of_a_folder() {

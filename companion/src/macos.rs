@@ -648,6 +648,24 @@ fn plugin_window_sign(pid: i32, frame: [f64; 4], win: &AxElement) -> bool {
     ok
 }
 
+/// (24 nov., audit E1) La fenetre active de l'appli `pid` (AXFocusedWindow : celle qui recoit le clavier) a-t-elle le
+/// cadre `frame` (a 2 points pres) ? false sans « Accessibilite », sans fenetre active, ou si c'est une autre : une touche
+/// postee au processus n'est remise que si c'est la fenetre du plugin.
+pub fn ax_focused_window_is(pid: i32, frame: [f64; 4]) -> bool {
+    if pid <= 0 || !unsafe { AXIsProcessTrusted() } {
+        return false;
+    }
+    ax_timeout();
+    unsafe {
+        let app = AxElement(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
+            return false;
+        }
+        let win = AxElement(ax_attr(app.0, c"AXFocusedWindow"));
+        ax_frame(win.0).is_some_and(|f| f.iter().zip(frame).all(|(a, b)| (a - b).abs() <= 2.0))
+    }
+}
+
 /// (11 nov., relecture M1) La fenetre de Logic `frame` porte-t-elle le bouton de menu de l'affichage, que seules ses
 /// fenetres de plugins portent ? Relu a chaque fois (pour `view`, rare). false sans « Accessibilite ».
 pub fn ax_plugin_window(pid: i32, frame: [f64; 4]) -> bool {

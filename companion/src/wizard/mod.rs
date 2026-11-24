@@ -375,7 +375,10 @@ pub fn cleanup_after_exit(files: &[PathBuf], empty_dirs: &[PathBuf], trees: &[Pa
     if files.is_empty() && empty_dirs.is_empty() && trees.is_empty() {
         return;
     }
-    let mut cmd = String::from("ping -n 4 127.0.0.1 >nul");
+    // (24 nov., audit M7) PING.EXE par son chemin complet : un nom nu est d'abord cherche par cmd.exe dans le dossier
+    // courant (Telechargements, ou le compagnon telecharge est lance) ; un « ping.cmd » pose la y aurait tourne
+    let sys32 = system_cmd().parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+    let mut cmd = format!("\"{}\" -n 4 127.0.0.1 >nul", sys32.join("PING.EXE").display());
     for f in files {
         cmd.push_str(&format!(" & del /f /q \"{}\"", f.display()));
     }
@@ -390,6 +393,7 @@ pub fn cleanup_after_exit(files: &[PathBuf], empty_dirs: &[PathBuf], trees: &[Pa
         use std::os::windows::process::CommandExt;
         keep_std_handles();
         let _ = std::process::Command::new(system_cmd())
+            .current_dir(&sys32)
             .raw_arg(format!("/d /s /c \"{cmd}\""))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

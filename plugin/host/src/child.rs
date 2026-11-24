@@ -17,7 +17,7 @@
 //! Le dialogue avec le compagnon : des lignes JSON. Entree : {"cmd":"save","n":1} · {"cmd":"editor","show":true|false}
 //! · {"cmd":"view","open":true|false} (l'editeur ouvert, MASQUE : le studio le filme) · {"cmd":"tempo","bpm":120,"playing":true} · {"cmd":"mix","vol":1,"pan":0,"mute":false} · {"cmd":"quit"} ; la fin de l'entree (le compagnon est parti) = quit.
 //! (20 nov.) macOS : {"cmd":"mouse"|"wheel"|"key",…} (les gestes du studio, poses dans la file d'AppKit : macui::gesture).
-//! Sortie : {"event":"ready",…} · {"event":"saved","n","sha","bytes"} · {"event":"editor","shown"} · {"event":"error",…}
+//! Sortie : {"event":"ready",…} · {"event":"saved","n","sha","bytes","touched"} · {"event":"editor","shown"} · {"event":"error",…}
 //! · {"event":"closed"}. L'etat d'un plugin (composant + controleur) est ecrit par CE processus dans --states-dir, sous
 //! son empreinte SHA-256 : seul un etat que le compagnon a produit lui-meme est jamais relu (--state), jamais des octets
 //! venus d'un projet partage.
@@ -225,6 +225,28 @@ fn fin(buf: &mut Vec<u8>, over: bool, max: usize) -> bool {
 
 /// (20 nov., relecture) le delai apres la fermeture de l'entree, avant que l'enfant ne s'arrete de lui-meme
 const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// (23 nov., 0.4.15) l'entree fermee parce que le compagnon est mort (sur Mac, sans Job object, rien d'autre n'arrete
+/// l'enfant) : son fil audio et sa fenetre ne lui survivent qu'une seconde, le temps de fermer le plugin proprement
+const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// le processus parent (le compagnon) ; 0 sous Windows (le Job object du compagnon s'en charge)
+fn parent_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::parent_id()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// le compagnon `was` n'est plus le parent (l'enfant a ete rattache a launchd : un autre parent, ou 1) ; jamais sous
+/// Windows (le Job object)
+fn orphaned(was: u32, now: u32) -> bool {
+    cfg!(unix) && (now != was || now == 1)
+}
 
 pub(crate) static VIEW: std::sync::atomic::AtomicPtr<IPlugView> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
@@ -552,6 +574,7 @@ fn run(a: HostArgs) -> Result<(), String> {
         let cmds = cmds.clone();
         let hw = hwnd;
         let lv = live.clone();
+        let parent = parent_pid();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut rd = stdin.lock();
@@ -603,13 +626,23 @@ fn run(a: HostArgs) -> Result<(), String> {
             // (20 nov., relecture) une boite de dialogue du plugin a sa propre boucle de messages et avale le notre : apres
             // QUIT_GRACE, l'enfant s'arrete de lui-meme (le Job object du compagnon le fait aussi quand celui-ci meurt ;
             // sur Mac, un menu du plugin tient de meme la boucle d'AppKit)
-            std::thread::sleep(QUIT_GRACE);
-            std::process::exit(0);
+            // (23 nov., 0.4.15) le parent relu APRES une seconde : un processus qui meurt ferme ses tuyaux avant que ses
+            // enfants ne soient rattaches a launchd ; lu tout de suite, il pouvait encore etre le compagnon
+            std::thread::sleep(ORPHAN_GRACE);
+            if !orphaned(parent, parent_pid()) {
+                std::thread::sleep(QUIT_GRACE.saturating_sub(ORPHAN_GRACE));
+            }
+            // (24 nov., audit F13) un arret sec, sans les destructeurs ni les gestionnaires de sortie du plugin : exit()
+            // les lancait pendant que son fil audio ou une boite de dialogue le tenait encore, et pouvait ne jamais finir
+            hard_exit(0);
         });
     }
     // le dernier etat ecrit (empreinte, taille) et la marque des changements a ce moment-la
     let mut last_saved: Option<(String, usize)> = None;
     let mut last_mark = u64::MAX;
+    // (24 nov., 0.4.15) la marque a l'ouverture (reglages charges) : « saved » dit si le plugin a change depuis (touched),
+    // le compagnon ne decharge pas un plugin touche dont le studio n'a encore aucune empreinte
+    let opened = changes(&inst);
     // (20 nov., Link to controller) l'id → l'indice des parametres (rempli par « params », au fil de l'interface) ; le fil
     // du suivi envoie les gestes de l'editeur au compagnon (« param »), toutes les 80 ms, tant que le studio suit
     let pmap: Arc<Mutex<std::collections::HashMap<u32, u32>>> = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -655,7 +688,7 @@ fn run(a: HostArgs) -> Result<(), String> {
                 match v["cmd"].as_str().unwrap_or("") {
                     "save" => {
                         drop(q);
-                        save_cmd(&inst, &a.states_dir, &mut last_saved, &mut last_mark, v["n"].clone());
+                        save_cmd(&inst, &a.states_dir, &mut last_saved, &mut last_mark, opened, v["n"].clone());
                     }
                     "mix" | "tempo" => {
                         drop(q);
@@ -698,7 +731,7 @@ fn run(a: HostArgs) -> Result<(), String> {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 match v["cmd"].as_str().unwrap_or("") {
                     "quit" => break 'ui,
-                    "save" => save_cmd(&inst, &a.states_dir, &mut last_saved, &mut last_mark, v["n"].clone()),
+                    "save" => save_cmd(&inst, &a.states_dir, &mut last_saved, &mut last_mark, opened, v["n"].clone()),
                     "editor" | "view" => {
                         let on = if v["cmd"] == "editor" { v["show"].as_bool().unwrap_or(false) } else { v["open"].as_bool().unwrap_or(false) };
                         if v["cmd"] == "editor" {
@@ -824,13 +857,14 @@ fn run(a: HostArgs) -> Result<(), String> {
 }
 
 /// « save » : l'etat du plugin ecrit dans le dossier des etats (son empreinte pour nom), → {"event":"saved"}.
-fn save_cmd(inst: &Instance, states_dir: &Path, last_saved: &mut Option<(String, usize)>, last_mark: &mut u64, n: Value) {
+fn save_cmd(inst: &Instance, states_dir: &Path, last_saved: &mut Option<(String, usize)>, last_mark: &mut u64, opened: u64, n: Value) {
     // (19 nov.) l'etat de certains plugins change de quelques octets sans qu'on touche a rien (Diva) :
     // il n'est relu que si le plugin a dit un changement (un geste dans l'editeur, restartComponent)
     // depuis le dernier enregistrement — sinon une empreinte de plus toutes les 15 s (Kontakt : 160 Ko)
     let mark = changes(inst);
+    let touched = mark != opened;
     if let (Some((sha, bytes)), true) = (&*last_saved, mark == *last_mark) {
-        out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": bytes, "unchanged": true }));
+        out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": bytes, "unchanged": true, "touched": touched }));
         return;
     }
     match inst.get_state() {
@@ -844,7 +878,7 @@ fn save_cmd(inst: &Instance, states_dir: &Path, last_saved: &mut Option<(String,
                 *last_mark = mark;
             }
             match r {
-                Ok(()) => out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": blob.len() })),
+                Ok(()) => out(json!({ "event": "saved", "n": n, "sha": sha, "bytes": blob.len(), "touched": touched })),
                 Err(e) => out(json!({ "event": "error", "n": n, "error": format!("the state could not be written ({e})") })),
             }
         }
@@ -1397,6 +1431,14 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_orphan_child_is_told_apart_on_unix_only() {
+        assert_eq!(orphaned(500, 1), cfg!(unix), "reparented to launchd");
+        assert_eq!(orphaned(500, 600), cfg!(unix), "another parent");
+        assert!(!orphaned(500, 500), "the companion is still there");
+        assert!(!orphaned(0, 0));
+    }
 
     #[test]
     fn state_round_trip() {

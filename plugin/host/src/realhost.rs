@@ -534,6 +534,9 @@ impl Instance {
         if let Some(c) = &self.ctrl {
             unsafe { c.setParamNormalized(id, v) };
         }
+        // (24 nov., 0.4.15) un reglage venu du studio est un changement comme un geste de l'editeur : sans lui, « save »
+        // repondait « inchange » (l'empreinte d'avant) et le reglage se perdait a la reouverture du projet
+        self.handler.edits.fetch_add(1, Ordering::Relaxed);
         let mut p = self.handler.pending.lock().unwrap();
         if p.len() < 4096 {
             p.push((id, v));

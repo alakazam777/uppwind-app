@@ -48,6 +48,11 @@ pub const AUTO_FIRST: Duration = Duration::from_secs(90);
 pub const AUTO_RETRY: Duration = Duration::from_secs(30 * 60);
 /// Le cle du fichier d'etat.
 pub const STATE_KEY: &str = "autoUpdate";
+/// (24 nov., audit E2) La case « Update automatically » est retiree tant que les mises a jour ne sont pas signees par une
+/// cle gardee hors de GitHub : l'empreinte vient de la meme release que l'exe, et quelqu'un qui tiendrait le compte GitHub
+/// installerait sans un clic son propre programme sur chaque ordinateur. Un clic sur « Update » reste possible (la
+/// personne voit la version). Une case cochee par une version d'avant ne fait plus rien.
+pub const AUTO_AVAILABLE: bool = false;
 
 const MAX_API: usize = 1024 * 1024;
 const MAX_SUMS: usize = 16 * 1024;
@@ -206,6 +211,8 @@ pub struct View {
     pub supported: bool,
     /// la case « Update automatically »
     pub auto: bool,
+    /// (24 nov., audit E2) la case est-elle proposee (AUTO_AVAILABLE)
+    pub auto_available: bool,
     pub checking: bool,
     pub installing: bool,
     /// la derniere version publiee, si on l'a lue
@@ -223,6 +230,7 @@ pub fn view(state_file: Option<&Path>, updates_dir: Option<&Path>) -> View {
     View {
         supported: cfg!(windows),
         auto: state_file.is_some_and(auto_on),
+        auto_available: AUTO_AVAILABLE,
         checking: s.checking,
         installing: s.installing(),
         latest: s.found.as_ref().map(|(r, _)| r.version.clone()),
@@ -235,10 +243,18 @@ pub fn view(state_file: Option<&Path>, updates_dir: Option<&Path>) -> View {
 
 /// « autoUpdate » du fichier d'etat.
 pub fn auto_on(state_file: &Path) -> bool {
+    AUTO_AVAILABLE && auto_ticked(state_file)
+}
+
+/// La case telle que le fichier d'etat la garde (sans tenir compte de AUTO_AVAILABLE).
+pub fn auto_ticked(state_file: &Path) -> bool {
     crate::state_file::read(state_file).is_some_and(|v| v[STATE_KEY] == Value::Bool(true))
 }
 
 pub fn set_auto(state_file: &Path, on: bool) -> Result<bool, String> {
+    if on && !AUTO_AVAILABLE {
+        return Err("Automatic updates are off until updates are signed: use Check for updates, then Update.".into());
+    }
     crate::state_file::update(state_file, |v| {
         v[STATE_KEY] = Value::Bool(on);
         true
@@ -648,6 +664,15 @@ mod tests {
         let f = d.join("state.json");
         std::fs::write(&f, r#"{"token":"t"}"#).unwrap();
         assert!(!auto_on(&f), "off until ticked");
+        // (24 nov., audit E2) retiree tant que les mises a jour ne sont pas signees : ni cochee, ni lue
+        if !AUTO_AVAILABLE {
+            assert!(set_auto(&f, true).is_err());
+            std::fs::write(&f, r#"{"token":"t","autoUpdate":true}"#).unwrap();
+            assert!(auto_ticked(&f) && !auto_on(&f), "ticked by an older version: it does nothing");
+            std::fs::write(&f, r#"{"token":"t"}"#).unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
         assert_eq!(set_auto(&f, true), Ok(true));
         assert!(auto_on(&f));
         assert_eq!(crate::state_file::read(&f).unwrap()["token"], "t", "the rest of the file stays");

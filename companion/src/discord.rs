@@ -75,7 +75,7 @@ pub struct Track {
 
 /// Les caracteres qui changent le sens d'ecriture (U+202A-202E, U+2066-2069, U+200E, U+200F) ou ne se voient pas
 /// (U+200B-200D, U+FEFF) : retires, un titre ne doit pas retourner le texte qui le suit sur le profil.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
 }
 
@@ -306,7 +306,11 @@ mod sys {
     pub fn open() -> io::Result<Box<dyn Pipe>> {
         for n in 0..10 {
             let path = format!(r"\\.\pipe\discord-ipc-{n}");
-            if let Ok(f) = OpenOptions::new().read(true).write(true).open(&path) {
+            // (24 nov., audit F2) SECURITY_IDENTIFICATION : un programme qui servirait ce tuyau a la place de Discord ne peut
+            // pas emprunter l'identite du compagnon (sans ce drapeau, Windows le permettait par defaut)
+            use std::os::windows::fs::OpenOptionsExt;
+            const SECURITY_IDENTIFICATION: u32 = 1 << 16;
+            if let Ok(f) = OpenOptions::new().read(true).write(true).security_qos_flags(SECURITY_IDENTIFICATION).open(&path) {
                 return Ok(Box::new(WinPipe(f)));
             }
         }

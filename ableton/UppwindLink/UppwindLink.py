@@ -89,7 +89,7 @@ from .link_core import LinkCore
 from .editor_core import EditorCore, EDITOR_VERSION
 from .editor_channel import LocalChannel
 
-SCRIPT_VERSION = "1.3.1"
+SCRIPT_VERSION = "1.3.2"  # (24 nov.) 1.3.2 : le canal local refuse un jeton non ASCII, son fichier ecrit par un temporaire neuf
 TAG = "[Uppwind Link]"
 CHANNEL_PRIORITY = 2          # le vrai script sert le canal local avant le script de dev (priorite 1)
 LINK_TRANSPORT = 2            # (25 oct.) le fichier d'etat le dit au compagnon : LINK et ROUTES sont servis ici ;

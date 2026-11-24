@@ -60,7 +60,10 @@ fn state_path() -> Option<std::path::PathBuf> {
 pub fn set_auto_update(on: bool) -> Result<bool, String> {
     let path = state_path().ok_or("Uppwind Link is not running.")?;
     let r = crate::update::set_auto(&path, on);
-    crate::log(&format!("update: automatic updates {} (the status window)", if on { "ON" } else { "off" }));
+    match &r {
+        Ok(on) => crate::log(&format!("update: automatic updates {} (the status window)", if *on { "ON" } else { "off" })),
+        Err(e) => crate::log(&format!("update: automatic updates not changed ({e})")),
+    }
     r
 }
 

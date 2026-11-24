@@ -86,7 +86,9 @@ jobs:
           security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
           umask 077
           printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/uwl-cert.p12"
-          security import "$RUNNER_TEMP/uwl-cert.p12" -k "$KEYCHAIN" -f pkcs12 -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign > /dev/null
+          # (24 nov., audit M8) -x : la cle privee ne peut pas etre exportee du trousseau (une dependance compromise qui
+          # tournerait pendant le build pourrait encore signer, plus emporter la cle)
+          security import "$RUNNER_TEMP/uwl-cert.p12" -k "$KEYCHAIN" -f pkcs12 -x -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign > /dev/null
           rm -f "$RUNNER_TEMP/uwl-cert.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN" > /dev/null
           # the job's keychain first in the search list, the runner's own ones kept after it

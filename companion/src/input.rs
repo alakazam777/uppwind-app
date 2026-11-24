@@ -786,9 +786,24 @@ impl Injector {
         let (pid, b) = (w.pid.max(0) as u32, w.bounds);
         let (cw, ch) = (b.size.width.round() as i32, b.size.height.round() as i32);
         let screen = |p: (i32, i32)| (b.origin.x + p.0 as f64, b.origin.y + p.1 as f64);
+        // (24 nov., audit M4) un evenement poste au processus va a la fenetre de l'appli qui est sous le point : avant un
+        // appui ou un cran de molette, la plus haute fenetre de cette appli sous le point doit etre celle suivie (ou un de
+        // ses menus), jamais une autre fenetre du DAW posee dessus (ses reglages, une boite de dialogue)
+        let covered = |p: (i32, i32)| -> bool {
+            let (x, y) = screen(p);
+            let wins: Vec<OwnWin> = crate::macos::on_screen_windows()
+                .into_iter()
+                .map(|m| OwnWin { id: m.id as u64, pid: m.pid, frame: [m.bounds.origin.x, m.bounds.origin.y, m.bounds.size.width, m.bounds.size.height], menu: m.layer == crate::popups::MAC_MENU_LAYER })
+                .collect();
+            let menus: Vec<u64> = crate::popups::list(top).iter().map(|p| p.id).collect();
+            !own_window_at_is(&wins, w.pid, x, y, top, &menus)
+        };
         match ev {
             InputEvent::Pointer { action, pt, button, buttons, mods } => {
                 let p = map_point(pt, cw, ch);
+                if matches!(action, PointerAction::Down | PointerAction::DblClick) && covered(p) {
+                    return Err(COVERED_REFUSED.into());
+                }
                 if matches!(action, PointerAction::DblClick) {
                     self.mac_clicks = 2;
                 } else if matches!(action, PointerAction::Down) {
@@ -806,17 +821,44 @@ impl Injector {
             }
             InputEvent::Wheel { pt, dx, dy, mods } => {
                 let p = map_point(pt, cw, ch);
+                if covered(p) {
+                    return Err(COVERED_REFUSED.into());
+                }
                 let (wx, wy) = mac_wheel(*dx, *dy);
                 crate::macos::post_wheel(pid, screen(p), wx, wy, mac_flags(*mods))?;
                 Ok(Outcome { applied: true, pointer: Some(p) })
             }
+            // (24 nov., audit E1) une touche postee au processus va a la fenetre ACTIVE de l'appli (sa fenetre principale,
+            // ses raccourcis : Cmd+Q, Cmd+S, Suppr, Espace), pas a la fenetre suivie. Jamais de raccourci (Ctrl, Alt, Cmd,
+            // touches F), et une touche seulement si la fenetre active du DAW est celle du plugin suivi (l'Accessibilite ;
+            // sans elle, rien) ; sinon refusee, sans rien envoyer
             InputEvent::Key { down, key, code, mods } => {
+                // (24 nov., relecture) coupe pour la 0.4.15, comme pour Logic : une course entre le controle de la
+                // fenetre active et l'envoi laisse un geste juste avant ouvrir une boite qui recoit la frappe
+                if !MAC_DAW_KEYS {
+                    return Err(MAC_DAW_KEYS_OFF.into());
+                }
+                if crate::session::key_shortcut(ev) {
+                    return Err(MAC_SHORTCUT_REFUSED.into());
+                }
                 let Some(kc) = mac_keycode_of_code(code) else { return Err("this key is not sent to plugins".into()) };
+                if !crate::macos::ax_focused_window_is(w.pid, [b.origin.x, b.origin.y, b.size.width, b.size.height]) {
+                    return Err(MAC_KEY_NOT_FOCUSED.into());
+                }
                 let text: Vec<u16> = if *down { chars_for_key(key, *mods) } else { Vec::new() };
                 crate::macos::post_key(pid, kc, *down, &text, mac_flags(*mods))?;
                 Ok(Outcome { applied: true, pointer: None })
             }
             InputEvent::Text { text } => {
+                if !MAC_DAW_KEYS {
+                    return Err(MAC_DAW_KEYS_OFF.into());
+                }
+                if crate::session::key_shortcut(ev) {
+                    return Err(MAC_SHORTCUT_REFUSED.into());
+                }
+                if !crate::macos::ax_focused_window_is(w.pid, [b.origin.x, b.origin.y, b.size.width, b.size.height]) {
+                    return Err(MAC_KEY_NOT_FOCUSED.into());
+                }
                 // une touche neutre (Espace, code 49) qui porte le texte : AppKit lit les caracteres de l'evenement
                 let u: Vec<u16> = text.encode_utf16().collect();
                 for chunk in u.chunks(20) {
@@ -1004,6 +1046,48 @@ impl Injector {
 }
 
 /// Le pid de l'appli d'une fenetre (0 : fermee, ou un systeme sans gestes).
+/// (24 nov., relecture) Le clavier vers une fenetre de plugin d'un DAW (Live) sur Mac : coupe en 0.4.15, comme pour Logic.
+/// La frappe dans un plugin heberge par le compagnon, elle, passe par son enfant (macui), qui controle au moment exact.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MAC_DAW_KEYS: bool = false;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MAC_DAW_KEYS_OFF: &str = "typing into a DAW's plugin window is not available on a Mac yet: type in the DAW, or host the plugin in Uppwind Link";
+
+/// (24 nov., audit M4) Ce que le studio lit quand une autre fenetre du DAW couvre le plugin a l'endroit d'un appui.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const COVERED_REFUSED: &str = "another window of the DAW covers the plugin window at that point: nothing clicked";
+/// (24 nov., audit E1) Les raccourcis clavier ne vont jamais a une fenetre de DAW sur Mac (ils iraient au DAW lui-meme).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MAC_SHORTCUT_REFUSED: &str = "no keyboard shortcuts (Ctrl, Alt, Cmd, F keys) to a DAW on a Mac";
+/// (24 nov., audit E1) La touche irait a une autre fenetre du DAW que celle du plugin.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MAC_KEY_NOT_FOCUSED: &str =
+    "typing goes to the plugin window only when it is the DAW's active window: click inside the plugin window in the DAW once (needs Accessibility for the companion)";
+
+/// (24 nov., audit M4) Une fenetre a l'ecran, de la plus haute a la plus basse : son numero, son appli, son cadre (x, y,
+/// largeur, hauteur en points).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OwnWin {
+    pub id: u64,
+    pub pid: i32,
+    pub frame: [f64; 4],
+    /// au niveau des menus (kCGPopUpMenuWindowLevel) : un menu ouvert de l'appli (celui du plugin, ouvert par un clic droit)
+    pub menu: bool,
+}
+
+/// (24 nov., audit M4) Sous le point (x, y) de l'ecran, la plus haute fenetre de l'appli `pid` est-elle `top` (ou un de
+/// ses menus, `menus`) ? Les fenetres des autres applis ne comptent pas : l'evenement poste au processus ne va qu'a ses
+/// fenetres. Aucune fenetre de l'appli sous le point : non.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn own_window_at_is(wins: &[OwnWin], pid: i32, x: f64, y: f64, top: u64, menus: &[u64]) -> bool {
+    let inside = |f: [f64; 4]| x >= f[0] && y >= f[1] && x < f[0] + f[2] && y < f[1] + f[3];
+    match wins.iter().find(|w| w.pid == pid && inside(w.frame)) {
+        Some(w) => w.id == top || w.menu || menus.contains(&w.id),
+        None => false,
+    }
+}
+
 pub fn pid_of(id: u64) -> u32 {
     #[cfg(windows)]
     {
@@ -1913,6 +1997,22 @@ mod window_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (24 nov., audit M4) un appui ne va que si la plus haute fenetre du DAW sous le point est celle suivie (ou un de
+    /// ses menus) ; une autre appli posee dessus ne compte pas (l'evenement ne va qu'au DAW)
+    #[test]
+    fn a_press_goes_only_where_the_watched_window_is_on_top_of_its_app() {
+        let w = |id, pid, x, y, wd, h| OwnWin { id, pid, frame: [x, y, wd, h], menu: false };
+        // de la plus haute a la plus basse : Chrome (autre appli), les reglages de Live, le plugin, la fenetre de Live
+        let wins = [w(1, 99, 0.0, 0.0, 2000.0, 2000.0), w(2, 10, 100.0, 100.0, 200.0, 200.0), w(3, 10, 50.0, 50.0, 600.0, 400.0), w(4, 10, 0.0, 0.0, 1800.0, 1100.0)];
+        assert!(own_window_at_is(&wins, 10, 400.0, 300.0, 3, &[]), "the plugin, under Chrome: Chrome does not count");
+        assert!(!own_window_at_is(&wins, 10, 150.0, 150.0, 3, &[]), "Live's settings cover the plugin there");
+        assert!(!own_window_at_is(&wins, 10, 1000.0, 1000.0, 3, &[]), "outside the plugin: Live's main window");
+        assert!(own_window_at_is(&wins, 10, 150.0, 150.0, 3, &[2]), "a menu of the plugin");
+        assert!(!own_window_at_is(&wins, 10, 1900.0, 1900.0, 3, &[]), "no window of Live there");
+        let open = [OwnWin { menu: true, ..w(5, 10, 120.0, 120.0, 100.0, 50.0) }, wins[1], wins[2]];
+        assert!(own_window_at_is(&open, 10, 130.0, 130.0, 3, &[]), "an open menu of the app, on top");
+    }
 
     #[test]
     fn escape_never_reaches_an_fl_plugin_without_an_open_menu() {
