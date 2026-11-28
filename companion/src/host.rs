@@ -567,17 +567,111 @@ fn hidden(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// (audit F8) La plus longue ligne lue d'un enfant (un etat de plugin en base64 tient bien en dessous). Au-dela, la
+/// ligne est jetee jusqu'a son retour a la ligne, sans etre gardee en memoire.
+pub const MAX_CHILD_LINE: usize = 32 << 20;
+
+/// (audit F8) Les lignes d'un enfant, chacune de MAX_CHILD_LINE octets au plus ; s'arrete a la fin ou a une erreur.
+fn capped_lines(r: impl std::io::Read) -> impl Iterator<Item = String> {
+    capped_lines_of(r, MAX_CHILD_LINE)
+}
+
+fn capped_lines_of(r: impl std::io::Read, max: usize) -> impl Iterator<Item = String> {
+    let mut r = BufReader::new(r);
+    std::iter::from_fn(move || loop {
+        let mut line = Vec::new();
+        let mut over = false;
+        loop {
+            let buf = match r.fill_buf() {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            };
+            if buf.is_empty() {
+                return if line.is_empty() || over { None } else { Some(String::from_utf8_lossy(&line).into_owned()) };
+            }
+            let (chunk, done) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (&buf[..i], i + 1),
+                None => (buf, buf.len()),
+            };
+            let end = chunk.len() < done;
+            if !over {
+                if line.len() + chunk.len() > max {
+                    over = true;
+                    line = Vec::new();
+                } else {
+                    line.extend_from_slice(chunk);
+                }
+            }
+            r.consume(done);
+            if end {
+                break;
+            }
+        }
+        if over {
+            continue;
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        return Some(String::from_utf8_lossy(&line).into_owned());
+    })
+}
+
+/// (relecture F8) La sortie standard de l'enfant : NUL sous Windows (le protocole passe par proto_of), le tuyau du
+/// protocole sur Mac (l'enfant le met de cote avant de charger le module, child::private_stdout).
+fn proto_stdout(cmd: &mut Command) {
+    if cfg!(windows) {
+        cmd.stdout(Stdio::null());
+    } else {
+        cmd.stdout(Stdio::piped());
+    }
+}
+
+/// (relecture F8) Le canal du protocole d'un enfant qui vient de demarrer. Windows : un tuyau neuf, non heritable ;
+/// le compagnon copie son bout d'ecriture dans l'enfant (DuplicateHandle) et lui en donne la valeur en premiere ligne
+/// de son entree standard. Le plugin, lui, ne voit qu'une sortie standard sur NUL : un printf ne touche ni ce tuyau,
+/// ni un fichier qui aurait repris la valeur d'une poignee fermee.
+#[cfg(windows)]
+fn proto_of(child: &mut Child) -> Result<Box<dyn std::io::Read + Send>, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let (r, w) = std::io::pipe().map_err(|e| format!("cannot open the plugin host's channel ({e})"))?;
+    let mut theirs = HANDLE::default();
+    unsafe { DuplicateHandle(GetCurrentProcess(), HANDLE(w.as_raw_handle()), HANDLE(child.as_raw_handle()), &mut theirs, 0, false, DUPLICATE_SAME_ACCESS) }
+        .map_err(|e| format!("cannot give the plugin host its channel ({e})"))?;
+    drop(w);
+    let stdin = child.stdin.as_mut().ok_or("no input")?;
+    writeln!(stdin, "{{\"proto\":{}}}", theirs.0 as usize).and_then(|_| stdin.flush()).map_err(|e| format!("cannot reach the plugin host ({e})"))?;
+    Ok(Box::new(r))
+}
+
+#[cfg(not(windows))]
+fn proto_of(child: &mut Child) -> Result<Box<dyn std::io::Read + Send>, String> {
+    Ok(Box::new(child.stdout.take().ok_or("no output")?))
+}
+
 /// Un module dans un processus a part : ses classes, ou pourquoi pas.
 fn scan_one(c: &Cfg, p: &Path) -> Result<Vec<Value>, String> {
     let mut cmd = Command::new(&c.exe);
-    cmd.arg("--plug-scan").arg(p).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.arg("--plug-scan").arg(p).stdin(Stdio::piped()).stderr(Stdio::null());
+    proto_stdout(&mut cmd);
     hidden(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("cannot start the scan ({e})"))?;
     tie_to_companion(&child);
-    let stdout = child.stdout.take().ok_or("no output")?;
+    let stdout = match proto_of(&mut child) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    drop(child.stdin.take());
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in capped_lines(stdout) {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 if v.get("ok").is_some() {
                     let _ = tx.send(v);
@@ -801,10 +895,10 @@ fn writer(mut stdin: ChildStdin, rx: mpsc::Receiver<String>) {
     });
 }
 
-fn reader(inst: Arc<Inst>, stdout: std::process::ChildStdout, ready_tx: Sender<Result<Value, String>>) {
+fn reader(inst: Arc<Inst>, stdout: Box<dyn std::io::Read + Send>, ready_tx: Sender<Result<Value, String>>) {
     std::thread::spawn(move || {
         let mut ready_tx = Some(ready_tx);
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in capped_lines(stdout) {
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
             match v["event"].as_str().unwrap_or("") {
                 "ready" => {
@@ -970,7 +1064,8 @@ fn add(plugin: &str, state: Option<&str>, rate: Option<u32>) -> Result<Value, St
             state_note = Some("the saved settings of this plugin are not on this computer: it opens with its defaults");
         }
     }
-    cmd.env("UWL_STATE_FILE", &c.state_file).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.env("UWL_STATE_FILE", &c.state_file).stdin(Stdio::piped()).stderr(Stdio::null());
+    proto_stdout(&mut cmd);
     // (20 nov.) les essais des menus (UWL_HOST_MENU_LOG=1, macui) : ce que l'enfant ecrit va au journal du compagnon
     if uwl_vst3host::dev_env("UWL_HOST_MENU_LOG").is_some_and(|v| v == "1") {
         cmd.stderr(Stdio::inherit());
@@ -978,10 +1073,17 @@ fn add(plugin: &str, state: Option<&str>, rate: Option<u32>) -> Result<Value, St
     hidden(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("cannot start the plugin host ({e})"))?;
     tie_to_companion(&child);
+    let stdout = match proto_of(&mut child) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     let stdin = child.stdin.take().ok_or("no input")?;
     let (tx, wrx) = mpsc::sync_channel(WRITE_QUEUE);
     writer(stdin, wrx);
-    let stdout = child.stdout.take().ok_or("no output")?;
     let pid = child.id();
     let name = class["name"].as_str().unwrap_or("Plugin").to_string();
     let inst = Arc::new(Inst {
@@ -1366,6 +1468,16 @@ impl Place {
     }
 }
 
+/// (F21) Lance `f` dans un fil s'il reste une place (le meme plafond que `request`) ; sinon rend faux, sans fil.
+pub fn spawn_placed(id: Option<u32>, f: impl FnOnce() + Send + 'static) -> bool {
+    let Some(place) = Place::take(id) else { return false };
+    std::thread::spawn(move || {
+        let _place = place;
+        f();
+    });
+    true
+}
+
 impl Drop for Place {
     fn drop(&mut self) {
         let mut g = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1508,6 +1620,18 @@ pub fn request(v: Value, reply: Sender<String>) {
         };
         let _ = reply.send(msg.to_string());
     });
+}
+
+#[cfg(test)]
+mod f8_tests {
+    #[test]
+    fn a_too_long_child_line_is_dropped_and_the_next_ones_read() {
+        let mut input = b"{\"a\":1}\r\n".to_vec();
+        input.extend(std::iter::repeat(b'x').take(100));
+        input.extend_from_slice(b"\n{\"b\":2}\nlast");
+        let got: Vec<String> = super::capped_lines_of(&input[..], 16).collect();
+        assert_eq!(got, vec!["{\"a\":1}", "{\"b\":2}", "last"]);
+    }
 }
 
 #[cfg(test)]

@@ -525,25 +525,52 @@ pub fn other_companions() -> Vec<(u32, String)> {
     Vec::new()
 }
 
+/// (F14) `path` est un chemin complet (pas un nom seul) dont le dossier est `here`, sans tenir compte de la casse.
+pub fn same_folder(here: Option<&str>, path: &str) -> bool {
+    let Some(here) = here else { return false };
+    let Some(cut) = path.rfind(['\\', '/']) else { return false };
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    !here.is_empty() && norm(&path[..cut]) == norm(here)
+}
+
 /// (27 oct.) --stop : apres le compagnon a icone et celui du fichier d'etat, ceux qui restent (lances en console).
 #[cfg(windows)]
 pub fn stop_others() -> Vec<String> {
+    let here = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
+    stop_others_in(here.as_deref())
+}
+
+/// (F14) Arrete les compagnons de la session dont l'image est dans le dossier `here`, et eux seuls.
+/// (relecture) Un seul handle par processus (TERMINATE et QUERY_LIMITED) : le chemin est relu sur ce handle-la, juste
+/// avant de terminer, pour qu'un pid repris entre la liste et l'arret ne soit pas tue.
+#[cfg(windows)]
+pub fn stop_others_in(here: Option<&str>) -> Vec<String> {
+    use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
     other_companions()
         .into_iter()
-        .map(|(pid, path)| unsafe {
-            match OpenProcess(PROCESS_TERMINATE, false, pid) {
-                Ok(h) => {
-                    let r = TerminateProcess(h, 0);
-                    let _ = CloseHandle(h);
-                    match r {
-                        Ok(()) => format!("Stopped the companion (pid {pid}, {path})."),
-                        Err(e) => format!("cannot stop pid {pid} ({path}): {e}"),
-                    }
-                }
-                Err(e) => format!("cannot stop pid {pid} ({path}): {e}"),
+        .filter_map(|(pid, listed)| unsafe {
+            // (F14) pas par le seul nom : le chemin complet de l'image doit etre dans le dossier de cet exe
+            if !same_folder(here, &listed) {
+                return Some(format!("Left pid {pid} running ({listed}): not in this companion's folder."));
             }
+            let h = match OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(h) => h,
+                Err(e) => return Some(format!("cannot stop pid {pid} ({listed}): {e}")),
+            };
+            let mut buf = [0u16; 1024];
+            let mut n = buf.len() as u32;
+            let path = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).ok().map(|_| String::from_utf16_lossy(&buf[..n as usize]));
+            let msg = match path {
+                Some(p) if same_folder(here, &p) && is_companion_image(&p) => match TerminateProcess(h, 0) {
+                    Ok(()) => format!("Stopped the companion (pid {pid}, {p})."),
+                    Err(e) => format!("cannot stop pid {pid} ({p}): {e}"),
+                },
+                _ => format!("Left pid {pid} running: it is no longer the companion that was listed."),
+            };
+            let _ = CloseHandle(h);
+            Some(msg)
         })
         .collect()
 }
@@ -1021,5 +1048,50 @@ mod tests {
         child.kill().unwrap();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod f14_tests {
+    use super::same_folder;
+
+    #[test]
+    fn stop_only_touches_an_image_in_this_folder() {
+        let here = Some(r"C:\Users\a\AppData\Local\Uppwind Link");
+        assert!(same_folder(here, r"c:\users\a\appdata\local\uppwind link\uppwind-companion.exe"));
+        assert!(same_folder(here, r"C:\Users\a\AppData\Local\Uppwind Link\uppwind-companion.part4.exe"));
+        assert!(!same_folder(here, r"C:\Temp\uppwind-companion.exe"));
+        assert!(!same_folder(here, "uppwind-companion.exe"));
+        assert!(!same_folder(None, r"C:\x\uppwind-companion.exe"));
+    }
+
+    /// (relecture) Deux vrais processus au nom d'un compagnon (des copies de PING.EXE) : celui du dossier donne est
+    /// arrete, celui d'un autre dossier continue.
+    #[cfg(windows)]
+    #[test]
+    fn stop_others_stops_this_folder_only() {
+        let base = std::env::temp_dir().join(format!("uwl-f14-{}", std::process::id()));
+        let (mine, other) = (base.join("mine"), base.join("other"));
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let start = |d: &std::path::Path| {
+            let exe = d.join("uppwind-companion-f14test.exe");
+            std::fs::copy(r"C:\Windows\System32\PING.EXE", &exe).unwrap();
+            std::process::Command::new(&exe).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap()
+        };
+        let (mut a, mut b) = (start(&mine), start(&other));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let here = mine.to_string_lossy().into_owned();
+        let said = super::stop_others_in(Some(&here));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let a_done = a.try_wait().unwrap().is_some();
+        let b_done = b.try_wait().unwrap().is_some();
+        let _ = a.kill();
+        let _ = b.kill();
+        let _ = a.wait();
+        let _ = b.wait();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(a_done, "the copy in this folder still runs: {said:?}");
+        assert!(!b_done, "the copy in another folder was stopped: {said:?}");
     }
 }

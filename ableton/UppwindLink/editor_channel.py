@@ -51,6 +51,54 @@ def state_file():
     return os.path.join(os.path.expanduser("~"), STATE_NAME)
 
 
+MIDI_SECRET_NAME = ".uppwind-link-midi.json"   # (24 nov.) le code du chemin MIDI, quand le compagnon n'en a pas pose
+ENV_MIDI_FILE = "UWLINK_MIDI_FILE"            # un autre chemin pour ce fichier (les tests)
+
+
+def _write_private(path, data):
+    """Un fichier JSON a nous seuls (0600), ecrit par un temporaire neuf (jamais un reste ou un lien pose avant)."""
+    tmp = path + ".tmp"
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)               # (24 nov., relecture) d'un coup : jamais un instant sans le fichier
+
+
+def load_midi_secret(proto, log=None, companion=None):
+    """(24 nov., audit M3) Le secret du chemin MIDI -> (15 octets, 'companion' | 'file' | 'session').
+    companion : le module uwl_secret (ecrit par le compagnon a cote du script), ou None ; sinon le code garde dans
+    ~/.uppwind-link-midi.json ; sinon un code neuf, garde la (on ne le colle qu'une fois dans le studio)."""
+    log = log or (lambda m: None)
+    if companion is not None:
+        s = proto.secret_of(getattr(companion, "SECRET", ""))
+        if s:
+            return s, "companion"
+        log("uwl_secret.py holds no valid code: using this script's own")
+    path = os.environ.get(ENV_MIDI_FILE) or os.path.join(os.path.expanduser("~"), MIDI_SECRET_NAME)
+    try:
+        with open(path) as f:
+            s = proto.secret_of(json.load(f).get("code", ""))
+        if s:
+            return s, "file"
+    except (OSError, ValueError, AttributeError):
+        pass
+    s = proto.random_bytes(proto.SECRET_BYTES)
+    if proto.random_is_weak():
+        # (24 nov., relecture) un code tire de l'horloge se devine : ni garde, ni utilise
+        log("no system random source: no MIDI link code (install the script with the Uppwind Link companion)")
+        return b"", "weak"
+    try:
+        _write_private(path, {"code": proto.code_of(s), "made": int(time.time())})
+        return s, "file"
+    except Exception as e:
+        log("cannot keep the MIDI link code in %s (%s): it changes each time Live starts" % (path, e))
+        return s, "session"
+
+
 def new_token():
     return binascii.hexlify(os.urandom(32)).decode("ascii")       # 256 bits
 
@@ -162,22 +210,13 @@ class LocalChannel(object):
         self._log("%s takes the local channel over: standing by" % getattr(other, "name", "another script"))
 
     def _write_state(self):
-        data = {"port": self.port, "token": self.token, "host": HOST, "started": int(time.time())}
+        # (audit F6) le pid de Live : apres un plantage, le compagnon voit que ce processus n'est plus la et garde le jeton
+        data = {"port": self.port, "token": self.token, "host": HOST, "started": int(time.time()), "pid": os.getpid()}
         data.update(self.info)
         try:
-            tmp = self.path + ".tmp"
             # (24 nov., audit F20) un fichier temporaire neuf, a nous, en 0600 : jamais un reste (ou un lien) pose avant,
             # dont les droits seraient gardes
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f)
-            if os.path.exists(self.path):
-                os.remove(self.path)
-            os.rename(tmp, self.path)
+            _write_private(self.path, data)
         except Exception as e:
             self._log("cannot write %s: %s" % (self.path, e))
 

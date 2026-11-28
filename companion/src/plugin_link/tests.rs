@@ -391,21 +391,39 @@ fn an_older_plugin_is_refused_with_a_reason_the_studio_shows() {
     assert_eq!(hub.notices_generation(), 2);
 }
 
+/// (24 nov., probleme 7) seize plugins prouves tiennent toutes les places : un dix-septieme est refuse, aucun n'est ferme
 #[test]
-fn plugin_connections_are_capped_from_the_accept() {
+fn sixteen_proved_plugins_keep_their_places() {
+    let hub = Hub::listen(0, SECRET).unwrap();
+    let held: Vec<_> = (0..MAX_CONNECTIONS as u64).map(|i| Fake::connect(&hub, p::Kind::Return, 0x100 + i, SECRET, 48000)).collect();
+    assert!(held.iter().all(|(_, w)| w.status == p::status::OK));
+    std::thread::sleep(Duration::from_millis(1200)); // plus vieux que la protection : rien ne les protege que leur preuve
+    let mut s = TcpStream::connect(("127.0.0.1", hub.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let mut buf = [0u8; 16];
+    assert!(matches!(s.read(&mut buf), Ok(0) | Err(_)), "a 17th is closed at once");
+    assert_eq!(hub.list().len(), MAX_CONNECTIONS, "the 16 proved plugins are all still there");
+}
+
+#[test]
+fn plugin_connections_are_capped_and_unproven_ones_make_way() {
     let hub = Hub::listen(0, SECRET).unwrap();
     // MAX_CONNECTIONS connexions muettes (avant HELLO) tiennent toutes les places
     let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| TcpStream::connect(("127.0.0.1", hub.port)).unwrap()).collect();
-    std::thread::sleep(Duration::from_millis(200));
-    let mut s = TcpStream::connect(("127.0.0.1", hub.port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let mut buf = [0u8; 16];
-    assert!(matches!(s.read(&mut buf), Ok(0) | Err(_)), "one more is closed at once");
-    drop(idle);
-    // les places reviennent des que ces connexions se ferment
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(1200));
+    // (24 nov., relecture, probleme 7) un vrai plugin entre quand meme : la plus ancienne connexion muette laisse sa place
+    let t0 = std::time::Instant::now();
     let (_f, w) = Fake::connect(&hub, p::Kind::Return, 0x42, SECRET, 48000);
     assert_eq!(w.status, p::status::OK);
+    assert!(t0.elapsed() < Duration::from_secs(2), "at once");
+    // (le port ferme de toute facon une connexion sans HELLO a 2 s : lue a 300 ms, elle n'est fermee que pour l'autre)
+    let mut first = &idle[0];
+    first.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let mut buf = [0u8; 16];
+    assert!(matches!(first.read(&mut buf), Ok(0)), "the oldest mute connection was closed for the plugin");
+    let mut last = &idle[MAX_CONNECTIONS - 1];
+    last.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    assert!(matches!(last.read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut), "the newest one stays");
 }
 
 #[test]

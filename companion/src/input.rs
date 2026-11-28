@@ -692,7 +692,13 @@ impl Injector {
                     }
                     return Err(FL_ESCAPE_REFUSED.into());
                 }
-                let target = win::key_target(top, self.key_target);
+                let (target, chosen) = win::key_target_of(top, self.key_target);
+                // (audit F17) ce qui irait a Live plutot qu'au plugin : refuse, sans rien envoyer. (deuxieme relecture)
+                // le repli au centre compte comme le cadre : aucun champ du plugin n'a le clavier, et une vue de plugin
+                // (JUCE) renvoie a sa fenetre parente les touches qu'elle n'utilise pas
+                if win_key_refused(key, code, *mods, target == top || !chosen) {
+                    return Err(WIN_KEY_REFUSED.into());
+                }
                 let chars = if *down { chars_for_key(key, *mods) } else { Vec::new() };
                 for m in key_msgs(*down, vk, win::scan_code(vk), ext, &chars, *mods) {
                     win::send(target, &m)?;
@@ -793,9 +799,10 @@ impl Injector {
             let (x, y) = screen(p);
             let wins: Vec<OwnWin> = crate::macos::on_screen_windows()
                 .into_iter()
-                .map(|m| OwnWin { id: m.id as u64, pid: m.pid, frame: [m.bounds.origin.x, m.bounds.origin.y, m.bounds.size.width, m.bounds.size.height], menu: m.layer == crate::popups::MAC_MENU_LAYER })
+                .map(|m| OwnWin { id: m.id as u64, pid: m.pid, frame: [m.bounds.origin.x, m.bounds.origin.y, m.bounds.size.width, m.bounds.size.height] })
                 .collect();
             let menus: Vec<u64> = crate::popups::list(top).iter().map(|p| p.id).collect();
+            // (24 nov., probleme 16) la fenetre d'un DAW : un menu de Live, pas filme, ne passe pas
             !own_window_at_is(&wins, w.pid, x, y, top, &menus)
         };
         match ev {
@@ -1056,6 +1063,29 @@ pub const MAC_DAW_KEYS_OFF: &str = "typing into a DAW's plugin window is not ava
 /// (24 nov., audit M4) Ce que le studio lit quand une autre fenetre du DAW couvre le plugin a l'endroit d'un appui.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const COVERED_REFUSED: &str = "another window of the DAW covers the plugin window at that point: nothing clicked";
+/// (audit F17) Sous Windows, une touche vers la fenetre d'un plugin dans un DAW est refusee si elle irait a Live :
+///   - Alt, AltGraph, F10 et la touche menu (le menu de la fenetre de Live), et toute touche avec Alt, sauf AltGr :
+///     Ctrl+Alt avec un caractere imprimable (sur AZERTY, `@ # { } [ ] |` arrivent ainsi du navigateur, en « key ») ;
+///   - quand la cible retombe sur le cadre du DAW lui-meme (`on_frame`) et non une sous-fenetre du plugin : toute
+///     touche avec Ctrl ou Alt (AltGr compris) et les touches F (les raccourcis de Live : Ctrl+S, F9…).
+/// Ctrl+lettre et les touches F vers une sous-fenetre du plugin passent (Ctrl+A, C, V, Z dans ses champs).
+pub fn win_key_refused(key: &str, code: &str, mods: u8, on_frame: bool) -> bool {
+    let ctrl = mods & 2 != 0;
+    let alt = mods & 4 != 0;
+    let mut chars = key.chars();
+    let printable = matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control());
+    let altgr = ctrl && alt && printable;
+    let fkey = |s: &str| s.len() >= 2 && s.as_bytes()[0] == b'F' && s[1..].bytes().all(|b| b.is_ascii_digit());
+    if matches!(key, "Alt" | "AltGraph" | "ContextMenu" | "F10") || matches!(code, "AltLeft" | "AltRight" | "ContextMenu" | "F10") {
+        return true;
+    }
+    if alt && !altgr {
+        return true;
+    }
+    on_frame && (ctrl || alt || fkey(key) || fkey(code))
+}
+pub const WIN_KEY_REFUSED: &str = "this key would reach the DAW itself, not the plugin: Alt, F10 and the menu key are not sent, nor Ctrl, Alt or F keys when no field of the plugin has the keyboard (click into the plugin first)";
+
 /// (24 nov., audit E1) Les raccourcis clavier ne vont jamais a une fenetre de DAW sur Mac (ils iraient au DAW lui-meme).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const MAC_SHORTCUT_REFUSED: &str = "no keyboard shortcuts (Ctrl, Alt, Cmd, F keys) to a DAW on a Mac";
@@ -1072,18 +1102,18 @@ pub struct OwnWin {
     pub id: u64,
     pub pid: i32,
     pub frame: [f64; 4],
-    /// au niveau des menus (kCGPopUpMenuWindowLevel) : un menu ouvert de l'appli (celui du plugin, ouvert par un clic droit)
-    pub menu: bool,
 }
 
 /// (24 nov., audit M4) Sous le point (x, y) de l'ecran, la plus haute fenetre de l'appli `pid` est-elle `top` (ou un de
 /// ses menus, `menus`) ? Les fenetres des autres applis ne comptent pas : l'evenement poste au processus ne va qu'a ses
 /// fenetres. Aucune fenetre de l'appli sous le point : non.
+/// (24 nov., relecture, probleme 16) un menu ouvert de l'appli ne passe plus : il n'est pas filme. Pour la fenetre d'un
+/// DAW, `menus` (popups.rs) est toujours vide : dans Live sur Mac, aucun menu (ni de Live, ni du plugin) ne passe.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn own_window_at_is(wins: &[OwnWin], pid: i32, x: f64, y: f64, top: u64, menus: &[u64]) -> bool {
     let inside = |f: [f64; 4]| x >= f[0] && y >= f[1] && x < f[0] + f[2] && y < f[1] + f[3];
     match wins.iter().find(|w| w.pid == pid && inside(w.frame)) {
-        Some(w) => w.id == top || w.menu || menus.contains(&w.id),
+        Some(w) => w.id == top || menus.contains(&w.id),
         None => false,
     }
 }
@@ -1500,10 +1530,17 @@ pub mod win {
     /// Qui recoit le clavier : la sous-fenetre qui a le focus dans le fil de Live si elle est dans le plugin, sinon
     /// la derniere cliquee, sinon la sous-fenetre au centre.
     pub fn key_target(top: u64, last: u64) -> u64 {
+        key_target_of(top, last).0
+    }
+
+    /// (F17, deuxieme relecture) La cible, et si elle a ete CHOISIE (un menu du plugin, le focus dans le plugin, la
+    /// derniere sous-fenetre cliquee) plutot que prise par repli (la sous-fenetre au centre) : un repli compte comme
+    /// le cadre du DAW pour les raccourcis (win_key_refused).
+    pub fn key_target_of(top: u64, last: u64) -> (u64, bool) {
         // un menu ouvert prend le clavier (fleches, Entree, Echap pour le fermer) — seulement un menu POSSEDE par le
         // plugin (audit de publication : une fenetre sans proprietaire qui le chevauche ne recoit jamais de touches)
         if let Some(p) = crate::popups::list(top).iter().find(|p| p.owned) {
-            return p.id;
+            return (p.id, true);
         }
         unsafe {
             let tid = GetWindowThreadProcessId(h(top), None);
@@ -1513,15 +1550,15 @@ pub mod win {
                 // lui-meme, qui pourrait passer les touches aux raccourcis de Live
                 let f = id(gi.hwndFocus);
                 if f != 0 && f != top && is_inside(top, f) {
-                    return f;
+                    return (f, true);
                 }
             }
         }
         if last != 0 && is_inside(top, last) {
-            return last;
+            return (last, true);
         }
         let (cw, ch) = client_size(top);
-        hit(top, (cw / 2, ch / 2)).0
+        (hit(top, (cw / 2, ch / 2)).0, false)
     }
 
     // ── FOCUS : le vrai curseur et SendInput ────────────────────────────────────────────────────────────────
@@ -1949,6 +1986,38 @@ mod window_tests {
         assert!(win::check_alive(0).is_err(), "no window, no input");
     }
 
+    /// (F17, deuxieme relecture) Le cablage : sans clic ni focus dans le plugin, la touche irait par repli a la
+    /// sous-fenetre au centre ; Ctrl+S et F9 sont refuses et rien n'arrive. Apres un clic dans le potard, Ctrl+A et F5 y
+    /// vont ; Alt+F reste refuse.
+    #[test]
+    fn f17_without_a_chosen_target_shortcuts_are_refused_and_after_a_click_they_go() {
+        let w = testwin::open((-6000, -6000)).expect("test window");
+        let (top, knob) = (w.top, w.knob);
+        let mut inj = Injector::default();
+        let key = |k: &str, c: &str, mods: u8| InputEvent::Key { down: true, key: k.into(), code: c.into(), mods };
+        let (_, chosen) = win::key_target_of(top, 0);
+        assert!(!chosen, "no click, no focus inside: a fallback");
+        let (b_top, b_knob) = (testwin::received(top).len(), testwin::received(knob).len());
+        assert!(inj.handle(top, &key("s", "KeyS", 2)).is_err(), "Ctrl+S by fallback");
+        assert!(inj.handle(top, &key("F9", "F9", 0)).is_err(), "F9 by fallback");
+        // une lettre simple passe encore (le repli garde la saisie)
+        inj.handle(top, &key("a", "KeyA", 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let sent: Vec<u32> = testwin::received(top)[b_top..].iter().chain(testwin::received(knob)[b_knob..].iter()).map(|m| m.msg).filter(|m| *m == WM_KEYDOWN).collect();
+        assert_eq!(sent.len(), 1, "only the plain letter was sent");
+        // un clic dans le potard : il devient la cible choisie
+        let (x, y) = ((KNOB_X + 100) as f64, (KNOB_Y + 50) as f64);
+        inj.handle(top, &ptr(PointerAction::Down, x, y, 0, 1)).unwrap();
+        inj.handle(top, &ptr(PointerAction::Up, x, y, 0, 0)).unwrap();
+        let before = testwin::received(knob).len();
+        inj.handle(top, &key("a", "KeyA", 2)).unwrap();
+        inj.handle(top, &key("F5", "F5", 0)).unwrap();
+        assert!(inj.handle(top, &key("f", "KeyF", 4)).is_err(), "Alt+F stays refused");
+        let r = wait_for(knob, before + 2);
+        let keys: Vec<(u32, usize)> = r[before..].iter().filter(|m| m.msg == WM_KEYDOWN).map(|m| (m.msg, m.wparam)).collect();
+        assert_eq!(keys, vec![(WM_KEYDOWN, 0x41), (WM_KEYDOWN, 0x74)]);
+    }
+
     /// 21 oct. (Kontakt) : un menu dans sa propre fenetre (popup possedee par le plugin) est trouve, pose sur l'image
     /// du plugin, et un clic a sa place lui arrive (a SES coordonnees), pas au plugin dessous.
     #[test]
@@ -2002,16 +2071,18 @@ mod tests {
     /// ses menus) ; une autre appli posee dessus ne compte pas (l'evenement ne va qu'au DAW)
     #[test]
     fn a_press_goes_only_where_the_watched_window_is_on_top_of_its_app() {
-        let w = |id, pid, x, y, wd, h| OwnWin { id, pid, frame: [x, y, wd, h], menu: false };
+        let w = |id, pid, x, y, wd, h| OwnWin { id, pid, frame: [x, y, wd, h] };
         // de la plus haute a la plus basse : Chrome (autre appli), les reglages de Live, le plugin, la fenetre de Live
         let wins = [w(1, 99, 0.0, 0.0, 2000.0, 2000.0), w(2, 10, 100.0, 100.0, 200.0, 200.0), w(3, 10, 50.0, 50.0, 600.0, 400.0), w(4, 10, 0.0, 0.0, 1800.0, 1100.0)];
         assert!(own_window_at_is(&wins, 10, 400.0, 300.0, 3, &[]), "the plugin, under Chrome: Chrome does not count");
         assert!(!own_window_at_is(&wins, 10, 150.0, 150.0, 3, &[]), "Live's settings cover the plugin there");
         assert!(!own_window_at_is(&wins, 10, 1000.0, 1000.0, 3, &[]), "outside the plugin: Live's main window");
-        assert!(own_window_at_is(&wins, 10, 150.0, 150.0, 3, &[2]), "a menu of the plugin");
         assert!(!own_window_at_is(&wins, 10, 1900.0, 1900.0, 3, &[]), "no window of Live there");
-        let open = [OwnWin { menu: true, ..w(5, 10, 120.0, 120.0, 100.0, 50.0) }, wins[1], wins[2]];
-        assert!(own_window_at_is(&open, 10, 130.0, 130.0, 3, &[]), "an open menu of the app, on top");
+        // (probleme 16) le cas reel d'un DAW : `menus` vide (popups::list), un menu ouvert au niveau des menus au-dessus du
+        // plugin (de Live ou du plugin, on ne sait pas) : refuse, il n'est pas filme
+        let open = [w(5, 10, 120.0, 120.0, 100.0, 50.0), wins[1], wins[2]];
+        assert!(!own_window_at_is(&open, 10, 130.0, 130.0, 3, &[]), "an open menu on top of the plugin: refused");
+        assert!(own_window_at_is(&open, 10, 400.0, 300.0, 3, &[]), "beside the menu, the plugin itself: it passes");
     }
 
     #[test]
@@ -2154,6 +2225,32 @@ mod tests {
         assert_eq!((h[0].msg, (h[0].wparam >> 16) as u16 as i16), (WM_MOUSEHWHEEL, 120));
         assert!(wheel_msgs(0.0, 0.0, 0, (0, 0)).is_empty());
         assert_eq!(wheel_delta(33.3), -40, "a trackpad's small steps keep their size");
+    }
+
+    #[test]
+    fn f17_keys_that_would_reach_live_are_refused_on_windows() {
+        use super::win_key_refused as r;
+        // vers une sous-fenetre du plugin
+        assert!(!r("a", "KeyA", 2, false), "Ctrl+A in a plugin's field");
+        assert!(!r("z", "KeyZ", 2, false), "Ctrl+Z for a plugin");
+        assert!(!r("F5", "F5", 0, false), "an F key for a plugin");
+        assert!(!r("@", "Digit0", 6, false), "AltGr+0 = @ on AZERTY");
+        assert!(!r("{", "Digit4", 6, false), "AltGr+4 = {{ on AZERTY");
+        assert!(!r("a", "KeyA", 1, false), "Shift+A");
+        assert!(r("Alt", "AltLeft", 4, false), "Alt alone opens Live's menu");
+        assert!(r("AltGraph", "AltRight", 6, false), "the AltGr key itself");
+        assert!(r("F10", "F10", 0, false), "F10 opens the menu");
+        assert!(r("ContextMenu", "ContextMenu", 0, false));
+        assert!(r("F4", "F4", 4, false), "Alt+F4");
+        assert!(r("f", "KeyF", 4, false), "Alt+F");
+        assert!(r(" ", "Space", 4, false), "Alt+Space");
+        assert!(r("Delete", "Delete", 6, false), "Ctrl+Alt+Suppr is not AltGr");
+        // le cadre du DAW
+        assert!(r("s", "KeyS", 2, true), "Ctrl+S to Live's frame");
+        assert!(r("@", "Digit0", 6, true), "AltGr to Live's frame");
+        assert!(r("F9", "F9", 0, true), "F9 to Live's frame");
+        assert!(!r("a", "KeyA", 0, true), "a plain letter still goes");
+        assert!(!r("Enter", "Enter", 0, true));
     }
 
     #[test]

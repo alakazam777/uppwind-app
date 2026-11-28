@@ -30,6 +30,14 @@ BIND.via = 'plugin' (cap 'notes') : la piste visee prend ses notes d'une piste d
 Notes » (notes_route.py), au lieu du port « Uppwind Link » ; la piste d'aide est creee si besoin (une etape
 d'annulation), retiree apres UNBIND (HELPER_GRACE_S plus tard : un studio qui se recharge la reprend) seulement si le
 script l'a creee. BIND_ACK.notes : le numero du Notes, que le studio donne au compagnon.
+
+24 nov. (v1.4.0, audit M3) : LE CHEMIN MIDI EST AUTHENTIFIE (cap 'auth', voir uwlink_protocol.py). Tout programme peut
+ecrire sur le port loopMIDI ; par lui, le script n'obeit qu'a un studio qui prouve le secret (secret : uwl_secret.py
+ecrit par le compagnon, sinon le code que le script garde dans ~/.uppwind-link-midi.json, cf. editor_channel) :
+HELLO par MIDI ne donne qu'un nonce (il ne coupe plus la session en cours, ni celle du compagnon) ; AUTH juste ouvre
+la session (ce que faisait HELLO) ; ensuite chaque commande par MIDI est signee. Le canal du compagnon (UDP, jeton de
+256 bits, et le compagnon appaire et arme) est deja authentifie : HELLO par lui ouvre la session tout de suite, sans
+signature, comme avant -- et la cle MIDI tombe (le studio a quitte loopMIDI).
 """
 
 import math
@@ -38,7 +46,7 @@ from . import notes_route as NR
 from . import uwlink_protocol as P
 
 DAW_NAME = "Ableton Live"
-CAPS = ["list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes"]
+CAPS = ["list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes", "auth"]
 PENDING_S = 5.0             # s : un BIND par le plugin attend au plus ca que Live offre la piste d'aide et son Notes
 HELPER_GRACE_S = 15.0       # s : une piste d'aide liberee reste ce temps (un studio qui se recharge la reprend)
 UDP_OUT_MAX = 4096          # morceaux en attente pour le compagnon (au-dela : il ne releve plus, on vide)
@@ -49,6 +57,18 @@ LIVE_TEMPO_MAX = 999.0
 LIST_BUDGET = 20000
 POLL_EVERY = 1.0            # s : la liste des pistes a-t-elle change ?
 OUT_PER_TICK = 16           # morceaux SysEx par appel de tick (update_display : toutes les 100 ms)
+# (24 nov., audit F3 des scripts) la file de sortie MIDI est bornee : une rafale de LIST (100 morceaux par reponse) la
+# faisait grossir sans fin. Au-dela, le message entier est jete (jamais un morceau sur deux : le studio ne saurait pas
+# le recoller). 512 : quatre pages de LIST d'avance, et un message de MAX_CHUNKS (128) passe toujours dans une file vide.
+OUT_MAX = 512
+OUT_WARN_EVERY = 10.0       # s entre deux lignes « file pleine » au journal de Live
+CODE_EVERY = 20.0           # (24 nov.) le code redit au plus toutes les 20 s (barre d'etat de Live et Log.txt)
+AUTH_LOG_EVERY = 10.0       # (24 nov.) les refus au journal : une ligne toutes les 10 s au plus
+# (24 nov., relecture) un AUTH juste sur une session MIDI deja ouverte ne remet plus Live a zero : les liens restent, et
+# ceux que le studio ne reprend pas (BIND) dans STALE_AFTER s sont defaits (un onglet ferme, un autre projet)
+STALE_AFTER = 10.0
+NO_SECRET = ("This Python has no safe random source: the Uppwind Link script cannot draw a MIDI link code. Install it "
+             "with the Uppwind Link companion, which gives it one.")
 MONITOR_IN = 0
 MONITOR_AUTO = 1            # (26 oct.) le monitoring d'une piste MIDI neuve dans Live
 FALLBACK_INPUT = "all ins"  # (26 oct.) l'entree d'une piste MIDI neuve (« All Ins / All Channels »)
@@ -118,7 +138,28 @@ def gain_to_live_volume(param, gain):
 
 
 class LinkCore(object):
-    def __init__(self, song, send, log=None, now=None, browser=None, version=None):
+    def __init__(self, song, send, log=None, now=None, browser=None, version=None, secret=None, secret_from="",
+                 show=None):
+        """(24 nov.) secret : les 15 octets du chemin MIDI (None : un secret tire pour ce lancement, les tests) ;
+        secret_from : 'companion' | 'file' | 'session' ; show(texte) : la barre d'etat de Live."""
+        if secret_from == "weak":
+            self.secret = b""        # (24 nov., relecture) pas de hasard sur : pas de code, le chemin MIDI reste ferme
+        else:
+            self.secret = bytes(secret) if secret else P.random_bytes(P.SECRET_BYTES)
+        self.secret_from = secret_from or ("session" if not secret else "file")
+        self.kid = P.key_id(self.secret) if self.secret else ""
+        self.code_logged = False     # (relecture) un code de ce lancement seulement, en entier au journal une fois
+        self.stale = {}              # (relecture) slot d'avant un nouvel AUTH -> l'heure ou il tombe s'il n'est pas repris
+        self.rx_signed = False       # (relecture) le message en cours venait-il de la session (signe, ou le compagnon)
+        self._show = show or (lambda m: None)
+        self.offer = None            # HELLO par MIDI -> {n, t, caps}
+        self.key = None              # la cle de la session MIDI (None : aucune commande MIDI n'est obeie)
+        self.ctr = 0
+        self.code_said_at = -1e9
+        self.refused_at = -1e9
+        self.refused = 0
+        self.error_said_at = -1e9
+        self.old_said = False
         self._song = song            # () -> Song
         self._send_raw = send        # (tuple d'octets) -> None
         self._log = log or (lambda m: None)
@@ -127,6 +168,8 @@ class LinkCore(object):
         self._version = version or (lambda: "")
         self.rx = P.Reassembler()
         self.out = []
+        self.out_dropped = 0         # (24 nov.) messages jetes, file pleine (dits au plus toutes les OUT_WARN_EVERY)
+        self.out_warned_at = -1e9
         self.session = False
         self.binds = {}              # slot -> cle de la piste
         self.waiting = {}            # slot deplace par un autre BIND sur sa piste -> cle (il la reprend ensuite)
@@ -602,6 +645,7 @@ class LinkCore(object):
         return res
 
     def link_slot(self, slot, k, via):
+        self.stale.pop(slot, None)
         old = self.binds.get(slot)
         self.waiting.pop(slot, None)
         # une piste n'a qu'un canal d'entree : l'autre slot attend (ITEM.slots ne le montre plus) et
@@ -641,6 +685,7 @@ class LinkCore(object):
         self.free_helper(key)
 
     def unbind(self, slot):
+        self.stale.pop(slot, None)
         self.waiting.pop(slot, None)
         self.pending.pop(slot, None)
         k = self.binds.pop(slot, None)
@@ -653,6 +698,7 @@ class LinkCore(object):
         self.apply_mutes()
 
     def reset(self):
+        self.stale.clear()
         self.waiting.clear()                    # tout s'en va : personne ne reprend les pistes
         self.pending.clear()
         for slot in list(self.binds):
@@ -878,6 +924,17 @@ class LinkCore(object):
                 self._log("the companion stopped reading the link (%d messages waiting): dropped" % len(self.udp_out))
                 self.udp_out = []
             return
+        if len(self.out) + len(chunks) > OUT_MAX:
+            # (24 nov.) file pleine : ce message ne part pas, en entier
+            self.out_dropped += 1
+            now = self._now()
+            if now - self.out_warned_at >= OUT_WARN_EVERY:
+                self.out_warned_at = now
+                self._log("too many replies waiting for Uppwind Studio: %d message(s) dropped (%s last)"
+                          % (self.out_dropped, P.command_name(cmd)))
+                self.out_dropped = 0
+            self.flush()
+            return
         self.out.extend(chunks)
         self.flush()
 
@@ -919,8 +976,29 @@ class LinkCore(object):
                 if req is not None and sender != "daw" and cmd != P.ERROR:
                     self.error(req, out["code"], "Update the Uppwind Link script." if out["code"] == P.ERR_VERSION else None)
                 return True
+            cmd, req, data = out["cmd"], out["req"], out["data"]
+            self.rx_signed = via == "udp"
+            if via != "udp" and cmd == P.ERROR and self.key is not None:
+                # (24 nov., relecture) un ERROR signe par la session : son texte peut aller au journal
+                v = P.verify_signed(cmd, req, out.get("text"), self.key, self.ctr)
+                if v["ok"]:
+                    self.ctr = v["c"]
+                    data = v["data"]
+                    self.rx_signed = True
+            if via != "udp" and cmd not in (P.HELLO, P.AUTH, P.ERROR) and P.COMMANDS[cmd][1] != "daw":
+                # (24 nov.) par MIDI : signe avec la cle de la session, ou rien
+                if self.key is None:
+                    self.refuse(req, "Reload Uppwind Studio: this script needs its MIDI link code.", "no session")
+                    return True
+                v = P.verify_signed(cmd, req, out.get("text"), self.key, self.ctr)
+                if not v["ok"]:
+                    self.refuse(req, "This command was not signed by your Uppwind Studio session.", v["why"])
+                    return True
+                self.ctr = v["c"]
+                data = v["data"]
+                self.rx_signed = True
             try:
-                self.dispatch(out["cmd"], out["req"], out["data"])
+                self.dispatch(cmd, req, data)
             except Exception as e:
                 self.last_failure = "%s: %s" % (type(e).__name__, e)
                 self._log("%s failed: %s" % (out.get("name"), e))
@@ -1022,6 +1100,116 @@ class LinkCore(object):
             else:
                 p["why"] = res[1]
 
+    # -- (24 nov.) L'authentification du chemin MIDI ------------------------------------------------------------
+    def say_code(self, force=False):
+        """(24 nov., relecture) force : au lancement, le journal seulement, et jamais un code qui dure (celui du
+        compagnon, celui de ~/.uppwind-link-midi.json) : seulement son id. Sinon (un studio le demande) : la barre
+        d'etat de Live, au plus toutes les CODE_EVERY ; jamais celui du compagnon, qui le donne lui-meme au studio."""
+        if force:
+            if self.secret_from == "companion":
+                self._log("MIDI link code: the one the Uppwind Link companion installed (id %s); Uppwind Studio gets it "
+                          "from the companion" % self.kid)
+            elif self.secret_from == "weak":
+                self._log("no system random source: the MIDI link stays closed. Install the script with the Uppwind "
+                          "Link companion: it gives it a code")
+            elif self.secret_from == "file":
+                self._log("MIDI link code id %s: Live's status bar shows the code when Uppwind Studio asks for it"
+                          % self.kid)
+            elif not self.code_logged:
+                self.code_logged = True
+                self._log("MIDI link code for this Live session: %s -- paste it in Uppwind Studio (it changes each "
+                          "time Live starts: this script could not keep it)" % P.code_of(self.secret))
+            return
+        if self.secret_from not in ("file", "session"):
+            return
+        now = self._now()
+        if now - self.code_said_at < CODE_EVERY:
+            return
+        self.code_said_at = now
+        code = P.code_of(self.secret)
+        try:
+            self._show("Uppwind Link code: %s (paste it in Uppwind Studio)" % code)
+        except Exception:
+            pass
+
+    def refuse(self, req, msg, why):
+        self.refused += 1
+        now = self._now()
+        if now - self.refused_at >= AUTH_LOG_EVERY:
+            self.refused_at = now
+            self._log("refused %d unproven message(s) on the MIDI port (%s): only Uppwind Studio with this script's "
+                      "code is obeyed" % (self.refused, why))
+            self.refused = 0
+        if req:
+            self.error(req, P.ERR_AUTH, msg)
+
+    def _hello_ack(self, extra):
+        ack = {"v": P.LINK_VERSION, "daw": DAW_NAME, "dawVersion": str(self._version())[:60], "caps": list(CAPS)}
+        ack.update(extra)
+        return ack
+
+    def _session_info(self):
+        project = ""
+        try:
+            project = str(getattr(self._song(), "name", "") or "")[:120]
+        except Exception:
+            pass
+        info = {"project": project}
+        bpm = P.round_bpm(self.tempo_known)
+        if bpm is not None:
+            info["bpm"] = bpm
+        return info
+
+    def open_session(self, caps, keep=False):
+        """La session s'ouvre (HELLO par le compagnon, ou AUTH juste par MIDI) : ce que faisait HELLO avant le 24 nov.
+        keep (relecture) : un nouvel AUTH sur une session MIDI ouverte : les liens restent ; ceux que le studio ne
+        reprend pas tombent apres STALE_AFTER s (tick)."""
+        if keep:
+            now = self._now()
+            self.stale = dict((slot, now + STALE_AFTER)
+                              for slot in list(self.binds) + list(self.waiting) + list(self.pending))
+        else:
+            self.reset()
+        self.session = True
+        # (25 oct.) la session vit sur le transport de son HELLO ; l'autre boite repart vide
+        self.transport = self._via_now or "midi"
+        if self.transport == "udp":
+            self.out = []
+            self.key = None                    # (24 nov.) le studio a quitte loopMIDI : plus rien n'y est obei
+            # (26 oct.) le studio quitte loopMIDI : les pistes qu'il y avait reliees (et que ce script ne connait
+            # peut-etre plus) retrouvent leur entree ; ses BIND par le plugin les menent ensuite a leur piste d'aide
+            self.sweep_link_port()
+        else:
+            self.udp_out = []
+        self.list_sig = self.signature()
+        # le tempo : ce que Live a maintenant ; TEMPO_CHANGED seulement a un studio qui le lit
+        self.studio_caps = list(caps)
+        self.tempo_known = self.get_tempo()
+        self.tempo_hold_until = 0.0
+        self.tempo_sent_at = -1e9
+        self.watch_tempo()
+
+    def auth(self, req, d):
+        now = self._now()
+        o, self.offer = self.offer, None
+        if len(self.secret) != P.SECRET_BYTES:
+            self.refuse(req, NO_SECRET, "no code")
+            return
+        if o is None or (now - o["t"]) * 1000.0 > P.AUTH_PENDING_MS:
+            self.refuse(req, "Connect again (HELLO first).", "AUTH without HELLO")
+            return
+        if not P.proof_ok(d["p"], P.studio_proof(self.secret, o["n"], d["n"])):
+            self.refuse(req, "Wrong MIDI link code: paste the code shown in Live's status bar.", "wrong code")
+            self.say_code()
+            return
+        self.open_session(o["caps"], keep=self.key is not None and self.transport == "midi")
+        self.key = P.session_key(self.secret, o["n"], d["n"])
+        self.ctr = 0
+        ack = {"p": P.daw_proof(self.secret, o["n"], d["n"])}
+        ack.update(self._session_info())
+        self.send(P.AUTH_ACK, req, ack)
+        self._log("Uppwind Studio connected (MIDI link code checked).")
+
     def dispatch(self, cmd, req, data):
         spec = P.COMMANDS[cmd]
         if spec[1] == "daw":
@@ -1033,36 +1221,26 @@ class LinkCore(object):
             return
         d = v["data"]
         if cmd == P.HELLO:
-            self.reset()
-            self.session = True
-            # (25 oct.) la session vit sur le transport de son HELLO ; l'autre boite repart vide
-            self.transport = self._via_now or "midi"
-            if self.transport == "udp":
-                self.out = []
-                # (26 oct.) le studio quitte loopMIDI : les pistes qu'il y avait reliees (et que ce script ne connait
-                # peut-etre plus) retrouvent leur entree ; ses BIND par le plugin les menent ensuite a leur piste d'aide
-                self.sweep_link_port()
-            else:
-                self.udp_out = []
-            self.list_sig = self.signature()
-            project = ""
-            try:
-                project = str(getattr(self._song(), "name", "") or "")[:120]
-            except Exception:
-                pass
-            # le tempo : ce que Live a maintenant ; TEMPO_CHANGED seulement a un studio qui le lit
-            self.studio_caps = list(d.get("caps", []))
-            self.tempo_known = self.get_tempo()
-            self.tempo_hold_until = 0.0
-            self.tempo_sent_at = -1e9
-            self.watch_tempo()
-            ack = {"v": P.LINK_VERSION, "daw": DAW_NAME, "dawVersion": str(self._version())[:60],
-                   "project": project, "caps": list(CAPS)}
-            bpm = P.round_bpm(self.tempo_known)
-            if bpm is not None:
-                ack["bpm"] = bpm
-            self.send(P.HELLO_ACK, req, ack)
-            self._log("Uppwind Studio connected.")
+            if (self._via_now or "midi") == "udp":
+                # le canal du compagnon : deja authentifie, la session s'ouvre tout de suite
+                self.open_session(d.get("caps", []))
+                self.send(P.HELLO_ACK, req, self._hello_ack(self._session_info()))
+                self._log("Uppwind Studio connected.")
+                return
+            # (24 nov.) par MIDI : un nonce, rien d'autre ; la session en cours continue
+            if len(self.secret) != P.SECRET_BYTES:
+                self.refuse(req, NO_SECRET, "no code")
+                return
+            n = P.new_nonce(self.secret)
+            self.offer = {"n": n, "t": self._now(), "caps": list(d.get("caps", []))}
+            self.send(P.HELLO_ACK, req, self._hello_ack({"auth": {"kid": self.kid, "n": n}}))
+            if "auth" not in self.offer["caps"] and not self.old_said:
+                self.old_said = True
+                self._log("this Uppwind Studio does not know the MIDI link code yet: reload its page")
+            if "auth" in self.offer["caps"]:
+                self.say_code()                # (relecture) seulement a un studio qui sait le demander
+        elif cmd == P.AUTH:
+            self.auth(req, d)
         elif cmd == P.LIST:
             self.send(P.LIST_REPLY, req, self.list_page(d.get("start", 0)))
         elif cmd == P.BIND:
@@ -1124,7 +1302,26 @@ class LinkCore(object):
         elif cmd == P.PING:
             self.send(P.PONG, req, {"t": d["t"]})
         elif cmd == P.ERROR:
-            self._log("Uppwind Studio reports %s: %s" % (d.get("code"), d.get("msg", "")))
+            # (24 nov.) un ERROR n'a pas a etre prouve : au journal au plus toutes les AUTH_LOG_EVERY. (Relecture) Son
+            # texte seulement s'il vient de la session : sinon n'importe quel programme ecrirait ici ce qu'il veut
+            now = self._now()
+            if now - self.error_said_at >= AUTH_LOG_EVERY:
+                self.error_said_at = now
+                if self.rx_signed:
+                    self._log("Uppwind Studio reports %s: %s" % (d.get("code"), d.get("msg", "")))
+                else:
+                    self._log("an unsigned error report came in on the MIDI port (not shown: anything can send one)")
+
+    def drop_stale(self, now):
+        """(24 nov., relecture) les slots d'avant le dernier AUTH que le studio n'a pas repris : defaits, le mix rendu."""
+        gone = [slot for slot, t in self.stale.items() if now >= t]
+        for slot in gone:
+            self.stale.pop(slot, None)
+            self.pending.pop(slot, None)
+            if slot in self.binds or slot in self.waiting:
+                self.unbind(slot)
+        if gone:
+            self._log("released %d track link(s) the studio did not take back after it connected again" % len(gone))
 
     def tick(self):
         """Appele par update_display (~ toutes les 100 ms)."""
@@ -1135,6 +1332,8 @@ class LinkCore(object):
         if self.doomed:
             self.sweep_helpers()               # (25 oct.) les pistes d'aide liberees, l'heure venue
         now = self._now()
+        if self.stale:
+            self.drop_stale(now)
         if now - self.last_poll < POLL_EVERY:
             return
         self.last_poll = now

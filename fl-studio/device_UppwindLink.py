@@ -72,6 +72,18 @@ voir plugins.getParamCount) ; les instruments natifs de FL ne les ont pas. Pitch
 de hauteur du canal (channels.setChannelPitch, en fraction de la plage). CC 120/123 : tout relacher.
 
 Bac a sable de FL : ni fichiers ni reseau ; json, math, time seulement (cf. uwlink_protocol.py).
+
+(24 nov., 1.5.0, audit M3) LE CHEMIN MIDI EST AUTHENTIFIE (cap 'auth', voir uwlink_protocol.py) : tout programme peut
+ecrire sur le port loopMIDI, et une page web a qui l'on a donne « MIDI avec SysEx » aussi. Le script ne fait donc rien
+pour un studio qui ne prouve pas le secret :
+  - le secret vient de uwl_secret.py (a cote de ce fichier, ecrit par le compagnon quand il installe le script : le
+    studio appaire au compagnon le recoit de lui, rien a faire) ; sans lui, le script en tire un au lancement de FL et
+    affiche son CODE au Script output (et dans la barre d'aide de FL quand un studio le demande) : on le colle dans
+    Uppwind Studio. Sans uwl_secret.py, ce code change a chaque lancement de FL (le script ne peut rien ecrire) ;
+  - HELLO ne coupe plus la session en cours : il donne un nonce (HELLO_ACK.auth) ; seul un AUTH juste ouvre la
+    session (ce que faisait HELLO : liens defaits, reglages rendus) ;
+  - ensuite chaque commande est signee (P.verify_signed) ; une commande sans signature juste est refusee (ERROR auth).
+Les notes et les CC du port ne sont pas des SysEx : ils ne portent pas de preuve (le studio les envoie aux slots lies).
 """
 
 import math
@@ -87,10 +99,10 @@ import ui
 
 import uwlink_protocol as P
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.5.0"  # (24 nov.) 1.5.0 : le chemin MIDI authentifie ; 1.4.1 : PARAM_SET lie ou suivi, file bornee
 TAG = "[Uppwind Link]"
 DAW_NAME = "FL Studio"
-CAPS = ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params"]
+CAPS = ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params", "auth"]
 ADD_HINT = "Add the plugin in FL's channel rack; it appears here instantly."
 # (26 oct.) le plugin des notes, son parametre « Link tag » (0..255, 0 : aucun), les ports MIDI de FL
 NOTES_NAME = "Uppwind Link Notes"
@@ -103,6 +115,21 @@ CHANGE_SETTLE = 0.25        # s de calme avant de pousser CHANGED
 MUTE_RETRY = 0.12           # s entre deux bascules de mute d'un meme canal (FL les regroupe par tick)
 MUTE_CHECK = 0.06           # s entre deux verifications des mutes
 OUT_PER_TICK = 8            # morceaux SysEx envoyes par appel (le reste au prochain OnIdle)
+# (24 nov., audit F3 des scripts) la file de sortie est bornee : une rafale de LIST (100 morceaux par reponse) la faisait
+# grossir sans fin. Au-dela, le message entier est jete (jamais un morceau sur deux : le studio ne saurait pas le
+# recoller). 512 : quatre pages de LIST d'avance, et un message de MAX_CHUNKS (128) passe toujours dans une file vide.
+OUT_MAX = 512
+OUT_WARN_EVERY = 10.0       # s entre deux lignes « file pleine » au Script output
+# (24 nov., 1.5.0) l'authentification : le code redit au plus toutes les CODE_EVERY ; les refus au journal au plus une
+# ligne toutes les AUTH_LOG_EVERY (une rafale ne noie pas le Script output)
+CODE_EVERY = 20.0
+AUTH_LOG_EVERY = 10.0
+# (24 nov., relecture) un AUTH juste sur une session deja ouverte ne remet plus le DAW a zero : les liens restent, et
+# ceux que le studio ne reprend pas (BIND) dans STALE_AFTER s sont defaits (un onglet ferme, un autre projet)
+STALE_AFTER = 10.0
+NO_SECRET = ("This FL Studio Python has no safe random source: install the Uppwind Link script with the Uppwind Link "
+             "companion, which gives it its code.")
+WHERE_CODE = "View > Script output"
 STRUCT_CHECK = 2.0          # s : filet de securite (le nombre de canaux a-t-il change sans qu'on le dise ?)
 VST_CC_BASE = 4096          # parametres des VST : 4096 normaux, puis 128 « MIDI CC », puis 16 aftertouch
 PARAMS_PAGE = 100           # parametres par PARAMS_REPLY (~ 50 octets chacun)
@@ -172,6 +199,8 @@ class _State(object):
         self.last_struct_check = 0.0
         self.last_sx = (b"", 0.0)
         self.warned_out = False
+        self.out_dropped = 0         # (24 nov.) messages jetes, file pleine (dits au plus toutes les OUT_WARN_EVERY)
+        self.out_warned_at = -1e9
         self.vol_checked = False
         # le tempo : ce que le studio sait faire (HELLO.caps), le tempo de FL tel que le studio le sait,
         # jusqu'a quand le tempo pose par le studio n'est pas un changement de FL, le dernier envoi
@@ -195,6 +224,25 @@ class _State(object):
         self.pw_dirty = False
         self.pw_at = 0.0
         self.pw_sig = None
+        # (24 nov., 1.5.0) l'authentification : le secret (15 octets), d'ou il vient ('companion' : uwl_secret.py ;
+        # 'session' : tire au lancement), son kid ; l'offre en cours (HELLO -> {n, t, caps}) ; la cle de la session et le
+        # dernier compteur accepte ; quand le code a ete dit, quand un refus a ete dit (et combien depuis)
+        self.secret = b""
+        self.secret_from = ""
+        self.kid = ""
+        self.offer = None
+        self.key = None
+        self.ctr = 0
+        self.code_said_at = -1e9
+        self.refused_at = -1e9
+        self.refused = 0
+        self.error_said_at = -1e9
+        # (24 nov., relecture) le code ecrit en entier au Script output une fois par lancement (et seulement le code
+        # de ce lancement) ; les slots d'avant un nouvel AUTH -> l'heure ou ils tombent s'ils ne sont pas repris ;
+        # le message en cours etait-il signe par la session
+        self.code_logged = False
+        self.stale = {}
+        self.rx_signed = False
 
 
 S = _State()
@@ -419,13 +467,137 @@ def fl_volume_to_gain(v):
     return (11.0 ** v - 1.0) / 10.0
 
 
+# -- (24 nov., 1.5.0) L'authentification -------------------------------------------------------
+def _load_secret():
+    """uwl_secret.py (le compagnon l'ecrit a cote du script) ; sinon un secret neuf, pour ce lancement de FL."""
+    try:
+        import uwl_secret
+        s = P.secret_of(getattr(uwl_secret, "SECRET", ""))
+        if s:
+            return s, "companion"
+        _log("uwl_secret.py holds no valid code: using a code for this FL session only.")
+    except ImportError:
+        pass
+    except Exception as e:
+        _log("uwl_secret.py: %s" % e)
+    s = P.random_bytes(P.SECRET_BYTES, ("%r" % time.time()).encode("ascii"))
+    if P.random_is_weak():
+        # (24 nov., relecture) un code tire de l'horloge se devine hors ligne (le kid le verifie) : pas de lien MIDI
+        return b"", "weak"
+    return s, "session"
+
+
+def _say_code(now, force=False):
+    """Le code de CE lancement (sans le compagnon) : la barre d'aide, au plus toutes les CODE_EVERY ; en entier au
+    Script output une fois par lancement. Celui du compagnon ne s'affiche jamais : le compagnon le donne au studio."""
+    if S.secret_from != "session":
+        return
+    if not force and now - S.code_said_at < CODE_EVERY:
+        return
+    S.code_said_at = now
+    code = P.code_of(S.secret)
+    if not S.code_logged:
+        S.code_logged = True
+        _log("MIDI link code for this FL session: %s -- paste it in Uppwind Studio (Settings > Uppwind Link, step 4). "
+             "It changes each time FL starts; the Uppwind Link companion installs a script that keeps one." % code)
+    try:
+        ui.setHintMsg("Uppwind Link code: %s" % code)
+    except Exception:
+        pass
+
+
+def _refuse(req, msg, why):
+    """Une commande sans preuve juste : ERROR auth (la file est bornee), le journal au plus toutes les AUTH_LOG_EVERY."""
+    S.refused += 1
+    now = _now()
+    if now - S.refused_at >= AUTH_LOG_EVERY:
+        S.refused_at = now
+        _log("refused %d unproven message(s) on the MIDI port (%s). Only Uppwind Studio with this script's code is "
+             "obeyed." % (S.refused, why))
+        S.refused = 0
+    if req:
+        _error(req, P.ERR_AUTH, msg)
+
+
+def _hello(req, d):
+    """HELLO : un nonce, rien d'autre. La session en cours (s'il y en a une) continue."""
+    now = _now()
+    if len(S.secret) != P.SECRET_BYTES:
+        _refuse(req, NO_SECRET, "no code")
+        return
+    n = P.new_nonce(S.secret)
+    S.offer = {"n": n, "t": now, "caps": list(d.get("caps", []))}
+    ack = {"v": P.LINK_VERSION, "daw": DAW_NAME, "dawVersion": _daw_version(), "caps": list(CAPS),
+           "auth": {"kid": S.kid, "n": n}}
+    _send(P.HELLO_ACK, req, ack)
+    if "auth" not in S.offer["caps"]:
+        _say(("old-studio",), "this Uppwind Studio does not know the MIDI link code yet: reload its page.")
+    else:
+        _say_code(now)          # (24 nov., relecture) seulement a un studio qui sait le demander
+
+
+def _auth(req, d):
+    """AUTH juste : la session s'ouvre (ce que faisait HELLO avant le 24 nov.) ; sinon ERROR auth."""
+    now = _now()
+    o, S.offer = S.offer, None
+    if len(S.secret) != P.SECRET_BYTES:
+        _refuse(req, NO_SECRET, "no code")
+        return
+    if o is None or (now - o["t"]) * 1000.0 > P.AUTH_PENDING_MS:
+        _refuse(req, "Connect again (HELLO first).", "AUTH without HELLO")
+        return
+    if not P.proof_ok(d["p"], P.studio_proof(S.secret, o["n"], d["n"])):
+        _refuse(req, "Wrong MIDI link code: paste the code shown in FL (%s)." % WHERE_CODE, "wrong code")
+        _say_code(now)
+        return
+    if S.key is not None:
+        # (24 nov., relecture) une session existait : on change de cle sans rendre le mix. Le studio relie ses pistes
+        # (BIND) ; un slot qu'il ne reprend pas tombe apres STALE_AFTER s (OnIdle). Les notes tenues sont relachees.
+        _release_all()
+        S.stale = dict((slot, now + STALE_AFTER) for slot in S.binds)
+        S.pw = None
+        S.pw_last = {}
+    else:
+        _reset_session(restore=True)
+    S.session = True
+    S.key = P.session_key(S.secret, o["n"], d["n"])
+    S.ctr = 0
+    S.last_rx = now
+    S.count = _count_all()
+    S.list_sig = _list_signature(S.count)
+    # le tempo : celui de FL maintenant ; TEMPO_CHANGED seulement a un studio qui le lit
+    S.studio_caps = o["caps"]
+    S.tempo_known = _tempo()
+    S.tempo_hold_until = 0.0
+    S.tempo_sent_at = -1e9
+    ack = {"p": P.daw_proof(S.secret, o["n"], d["n"]), "project": _project()}
+    bpm = P.round_bpm(S.tempo_known)
+    if bpm is not None:
+        ack["bpm"] = bpm
+    _send(P.AUTH_ACK, req, ack)
+    _log("Uppwind Studio connected (MIDI link code checked).")
+    _sync_tags()                # (26 oct.) les numeros des Uppwind Link Notes, des maintenant
+
+
 # -- Sortie ---------------------------------------------------------------------------------
 def _send(cmd, req, data):
     try:
-        S.out.extend(P.encode_message(cmd, req, data))
+        chunks = P.encode_message(cmd, req, data)
     except Exception as e:
         _log("cannot encode %s: %s" % (P.command_name(cmd), e))
         return
+    if len(S.out) + len(chunks) > OUT_MAX:
+        # (24 nov.) file pleine : ce message ne part pas, en entier
+        S.out_dropped += 1
+        now = _now()
+        if now - S.out_warned_at >= OUT_WARN_EVERY:
+            S.out_warned_at = now
+            _log("too many replies waiting for Uppwind Studio: %d message(s) dropped (%s last)."
+                 % (S.out_dropped, P.command_name(cmd)))
+            S.out_dropped = 0
+        _flush()
+        return
+    S.out.extend(chunks)
     _flush()
 
 
@@ -863,6 +1035,7 @@ def _unbind(slot, restore=True, send_off=True):
 
 
 def _reset_session(restore=True):
+    S.stale.clear()
     _release_all()
     for slot in list(S.binds):
         _unbind(slot, restore=restore)
@@ -1114,23 +1287,9 @@ def _dispatch(cmd, req, data):
         _error(req, P.ERR_UNSUPPORTED, ADD_HINT)
         return
     if cmd == P.HELLO:
-        _reset_session(restore=True)
-        S.session = True
-        S.count = _count_all()
-        S.list_sig = _list_signature(S.count)
-        # le tempo : celui de FL maintenant ; TEMPO_CHANGED seulement a un studio qui le lit
-        S.studio_caps = list(d.get("caps", []))
-        S.tempo_known = _tempo()
-        S.tempo_hold_until = 0.0
-        S.tempo_sent_at = -1e9
-        ack = {"v": P.LINK_VERSION, "daw": DAW_NAME, "dawVersion": _daw_version(), "project": _project(),
-               "caps": list(CAPS)}
-        bpm = P.round_bpm(S.tempo_known)
-        if bpm is not None:
-            ack["bpm"] = bpm
-        _send(P.HELLO_ACK, req, ack)
-        _log("Uppwind Studio connected.")
-        _sync_tags()                # (26 oct.) les numeros des Uppwind Link Notes, des maintenant
+        _hello(req, d)              # (24 nov., 1.5.0) un nonce ; la session s'ouvre sur AUTH
+    elif cmd == P.AUTH:
+        _auth(req, d)
     elif cmd == P.LIST:
         _send(P.LIST_REPLY, req, _list_page(d.get("start", 0)))
     elif cmd == P.BIND:
@@ -1142,6 +1301,7 @@ def _dispatch(cmd, req, data):
         if d.get("via") == "plugin":
             tag, why = _notes_route(d["id"])
         _bind(d["slot"], d["id"], tag)
+        S.stale.pop(d["slot"], None)
         ack = {"slot": d["slot"], "id": d["id"]}
         if d.get("via") == "plugin":
             ack["via"] = "plugin" if tag else "port"
@@ -1152,6 +1312,7 @@ def _dispatch(cmd, req, data):
                 _say(("route", d["slot"]), "notes for '%s' come through loopMIDI: %s" % (_name(d["id"]), why))
         _send(P.BIND_ACK, req, ack)
     elif cmd == P.UNBIND:
+        S.stale.pop(d["slot"], None)
         _unbind(d["slot"])
     elif cmd == P.SET:
         if not _playable(d["id"]):
@@ -1178,6 +1339,12 @@ def _dispatch(cmd, req, data):
         if not _playable(d["id"]) or not _plugin_valid(d["id"]):
             _error(0, P.ERR_NOT_FOUND, "No plugin at position %d of the channel rack." % (d["id"] + 1))
             return
+        # (24 nov., audit M3) seulement l'instrument que le studio a lie (BIND) ou qu'il suit (PARAM_WATCH) : jamais un
+        # plugin quelconque du projet
+        if d["id"] != S.pw and d["id"] not in _bound_indexes():
+            _error(0, P.ERR_UNSUPPORTED, "Link the instrument at position %d to a track in Uppwind Studio first."
+                   % (d["id"] + 1))
+            return
         _param_set(d["id"], d["p"], d["v"])
     elif cmd == P.PARAM_WATCH:
         i = d.get("id")
@@ -1187,7 +1354,15 @@ def _dispatch(cmd, req, data):
     elif cmd == P.PING:
         _send(P.PONG, req, {"t": d["t"]})
     elif cmd == P.ERROR:
-        _log("Uppwind Studio reports %s: %s" % (d.get("code"), d.get("msg", "")))
+        # (24 nov.) un ERROR n'a pas a etre prouve : au journal au plus toutes les AUTH_LOG_EVERY. (Relecture) Son texte
+        # seulement s'il est signe par la session : sinon n'importe quel programme ecrirait ici ce qu'il veut
+        now = _now()
+        if now - S.error_said_at >= AUTH_LOG_EVERY:
+            S.error_said_at = now
+            if S.rx_signed:
+                _log("Uppwind Studio reports %s: %s" % (d.get("code"), d.get("msg", "")))
+            else:
+                _log("an unsigned error report came in on the MIDI port (not shown: anything can send one).")
 
 
 def _handle_sysex(raw):
@@ -1217,7 +1392,30 @@ def _handle_sysex(raw):
             msg = "Update the Uppwind Link script." if out["code"] == P.ERR_VERSION else None
             _error(req, out["code"], msg)
         return True
-    S.last_rx = now
+    # (24 nov., 1.5.0) sans preuve : HELLO, AUTH et ERROR seulement (et nos propres reponses revenues, que _dispatch
+    # signale) ; tout le reste doit etre signe avec la cle de la session
+    cmd, req, data = out["cmd"], out["req"], out["data"]
+    S.rx_signed = False
+    if cmd == P.ERROR and S.key is not None:
+        # (24 nov., relecture) un ERROR signe par la session : son texte peut aller au journal
+        v = P.verify_signed(cmd, req, out.get("text"), S.key, S.ctr)
+        if v["ok"]:
+            S.ctr = v["c"]
+            data = v["data"]
+            S.rx_signed = True
+    if cmd not in (P.HELLO, P.AUTH, P.ERROR) and P.COMMANDS[cmd][1] != "daw":
+        if S.key is None:
+            _refuse(req, "Reload Uppwind Studio: this script needs its MIDI link code (%s)." % WHERE_CODE, "no session")
+            return True
+        v = P.verify_signed(cmd, req, out.get("text"), S.key, S.ctr)
+        if not v["ok"]:
+            _refuse(req, "This command was not signed by your Uppwind Studio session.", v["why"])
+            return True
+        S.ctr = v["c"]
+        data = v["data"]
+        S.rx_signed = True
+        S.last_rx = now
+    out = {"cmd": cmd, "req": req, "data": data, "name": out.get("name")}
     try:
         _dispatch(out["cmd"], out["req"], out["data"])
     except Exception as e:
@@ -1230,6 +1428,9 @@ def _handle_sysex(raw):
 def OnInit():
     global S
     S = _State()
+    # (24 nov., relecture) le secret d'abord : rien ne doit trouver S.secret vide (le HELLO le refuse de toute facon)
+    S.secret, S.secret_from = _load_secret()
+    S.kid = P.key_id(S.secret) if S.secret else ""
     try:
         S.api = int(general.getVersion())
     except Exception:
@@ -1242,6 +1443,16 @@ def OnInit():
     except Exception:
         S.count = -1
     _log("v%s ready (FL API %d, input port %s). Waiting for Uppwind Studio." % (SCRIPT_VERSION, S.api, _port()))
+    if S.secret_from == "companion":
+        _log("MIDI link code: the one the Uppwind Link companion installed (id %s). Uppwind Studio gets it from the "
+             "companion: start the companion and pair the studio. The code is also in uwl_secret.py, next to this "
+             "script." % S.kid)
+    elif S.secret_from == "weak":
+        _log("no system random source in this FL Python: the MIDI link stays closed (a code drawn from the clock "
+             "could be guessed). Install the script with the Uppwind Link companion: it gives it a code.")
+    _say_code(_now(), force=True)
+    if not P.SHA256_NATIVE:
+        _log("no hashlib in this FL Python: the MIDI link code is checked in pure Python (slower, same result).")
     try:
         if not device.isAssigned():
             _log("no output port linked yet: give the 'Uppwind Link Back' OUTPUT the same Port number (%s)." % _port())
@@ -1316,6 +1527,8 @@ def OnIdle():
             _show_editor()
         if S.pw is not None:
             _param_check(now)
+        if S.stale:
+            _drop_stale(now)
         _flush()
         if S.dirty and now - S.dirty_at >= CHANGE_SETTLE:
             S.dirty = False
@@ -1338,6 +1551,17 @@ def OnIdle():
             S.last_rx = 0.0
     except Exception as e:
         _log("idle: %s" % e)
+
+
+def _drop_stale(now):
+    """(24 nov., relecture) les slots d'avant le dernier AUTH que le studio n'a pas repris : defaits, le mix rendu."""
+    gone = [slot for slot, t in S.stale.items() if now >= t]
+    for slot in gone:
+        del S.stale[slot]
+        if slot in S.binds:
+            _unbind(slot)
+    if gone:
+        _log("released %d channel link(s) the studio did not take back after it connected again." % len(gone))
 
 
 def OnRefresh(flags):

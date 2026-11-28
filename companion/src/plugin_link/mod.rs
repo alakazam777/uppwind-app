@@ -309,6 +309,7 @@ impl Hub {
         // (audit de publication, comme le studio) au plus MAX_CONNECTIONS a la fois, comptees des l'acceptation : une
         // rafale de connexions a moitie ouvertes ne fait pas pousser les fils sans fin
         let active = Arc::new(AtomicUsize::new(0));
+        let unproven = crate::evict::Unproven::new();
         std::thread::Builder::new()
             .name("uwl-plugins".into())
             .spawn(move || {
@@ -317,7 +318,11 @@ impl Hub {
                     match s {
                         Ok(s) => {
                             let peer = s.peer_addr();
-                            if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                            // (24 nov., relecture, probleme 7) comme le studio : la plus ancienne connexion qui n'a pas
+                            // prouve le secret laisse sa place ; une connexion prouvee la garde
+                            let n = active.load(Ordering::SeqCst);
+                            let loopback = matches!(peer, Ok(a) if a.ip().is_loopback());
+                            if n >= MAX_CONNECTIONS && (!loopback || n >= 2 * MAX_CONNECTIONS || !unproven.evict_oldest()) {
                                 refused += 1;
                                 if refused == 1 || refused % 100 == 0 {
                                     crate::log(&format!("plugin link REFUSED a connection: {MAX_CONNECTIONS} are already open ({refused} refused so far)"));
@@ -330,9 +335,10 @@ impl Hub {
                                     let h2 = h.clone();
                                     active.fetch_add(1, Ordering::SeqCst);
                                     let slot = Slot(active.clone());
+                                    let ticket = unproven.enter(&s);
                                     std::thread::spawn(move || {
                                         let _slot = slot;
-                                        conn::run(s, h2, a)
+                                        conn::run(s, h2, a, ticket)
                                     });
                                 }
                                 _ => crate::log(&format!("plugin link REFUSED: {peer:?} is not this computer")),

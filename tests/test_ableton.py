@@ -26,6 +26,7 @@ sys.dont_write_bytecode = True   # pas de __pycache__ dans les dossiers des scri
 TMP = tempfile.mkdtemp(prefix="uwlink-abl-")
 os.environ["UWLINK_DEV_FILE"] = os.path.join(TMP, "state.json")
 os.environ["UWLINK_CHANNEL_PORT"] = "0"
+os.environ["UWLINK_MIDI_FILE"] = os.path.join(TMP, "midi.json")     # (24 nov.) jamais le vrai ~/.uppwind-link-midi.json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINK = os.path.dirname(HERE)
@@ -211,12 +212,43 @@ class Rig(object):
                                now=lambda: self.t, browser=lambda: self.browser, version=lambda: "12.1.5")
         self.rx = P.Reassembler()
         self.req = 0
+        self.key = None              # (24 nov.) la cle de la session MIDI, apres AUTH
+        self.ctr = 0
 
-    def send(self, cmd, data=None):
+    def chunks(self, cmd, req, data=None, signed=None):
+        if signed is None:
+            signed = self.key is not None and cmd not in (P.HELLO, P.AUTH, P.ERROR)
+        if signed:
+            self.ctr += 1
+            return P.encode_signed(cmd, req, data or {}, self.key, self.ctr)
+        return P.encode_message(cmd, req, data or {})
+
+    def send(self, cmd, data=None, signed=None):
         self.req = P.next_req(self.req)
-        for chunk in P.encode_message(cmd, self.req, data or {}):
+        for chunk in self.chunks(cmd, self.req, data, signed):
             assert self.core.receive(tuple(bytearray(chunk)))
         return self.req
+
+    def connect(self, data=None, secret=None):
+        """(24 nov.) HELLO puis AUTH avec le code du script -> (HELLO_ACK, req, HELLO_ACK et AUTH_ACK reunis)"""
+        d = dict(data or {"v": 1})
+        d["caps"] = list(d.get("caps", [])) + ["auth"]
+        req = self.send(P.HELLO, d)
+        rep = [r for r in self.replies() if r[1] == req]
+        assert len(rep) == 1 and rep[0][0] == P.HELLO_ACK, rep
+        ack = rep[0][2]
+        assert "project" not in ack and "bpm" not in ack and ack["auth"]["kid"] == P.key_id(self.core.secret), ack
+        secret = secret or self.core.secret
+        ns = P.new_nonce()
+        areq = self.send(P.AUTH, {"n": ns, "p": P.studio_proof(secret, ack["auth"]["n"], ns)})
+        rep = [r for r in self.replies() if r[1] == areq]
+        assert len(rep) == 1 and rep[0][0] == P.AUTH_ACK, rep
+        assert P.proof_ok(rep[0][2]["p"], P.daw_proof(secret, ack["auth"]["n"], ns))
+        self.key = P.session_key(secret, ack["auth"]["n"], ns)
+        self.ctr = 0
+        out = dict(ack)
+        out.update(dict((k, v) for k, v in rep[0][2].items() if k != "p"))
+        return (P.HELLO_ACK, req, out)
 
     def replies(self):
         for _ in range(60):
@@ -233,6 +265,8 @@ class Rig(object):
         return out
 
     def ask(self, cmd, data=None):
+        if cmd == P.HELLO:
+            return self.connect(data)
         req = self.send(cmd, data)
         rep = [r for r in self.replies() if r[1] == req]
         assert len(rep) == 1, rep
@@ -252,8 +286,233 @@ def hello_and_caps():
     cmd, _req, d = r.ask(P.HELLO, {"v": 1})
     assert cmd == P.HELLO_ACK
     assert d["daw"] == "Ableton Live" and d["dawVersion"] == "12.1.5"
-    assert d["caps"] == ["list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes"]
+    assert d["caps"] == ["list", "bind", "set", "plugins", "add", "remove", "audition", "tempo", "notes", "auth"]
     assert d["bpm"] == 120, d
+
+
+@test
+def the_midi_output_queue_is_bounded_under_a_burst_of_list():
+    # (24 nov., audit F3 des scripts) une rafale de LIST plus vite que Live n'envoie : la file s'arrete a OUT_MAX
+    # morceaux, chaque message y est entier ou absent, une seule ligne au journal
+    r = Rig()
+    r.song.tracks.extend(Track("Instrument number %03d with a long name" % i, [Device("Some Very Long Plugin %d" % i)])
+                         for i in range(400))
+    r.ask(P.HELLO, {"v": 1})
+    burst = 0
+    while burst < 60:
+        r.req = P.next_req(r.req)
+        for chunk in r.chunks(P.LIST, r.req, {}):
+            assert r.core.receive(tuple(bytearray(chunk)))
+        burst += 1
+        assert len(r.core.out) <= C.OUT_MAX, len(r.core.out)
+    assert len([m for m in r.logs if "dropped" in m]) == 1, r.logs
+    got = []
+    for _ in range(20):
+        got += r.replies()
+    assert got and all(c == P.LIST_REPLY for c, q, d in got), [c for c, q, d in got][:5]
+    assert not r.core.out, len(r.core.out)
+    cmd, _req, _d = r.ask(P.PING, {"t": 1})
+    assert cmd == P.PONG
+
+
+# -- 24 nov. (v1.4.0, audit M3) : le chemin MIDI authentifie -----------------------------------------------------
+def foreign(r, cmd, data=None, req=7, key=None, ctr=1):
+    """Un autre programme sur le port loopMIDI : il ne connait pas le secret."""
+    chunks = P.encode_signed(cmd, req, data or {}, key, ctr) if key is not None else P.encode_message(cmd, req, data or {})
+    for chunk in chunks:
+        assert r.core.receive(tuple(bytearray(chunk)))
+    return [x for x in r.replies() if x[1] == req]
+
+
+@test
+def live_obeys_nothing_on_midi_without_the_code():
+    r = Rig()
+    n = len(r.song.tracks)
+    for cmd, data in ((P.LIST, {}), (P.BIND, {"slot": 1, "id": 2}), (P.ADD, {"plugin": "x"}), (P.REMOVE, {"id": 0}),
+                      (P.TEMPO, {"bpm": 61}), (P.SET, {"id": 2, "mute": True}), (P.PLUGINS, {})):
+        rep = foreign(r, cmd, data)
+        assert [(c, d["code"]) for c, q, d in rep] == [(P.ERROR, P.ERR_AUTH)], (P.command_name(cmd), rep)
+    assert len(r.song.tracks) == n and r.song.tempo == 120 and not r.core.binds and not r.song.tracks[2].mute
+    # une session ouverte : un HELLO etranger ne la coupe pas, un AUTH faux non plus, une commande rejouee non plus
+    r.connect()
+    r.ask(P.BIND, {"slot": 1, "id": 2})
+    foreign(r, P.HELLO, {"v": 1, "caps": ["auth"]})
+    foreign(r, P.AUTH, {"n": "1" * 32, "p": "2" * 64}, req=8)
+    assert r.core.binds.get(1) is not None and r.core.key is not None
+    r.req = P.next_req(r.req)
+    captured = r.chunks(P.SET, 0, {"id": 2, "mute": True})
+    for c in captured:
+        r.core.receive(tuple(bytearray(c)))
+    assert r.song.tracks[2].mute is True
+    r.send(P.SET, {"id": 2, "mute": False})
+    for c in captured:
+        r.core.receive(tuple(bytearray(c)))
+    assert r.song.tracks[2].mute is False, "replayed"
+    rep = foreign(r, P.TEMPO, {"bpm": 61}, req=9, key=b"k" * 32, ctr=10 ** 6)
+    assert rep[0][2]["code"] == P.ERR_AUTH and r.song.tempo == 120
+    # une rafale de refus : une ligne au journal, pas une par message
+    before = len(r.logs)
+    for _ in range(40):
+        foreign(r, P.LIST, {}, req=10)
+    assert len([m for m in r.logs[before:] if "refused" in m]) <= 1, r.logs[before:]
+    # ni HELLO sans cap, ni ERROR, ni mauvais AUTH en rafale
+    before = len(r.logs)
+    for i in range(40):
+        foreign(r, P.HELLO, {"v": 1}, req=11)
+        foreign(r, P.ERROR, {"code": "x", "msg": "spam %d" % i}, req=0)
+        foreign(r, P.AUTH, {"n": "1" * 32, "p": "2" * 64}, req=12)
+    assert len(r.logs) - before <= 6, r.logs[before:]
+
+
+@test
+def the_midi_code_is_kept_and_the_companion_one_wins():
+    import types
+    path = os.path.join(TMP, "midi-keep.json")
+    old = os.environ.get(ECH.ENV_MIDI_FILE)
+    os.environ[ECH.ENV_MIDI_FILE] = path
+    try:
+        a, src = ECH.load_midi_secret(P)
+        assert src == "file" and len(a) == P.SECRET_BYTES and os.path.isfile(path)
+        b, src = ECH.load_midi_secret(P)
+        assert (b, src) == (a, "file"), "the same code after a restart of Live"
+        if os.name == "posix":
+            assert (os.stat(path).st_mode & 0o777) == 0o600
+        mod = types.ModuleType("uwl_secret")
+        mod.SECRET = "MZXW-6YTB-OI2D-EMRT-GQ3D-KNZW"  # gitleaks:allow (a made-up test code)
+        c, src = ECH.load_midi_secret(P, companion=mod)
+        assert src == "companion" and c == P.secret_of(mod.SECRET)
+        mod.SECRET = "nope"
+        logs = []
+        c, src = ECH.load_midi_secret(P, log=logs.append, companion=mod)
+        assert (c, src) == (a, "file") and logs, logs
+        with open(path, "w") as f:
+            f.write("{broken")
+        d, src = ECH.load_midi_secret(P)
+        assert src == "file" and d != a
+        # (relecture) sans hasard sur : pas de code, rien d'ecrit (le fichier abime reste tel quel)
+        os.remove(path)
+        weak = P.random_is_weak
+        P.random_is_weak = lambda: True
+        try:
+            e, src = ECH.load_midi_secret(P)
+        finally:
+            P.random_is_weak = weak
+        assert (e, src) == (b"", "weak") and not os.path.exists(path)
+    finally:
+        if old is None:
+            os.environ.pop(ECH.ENV_MIDI_FILE, None)
+        else:
+            os.environ[ECH.ENV_MIDI_FILE] = old
+    # (relecture) un code qui dure (le fichier) : jamais en entier dans Log.txt, seulement son id ; la barre d'etat le
+    # montre quand un studio le demande, pas plus d'une fois toutes les 20 s
+    shown, logs = [], []
+    core = C.LinkCore(song=lambda: None, send=lambda b: None, log=logs.append, now=lambda: 50.0, secret=a,
+                      secret_from="file", show=shown.append)
+    core.say_code(force=True)
+    core.say_code()
+    core.say_code()
+    assert not [m for m in logs if P.code_of(a) in m] and any(core.kid in m for m in logs), logs
+    assert len(shown) == 1 and P.code_of(a) in shown[0], shown
+    # celui du compagnon : ni au journal, ni a l'ecran
+    shown, logs = [], []
+    core = C.LinkCore(song=lambda: None, send=lambda b: None, log=logs.append, now=lambda: 50.0, secret=a,
+                      secret_from="companion", show=shown.append)
+    core.say_code(force=True)
+    core.say_code()
+    assert not shown and not [m for m in logs if P.code_of(a) in m], (shown, logs)
+    # un code de ce lancement seulement (le fichier n'a pas pu etre ecrit) : en entier au journal, une fois
+    shown, logs = [], []
+    core = C.LinkCore(song=lambda: None, send=lambda b: None, log=logs.append, now=lambda: 50.0, secret=a,
+                      secret_from="session", show=shown.append)
+    core.say_code(force=True)
+    core.say_code()
+    assert len([m for m in logs if P.code_of(a) in m]) == 1 and len(shown) == 1, (shown, logs)
+
+
+@test
+def a_new_session_keeps_the_mix_and_drops_only_what_the_studio_does_not_take_back():
+    # (24 nov., relecture, point 1) un AUTH juste sur une session MIDI ouverte : rien n'est rendu tout de suite ; les
+    # slots repris restent, les autres tombent apres STALE_AFTER
+    r = Rig()
+    r.ask(P.HELLO, {"v": 1})
+    r.ask(P.BIND, {"slot": 1, "id": 2})
+    r.ask(P.BIND, {"slot": 2, "id": 4})
+    r.send(P.SET, {"id": 2, "vol": 0.3})
+    r.send(P.SET, {"id": 4, "vol": 0.1, "mute": True})
+    lead, keys = r.song.tracks[2], r.song.tracks[4]
+    v_lead = lead.mixer_device.volume.value
+    r.ask(P.HELLO, {"v": 1})
+    r.ask(P.BIND, {"slot": 1, "id": 2})
+    r.advance(C.STALE_AFTER - 1)
+    assert keys.mute is True and keys.input_routing_type is not ALL_INS
+    r.advance(2)
+    assert keys.mute is False and keys.mixer_device.volume.value == 0.85 and keys.input_routing_type is ALL_INS
+    assert lead.mixer_device.volume.value == v_lead and set(r.core.binds) == {1}
+    assert any("did not take back" in m for m in r.logs), r.logs
+
+
+@test
+def a_slot_waiting_for_its_track_is_dropped_too_when_not_taken_back():
+    # (relecture) un slot d'avant la nouvelle session, deplace par un autre BIND sur sa piste (waiting) : il ne doit
+    # pas reprendre la piste pour toujours quand l'autre s'en va
+    r = Rig()
+    r.ask(P.HELLO, {"v": 1})
+    r.ask(P.BIND, {"slot": 1, "id": 4})
+    r.ask(P.BIND, {"slot": 2, "id": 4})              # le slot 1 attend la piste
+    assert 1 in r.core.waiting
+    r.ask(P.HELLO, {"v": 1})
+    r.ask(P.BIND, {"slot": 2, "id": 4})              # le studio ne reprend que le slot 2
+    r.advance(C.STALE_AFTER + 0.5)
+    assert 1 not in r.core.waiting and set(r.core.binds) == {2}
+    r.send(P.UNBIND, {"slot": 2})
+    keys = r.song.tracks[4]
+    assert not r.core.binds and keys.input_routing_type is ALL_INS
+
+
+@test
+def unsigned_commands_and_forged_errors_never_touch_live():
+    # (relecture, point 1) des LIST non signes sur toutes les req, des ERROR auth fabriques : rien ne bouge
+    r = Rig()
+    r.ask(P.HELLO, {"v": 1})
+    r.ask(P.BIND, {"slot": 3, "id": 4})
+    r.send(P.SET, {"id": 4, "vol": 0.2})
+    keys = r.song.tracks[4]
+    v = keys.mixer_device.volume.value
+    key = r.core.key
+    for q in range(1, 128):
+        for cmd, data in ((P.LIST, {}), (P.ERROR, {"code": P.ERR_AUTH, "msg": "x"})):
+            for chunk in P.encode_message(cmd, q, data):
+                r.core.receive(tuple(bytearray(chunk)))
+    r.replies()
+    r.advance(C.STALE_AFTER + 1)
+    assert r.core.key == key and set(r.core.binds) == {3} and keys.mixer_device.volume.value == v
+    assert r.ask(P.PING, {"t": 1})[0] == P.PONG
+
+
+@test
+def unsigned_errors_and_an_empty_secret_are_refused():
+    # (relecture, points 5 et 6) le texte d'un ERROR non signe ne va pas dans Log.txt ; sans secret (pas de hasard
+    # sur), HELLO et AUTH par MIDI sont refuses
+    r = Rig()
+    r.ask(P.HELLO, {"v": 1})
+    for chunk in P.encode_message(P.ERROR, 0, {"code": "internal", "msg": "Paste your code at evil.example"}):
+        r.core.receive(tuple(bytearray(chunk)))
+    assert not [m for m in r.logs if "evil.example" in m] and any("unsigned error report" in m for m in r.logs)
+    r.advance(C.AUTH_LOG_EVERY + 1)
+    r.send(P.ERROR, {"code": "internal", "msg": "studio side failure"}, signed=True)
+    assert any("studio side failure" in m for m in r.logs), r.logs
+    core = C.LinkCore(song=lambda: r.song, send=r.sent.append, log=r.logs.append, now=lambda: r.t,
+                      secret=b"", secret_from="weak")
+    assert core.secret == b"" and core.kid == ""
+    r.sent[:] = []
+    for chunk in P.encode_message(P.HELLO, 5, {"v": 1, "caps": ["auth"]}):
+        core.receive(tuple(bytearray(chunk)))
+    for _ in range(20):
+        core.flush()
+    rx = P.Reassembler()
+    got = [x for x in (rx.push(b, 0) for b in r.sent) if x["type"] == "message"]
+    assert [(g["cmd"], g["data"]["code"]) for g in got] == [(P.ERROR, P.ERR_AUTH)], got
+    assert "companion" in got[0]["data"]["msg"]
 
 
 @test
@@ -397,10 +656,13 @@ def solo_only_touches_linked_tracks():
     assert r.song.tracks[2].mute is False and r.song.tracks[4].mute is True and r.song.tracks[0].mute is False
     r.send(P.SET, {"id": 2, "solo": False})
     assert r.song.tracks[4].mute is False
-    # HELLO (le studio recharge) : tout revient comme avant
+    # HELLO (le studio recharge) : (relecture) rien ne bouge tout de suite ; ce qu'il ne relie pas dans STALE_AFTER s
+    # revient comme avant
     r.send(P.SET, {"id": 4, "vol": 0.1, "mute": True})
     r.ask(P.HELLO, {"v": 1})
     k = r.song.tracks[4]
+    assert k.mute is True
+    r.advance(C.STALE_AFTER + 0.5)
     assert k.mute is False and k.mixer_device.volume.value == 0.85 and k.input_routing_type is ALL_INS
 
 
@@ -965,7 +1227,7 @@ def merged_script_opens_plugin_windows_and_keeps_the_midi_link():
     s = UppwindLink.create_instance(c)
     try:
         st = uwlink_dev.read_state(state)
-        assert st["script"] == "UppwindLink" and st["version"] == "1.3.2" and st["editor"] == EC.EDITOR_VERSION, st
+        assert st["script"] == "UppwindLink" and st["version"] == "1.4.0" and st["editor"] == EC.EDITOR_VERSION, st
         assert st["link"] == 2, "the companion learns that LINK is served here, and that an empty read may wait"
         assert st["port"] == s._uw_chan.port and len(st["token"]) == 64
         # le compagnon : LIST, EDITOR_OPEN / STATE / CLOSE, EVENTS — par le vrai UDP
@@ -1179,6 +1441,8 @@ class PRig(Rig):
                                now=lambda: self.t, browser=lambda: self.browser, version=lambda: "12.4.3")
         self.rx = P.Reassembler()
         self.req = 0
+        self.key = None
+        self.ctr = 0
 
     def track(self, name):
         return [t for t in self.song.tracks if t.name == name][0]
@@ -1248,6 +1512,7 @@ def plugin_unbind_restores_the_input_and_removes_the_helper_later():
     plugin_bind(r, 1, 1)
     h2 = r.song.tracks[-1]
     r.ask(P.HELLO, {"v": 1})
+    r.advance(C.STALE_AFTER + 0.5)                   # (relecture) le slot non repris tombe apres STALE_AFTER s
     assert lead.input_routing_type is ALL_INS and h2 in r.song.tracks
     plugin_bind(r, 1, 1)
     r.core.shutdown()
@@ -1448,12 +1713,30 @@ def the_companion_transport_carries_the_same_messages():
     r.core.udp_out = [big] * 300
     rep = r.core.handle_link({"cmd": "LINK"})
     assert rep["more"] is True and sum(len(h) for h in rep["out"]) <= C.LINK_OUT_BUDGET + 500
-    # un HELLO par MIDI reprend la session : le dernier gagne
-    for chunk in P.encode_message(P.HELLO, 9, {"v": 1}):
+    r.core.udp_out = []
+    # (24 nov.) un HELLO par MIDI sans preuve (un autre programme sur le port) : un nonce, la session du compagnon reste
+    for chunk in P.encode_message(P.HELLO, 9, {"v": 1, "caps": ["auth"]}):
         r.core.receive(tuple(bytearray(chunk)))
-    assert r.core.transport == "midi" and r.core.udp_out == []
+    assert r.core.transport == "udp" and r.track("Lead").input_routing_type is not ALL_INS
     assert P.decode_chunks(r.sent)["cmd"] == P.HELLO_ACK
+    r.sent[:] = []
+    # et rien de ce qu'il envoie ensuite n'est obei
+    for chunk in P.encode_message(P.UNBIND, 0, {"slot": 1}):
+        r.core.receive(tuple(bytearray(chunk)))
+    assert r.track("Lead").input_routing_type is not ALL_INS
+    # le studio qui prouve le code par MIDI reprend la session : la nouvelle session delie
+    r.sent[:] = []
+    _c, _q, d = r.connect()
+    assert r.core.transport == "midi" and r.core.udp_out == [] and d["project"] is not None
     assert r.track("Lead").input_routing_type is ALL_INS, "the new session unbinds"
+    # puis le compagnon reprend : la cle MIDI tombe, plus rien n'est obei par MIDI
+    link_replies(r.core.handle_link({"cmd": "LINK", "in": hexes(P.HELLO, 10, {"v": 1})}))
+    assert r.core.transport == "udp" and r.core.key is None
+    r.sent[:] = []
+    for chunk in r.chunks(P.PING, 11, {"t": 1}):
+        r.core.receive(tuple(bytearray(chunk)))
+    got = r.replies()
+    assert [(c, d["code"]) for c, q, d in got] == [(P.ERROR, P.ERR_AUTH)], got
 
 
 @test

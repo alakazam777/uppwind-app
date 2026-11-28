@@ -54,9 +54,124 @@ fn read_state_full(p: &Path) -> Result<(u16, String, Who), String> {
     let v: Value = serde_json::from_str(&raw).map_err(|_| "the state file of Live's UppwindLink script is not JSON".to_string())?;
     let port = v["port"].as_u64().filter(|p| *p > 0 && *p < 65536).ok_or("no port in the state file")? as u16;
     let token = v["token"].as_str().filter(|t| !t.is_empty()).ok_or("no token in the state file")?.to_string();
+    // (audit F6) si Live a plante, le fichier reste et un autre programme peut tenir le port : le jeton ne part que si
+    // le processus qui a ecrit le fichier (son pid) vit encore et a demarre avant le fichier. Un script d'avant la
+    // 0.4.16 n'ecrit pas de pid : rien a verifier (le studio propose deja la mise a jour du script).
+    if let Some(pid) = v["pid"].as_u64() {
+        let started = v["started"].as_u64().unwrap_or(u64::MAX);
+        if !writer_alive(pid, started) {
+            return Err(GONE.to_string());
+        }
+    }
     let txt = |k: &str| v[k].as_str().map(|s| s.chars().filter(|c| !c.is_control()).take(40).collect::<String>()).filter(|s| !s.is_empty());
     let link = v["link"].as_u64().map(|n| n >= 1).unwrap_or(false);
     Ok((port, token, Who { script: txt("script"), live: txt("live"), version: txt("version"), link }))
+}
+
+/// (relecture F6) La marge entre l'heure de demarrage du processus et `started` : une horloge remise a l'heure apres le
+/// lancement de Live ne bloque pas le canal ; un pid repris apres un plantage demarre bien plus tard.
+pub const START_MARGIN_S: u64 = 60;
+
+/// (relecture F6) Le processus de Live, tenu pendant que le relais du lien parle au script : sous Windows une poignee
+/// ouverte (son pid ne peut pas etre repris tant qu'elle vit) ; ailleurs son heure de demarrage, relue a chaque fois.
+pub struct Writer {
+    #[cfg_attr(windows, allow(dead_code))]
+    pid: u32,
+    start: u64,
+    #[cfg(windows)]
+    h: windows::Win32::Foundation::HANDLE,
+}
+
+unsafe impl Send for Writer {}
+
+impl Writer {
+    /// Le processus `pid`, s'il vit et a demarre au plus tard a `started` (+ la marge).
+    pub fn open(pid: u64, started: u64) -> Option<Writer> {
+        let pid = u32::try_from(pid).ok().filter(|p| *p != 0)?;
+        #[cfg(windows)]
+        let h = unsafe { windows::Win32::System::Threading::OpenProcess(windows::Win32::System::Threading::PROCESS_SYNCHRONIZE, false, pid) }.ok()?;
+        let w = Writer {
+            pid,
+            start: process_start_secs(pid).unwrap_or(u64::MAX),
+            #[cfg(windows)]
+            h,
+        };
+        (w.start <= started.saturating_add(START_MARGIN_S) && w.alive()).then_some(w)
+    }
+
+    /// Vit-il encore (le meme processus) ?
+    pub fn alive(&self) -> bool {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::WAIT_TIMEOUT;
+            unsafe { windows::Win32::System::Threading::WaitForSingleObject(self.h, 0) == WAIT_TIMEOUT }
+        }
+        #[cfg(not(windows))]
+        {
+            process_start_secs(self.pid) == Some(self.start)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Writer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.h);
+        }
+    }
+}
+
+/// (audit F6) Le processus `pid` vit-il, et a-t-il demarre au plus tard a `started` (secondes Unix, + la marge) ?
+/// Un pid repris par un autre programme apres le plantage de Live a demarre apres le fichier : il est ecarte.
+pub fn writer_alive(pid: u64, started: u64) -> bool {
+    let Ok(pid) = u32::try_from(pid) else { return false };
+    if pid == 0 {
+        return false;
+    }
+    match process_start_secs(pid) {
+        Some(t) => t <= started.saturating_add(START_MARGIN_S),
+        None => false,
+    }
+}
+
+/// L'heure de demarrage du processus (secondes Unix), None s'il n'existe pas.
+#[cfg(windows)]
+fn process_start_secs(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let mut code = 0u32;
+        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u).is_ok() && GetExitCodeProcess(h, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(h);
+        if !ok {
+            return None;
+        }
+        // FILETIME : des centaines de ns depuis 1601
+        let t = ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64;
+        Some((t / 10_000_000).saturating_sub(11_644_473_600))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_secs(pid: u32) -> Option<u64> {
+    // proc_pidinfo(PROC_PIDTBSDINFO) : struct proc_bsdinfo, 136 octets, pbi_start_tvsec (u64) a l'octet 120
+    extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+    }
+    let mut b = [0u8; 136];
+    let n = unsafe { proc_pidinfo(pid as i32, 3, 0, b.as_mut_ptr(), b.len() as i32) };
+    if n as usize != b.len() {
+        return None;
+    }
+    Some(u64::from_ne_bytes(b[120..128].try_into().ok()?))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn process_start_secs(pid: u32) -> Option<u64> {
+    std::path::Path::new(&format!("/proc/{pid}")).exists().then_some(0)
 }
 
 /// Une requete → la reponse (un objet JSON avec « ok »). Live repond depuis update_display (~100 ms).
@@ -106,11 +221,20 @@ pub fn probe_at(path: &Path, timeout: Duration) -> Probe {
 /// (26 oct.) Pour le relais du lien (link_relay.rs, un socket qui reste ouvert ; avant : une requete et son socket par
 /// echange, link_exchange) : le port du script, son jeton et ce
 /// qu'il sert du lien (« link » : 1 = LINK ; 2 = un releve vide peut attendre, « wait »). Les erreurs : comme read_state.
-pub fn link_target_at(path: &Path) -> Result<(u16, String, u64), String> {
+/// (relecture F6) Et le processus de Live tenu (None : un script d'avant la 0.4.16, sans pid), que le relais revoit
+/// avant chaque envoi.
+pub fn link_target_at(path: &Path) -> Result<(u16, String, u64, Option<Writer>), String> {
     let (port, token) = read_state_at(path)?;
-    let level = std::fs::read_to_string(path).ok().and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|v| v["link"].as_u64()).unwrap_or(0);
-    Ok((port, token, level))
+    let v = std::fs::read_to_string(path).ok().and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).unwrap_or(Value::Null);
+    let level = v["link"].as_u64().unwrap_or(0);
+    let writer = match v["pid"].as_u64() {
+        Some(pid) => Some(Writer::open(pid, v["started"].as_u64().unwrap_or(u64::MAX)).ok_or_else(|| GONE.to_string())?),
+        None => None,
+    };
+    Ok((port, token, level, writer))
 }
+
+pub const GONE: &str = "Live's UppwindLink script is gone (Live closed or crashed): open Live again";
 
 /// Le numero d'une requete (link_relay.rs aussi).
 pub fn new_request_id() -> u64 {
@@ -286,6 +410,28 @@ mod tests {
         for f in [none, path, stale] {
             let _ = std::fs::remove_dir_all(f.parent().unwrap());
         }
+    }
+
+    #[test]
+    fn the_token_stays_home_when_the_script_is_gone() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let me = std::process::id() as u64;
+        assert!(super::writer_alive(me, now), "this process is alive and started before now");
+        assert!(!super::writer_alive(me, now - 3600), "a pid that started after the file is someone else");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap()).arg("--list").spawn().unwrap();
+        let gone = child.id() as u64;
+        child.wait().unwrap();
+        assert!(!super::writer_alive(gone, now + 60), "a finished process");
+        // un fichier d'etat avec le pid d'un processus fini : le jeton ne part pas, aucun paquet n'est envoye
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let path = temp_state("gone");
+        std::fs::write(&path, json!({"port": sock.local_addr().unwrap().port(), "token": "t0k", "pid": gone, "started": now}).to_string()).unwrap();
+        let e = super::request_at(&path, json!({"cmd": "EVENTS"}), Duration::from_millis(200)).unwrap_err();
+        assert!(e.contains("gone"), "{e}");
+        let mut buf = [0u8; 512];
+        assert!(sock.recv_from(&mut buf).is_err(), "the token was sent");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

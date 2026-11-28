@@ -37,6 +37,8 @@ Live 12 calls it *Settings › Tempo & MIDI* (*Options › Settings* on Windows,
 
 **One Control Surface is all you need.** Since version 1.1.0 the same script also opens your plugins' windows for the Uppwind Link companion (see *Plugin windows* below).
 
+**The MIDI link code (1.4.0 and later).** Over loopMIDI, the script obeys only Uppwind Studio, which proves it knows the script's code (24 characters, like `ABCD-EFGH-IJKL-MNOP-QRST-UVWX`): any program on your computer can write to a MIDI port. Installed by the companion, the code is in `uwl_secret.py` next to the script, and the studio gets it from the companion (Live never shows it: if the studio asks for it, start the companion and pair the studio). Otherwise Live shows it in its status bar (at the bottom) when the studio connects, and keeps it in `~/.uppwind-link-midi.json` (the `code` line), where you can copy it; `Log.txt` has only its id. Paste it once in the studio (*Settings › Uppwind Link*, step 4). Through the companion (no MIDI ports), no code is needed.
+
 **MIDI Ports:**
 
 | Port | Track | Remote |

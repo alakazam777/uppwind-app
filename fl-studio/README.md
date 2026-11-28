@@ -93,7 +93,19 @@ What the script does with each kind of event:
 
 FL's MIDI scripting API has no function to load a plugin, list the installed plugins, delete a channel or set a channel's MIDI ports. So the script reports only these capabilities: `list`, `bind`, `set`, `audition`, `tempo`, `notes`, (1.3.0) `editor` and (1.4.0) `params` (it can route a channel's notes through an Uppwind Link Notes that is already there). The studio then says *"Add the plugin in FL's channel rack; it appears here instantly."* The *Uppwind Link Notes* channels are not listed: they are not instruments.
 
+## The MIDI link code (1.5.0 and later)
+
+Any program on your computer can write to a loopMIDI port, so the script obeys only Uppwind Studio, which proves it knows the script's **MIDI link code** (24 characters, like `ABCD-EFGH-IJKL-MNOP-QRST-UVWX`).
+
+- **Installed by the companion:** the companion writes the code in `uwl_secret.py`, next to the script, and gives it to the studio: nothing to do. FL never shows that code (only its id): if the studio asks for it, start the companion and pair the studio. Keep that file private.
+- **Installed by hand:** *View › Script output* shows `MIDI link code for this FL session: …` once when FL starts (FL's hint bar shows it when the studio connects). Paste it in the studio (*Settings › Uppwind Link*, step 4). Without `uwl_secret.py` the code changes each time FL starts.
+- **No system random source** in FL's Python: the script has no code and obeys nothing over MIDI (*Script output* says the link stays closed). Install it with the companion.
+
+Notes and the CCs the studio forwards are plain MIDI, not commands: they don't carry the code.
+
 ## Troubleshooting
+
+- **The studio asks for a code.** Copy the line `MIDI link code for this FL session: …` from *View › Script output*. If the studio says the code was refused, FL was restarted without `uwl_secret.py`: copy the new one.
 
 - **The studio says FL doesn't answer.**
   - Is the script in *Script output*? If not, check the folder name and location, then restart FL.

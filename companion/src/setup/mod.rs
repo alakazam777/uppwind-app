@@ -558,6 +558,51 @@ fn fl_settings_checks(r: &Report) -> Vec<Check> {
     c
 }
 
+/// (24 nov., audit M3) Les codes du chemin MIDI des scripts installes (leur uwl_secret.py) : ce que le compagnon donne
+/// au studio appaire (midicodes), pour qu'il prouve le code au script sans que la personne le colle.
+pub fn midi_codes_in(probe: &Probe) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let ab = ableton::detect(probe);
+    for ul in &ab.user_libraries {
+        dirs.push(ul.join("Remote Scripts").join(ableton::FOLDER));
+    }
+    if let Some(hw) = &fl::detect(probe).hardware {
+        dirs.push(hw.join(fl::FOLDER));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        if let Some(c) = scripts::read_secret(&d) {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// La meme chose, sur la vraie machine, relue au plus toutes les 10 s (un studio qui attend son code redemande toutes
+/// les quelques secondes ; Probe::from_env lit le registre, les ports MIDI et les processus)
+pub fn midi_codes() -> Vec<String> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, v)) = c.as_ref() {
+        if at.elapsed() < Duration::from_secs(10) {
+            return v.clone();
+        }
+    }
+    let v = match Probe::from_env() {
+        Ok(p) => midi_codes_in(&p),
+        Err(e) => {
+            crate::log(&format!("MIDI link codes: {e}"));
+            Vec::new()
+        }
+    };
+    *c = Some((Instant::now(), v.clone()));
+    v
+}
+
 /// --apply : fait le plan, relit chaque dossier.
 pub fn apply(r: &mut Report) {
     for t in &mut r.scripts {
@@ -1211,6 +1256,47 @@ pub(crate) mod tests {
 
     fn count(dir: &Path) -> usize {
         std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| if e.path().is_dir() { 1 + count(&e.path()) } else { 1 }).sum()).unwrap_or(0)
+    }
+
+    #[test]
+    fn each_installed_script_gets_a_midi_code_that_updates_keep() {
+        let root = temp_root("midicode");
+        let p = machine(&root);
+        let o = Opts { apply: true, ..Default::default() };
+        let mut r = gather(&p, &o, "20261124-090000");
+        apply(&mut r);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let (ab, flp) = (r.scripts[0].dir.clone(), r.scripts[1].dir.clone());
+        let (ca, cf) = (scripts::read_secret(&ab).expect("Live's code"), scripts::read_secret(&flp).expect("FL's code"));
+        assert_ne!(ca, cf, "one code per script");
+        assert!(!r.scripts.iter().any(|t| t.files.iter().any(|f| f.name == scripts::SECRET_FILE)), "not an extra file");
+        assert_eq!(midi_codes_in(&p), vec![ca.clone(), cf.clone()]);
+        // une mise a jour garde le code (le studio le connait deja)
+        let v = scripts::bundle(Daw::Fl).version();
+        let old = std::fs::read_to_string(flp.join("device_UppwindLink.py")).unwrap();
+        std::fs::write(flp.join("device_UppwindLink.py"), old.replace(&format!("SCRIPT_VERSION = \"{v}\""), "SCRIPT_VERSION = \"0.9.0\"")).unwrap();
+        let mut r2 = gather(&p, &o, "20261124-090100");
+        assert_eq!(r2.scripts[1].action, Action::Update);
+        apply(&mut r2);
+        assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+        assert_eq!(scripts::read_secret(&flp).as_deref(), Some(cf.as_str()), "the update kept FL's code");
+        // (relecture) la sauvegarde d'avant la mise a jour n'emporte pas le code ; aucun temporaire ne reste
+        let bk = r2.scripts[1].backup.clone().expect("a backup");
+        assert!(bk.join("device_UppwindLink.py").is_file() && !bk.join(scripts::SECRET_FILE).exists(), "{}", bk.display());
+        assert!(!flp.join(scripts::SECRET_TMP).exists());
+        // un script a jour sans code (installe a la main) : --apply lui en donne un, et ne touche pas au reste
+        std::fs::remove_file(ab.join(scripts::SECRET_FILE)).unwrap();
+        let mut r3 = gather(&p, &o, "20261124-090200");
+        assert_eq!(r3.scripts[0].action, Action::None);
+        apply(&mut r3);
+        let ca2 = scripts::read_secret(&ab).expect("a new code");
+        assert_ne!(ca2, ca);
+        assert!(r3.done.iter().any(|l| l.contains("MIDI link code")), "{:?}", r3.done);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(ab.join(scripts::SECRET_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]

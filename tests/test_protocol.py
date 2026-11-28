@@ -91,6 +91,82 @@ def messages_fixture():
 
 
 @test
+def auth_fixture():
+    # (24 nov., audit M3) les memes octets que le studio : avec le SHA-256 du Python (hashlib) ET avec le secours en
+    # Python pur (celui d'un bac a sable sans hashlib)
+    cases = read_fix("auth.json")
+    assert len(cases) > 30
+    ub = lambda s: bytes(bytearray.fromhex(s))     # noqa: E731
+    for c in cases:
+        k = c["kind"]
+        if k == "sha256":
+            assert P.sha256(c["msg"].encode("latin-1")).hex() == c["hex"], c
+            assert P.py_sha256(c["msg"].encode("latin-1")).hex() == c["hex"], c
+        elif k == "hmac":
+            assert P.hmac_sha256(ub(c["key"]), c["msg"].encode("latin-1")).hex() == c["hex"], c
+            assert P.hmac_sha256(ub(c["key"]), c["msg"].encode("latin-1"), P.py_sha256).hex() == c["hex"], c
+        elif k == "code":
+            assert P.code_of(ub(c["secret"])) == c["code"], c
+            assert P.secret_of(c["code"]).hex() == c["secret"], c
+            assert P.key_id(ub(c["secret"])) == c["kid"], c
+        elif k == "bad-code":
+            assert P.secret_of(c["code"]) is None, c
+        elif k == "code-forms":
+            assert P.secret_of(c["code"]).hex() == c["secret"], c
+        elif k == "handshake":
+            s = ub(c["secret"])
+            assert P.studio_proof(s, c["daw"], c["studio"]) == c["studioProof"]
+            assert P.daw_proof(s, c["daw"], c["studio"]) == c["dawProof"]
+            assert P.session_key(s, c["daw"], c["studio"]).hex() == c["key"]
+            assert P.proof_ok(c["studioProof"].upper(), c["studioProof"]) and not P.proof_ok(c["dawProof"], c["studioProof"])
+            assert not P.proof_ok(None, c["studioProof"]) and not P.proof_ok("é" * 64, c["studioProof"])
+        elif k == "signed":
+            got = [hexs(x) for x in P.encode_signed(c["cmd"], c["req"], c["data"], ub(c["key"]), c["c"])]
+            assert got == c["chunks"], (c["name"], got, c["chunks"])
+            out = P.decode_chunks([unhex(h) for h in c["chunks"]])
+            v = P.verify_signed(c["cmd"], c["req"], out["text"], ub(c["key"]), c["c"] - 1)
+            assert v["ok"] and v["c"] == c["c"], (c["name"], v)
+            assert v["data"] == json.loads(P.canonical_json(c["data"])), (c["name"], v)
+        elif k == "verify":
+            r = P.verify_signed(c["cmd"], c["req"], c["text"], ub(c["key"]), c["last"])
+            got = {"ok": True, "data": r["data"], "c": r["c"]} if r["ok"] else {"ok": False, "why": r["why"]}
+            assert got == c["out"], (c["name"], got, c["out"])
+        else:
+            raise AssertionError("unknown case %s" % k)
+    assert any(c["kind"] == "signed" and len(c["chunks"]) > 1 for c in cases)
+    for bad in ({"c": 1}, {"a": "x"}, [1]):
+        try:
+            P.encode_signed(P.SET, 0, bad, b"k" * 32, 1)
+        except (ValueError, TypeError):
+            continue
+        raise AssertionError(bad)
+    for n in (0, -1, True, P.MAX_COUNTER + 1):
+        try:
+            P.encode_signed(P.SET, 0, {}, b"k" * 32, n)
+        except ValueError:
+            continue
+        raise AssertionError(n)
+
+
+@test
+def random_bytes_without_os_urandom_still_differ():
+    import os as _os
+    real = _os.urandom
+    try:
+        def broken(n):
+            raise NotImplementedError("sandbox")
+        _os.urandom = broken
+        P._RNG["fallback"] = False
+        a, b = P.random_bytes(16, b"secret"), P.random_bytes(16, b"secret")
+        assert len(a) == 16 and a != b
+        assert P.random_is_weak(), "said"
+    finally:
+        _os.urandom = real
+    P._RNG["fallback"] = False
+    assert len(P.new_nonce()) == 32 and not P.random_is_weak()
+
+
+@test
 def errors_fixture():
     for c in read_fix("errors.json"):
         r = P.Reassembler()

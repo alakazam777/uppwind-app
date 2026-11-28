@@ -64,10 +64,17 @@ pub fn run(op: &str) -> Outcome {
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SW_HIDE};
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => return Outcome::Failed(format!("cannot find this program's own file ({e})")),
+    // (relecture F18) le chemin REEL de l'image qui tourne (QueryFullProcessImageNameW suit un renommage ;
+    // current_exe garde l'ancien chemin, ou un autre exe a pu etre pose), tenu, puis relu : s'il a change entre les
+    // deux, refuse. Une fois tenu (sans FILE_SHARE_DELETE), l'exe ne peut plus etre renomme, ni ses dossiers.
+    let Some(exe) = own_image() else { return Outcome::Failed("cannot find this program's own file".into()) };
+    let _held = match hold(&exe) {
+        Ok(h) => h,
+        Err(e) => return Outcome::Failed(format!("cannot hold this program's own file before asking for administrator rights ({e})")),
     };
+    if own_image().as_deref() != Some(exe.as_path()) {
+        return Outcome::Failed("this program's own file moved while it was being checked: nothing was asked".into());
+    }
     let file = HSTRING::from(exe.as_os_str());
     let params = HSTRING::from(format!("{FLAG} {op}"));
     unsafe {
@@ -109,6 +116,87 @@ pub fn run(op: &str) -> Outcome {
             Ok(()) => Outcome::Exit(code as i32),
             Err(e) => Outcome::Failed(format!("cannot read the result of the copy with administrator rights ({e})")),
         }
+    }
+}
+
+/// (F18) Ouvre `exe` en lecture, en partage de lecture seulement (ni FILE_SHARE_WRITE, ni FILE_SHARE_DELETE) : tant
+/// que la poignee vit, l'exe ne peut etre ni ecrit, ni renomme, ni efface, et ses dossiers ne peuvent pas etre renommes.
+/// (relecture) Le dossier n'est plus tenu : ca bloquait tout renommage dedans (un telechargement qui se termine dans
+/// Telechargements), sans rien ajouter. Ce n'est pas une signature : un exe remplace avant son lancement n'est pas vu.
+#[cfg(windows)]
+pub fn hold(exe: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(exe)
+}
+
+/// (relecture F18) Le chemin de l'image de ce processus, tel que Windows le suit (apres un renommage aussi).
+#[cfg(windows)]
+pub fn own_image() -> Option<std::path::PathBuf> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{GetCurrentProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+    let mut buf = vec![0u16; 32768];
+    let mut n = buf.len() as u32;
+    unsafe { QueryFullProcessImageNameW(GetCurrentProcess(), PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n) }.ok()?;
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])))
+}
+
+#[cfg(all(test, windows))]
+mod f18_tests {
+    #[test]
+    fn a_held_exe_and_its_folder_cannot_be_swapped() {
+        let base = std::env::temp_dir().join(format!("uwl-f18-{}", std::process::id()));
+        let dir = base.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("uppwind-companion.exe");
+        std::fs::write(&exe, b"MZ original").unwrap();
+        {
+            let _h = super::hold(&exe).unwrap();
+            assert!(std::fs::write(&exe, b"MZ other").is_err(), "written while held");
+            assert!(std::fs::rename(&exe, dir.join("old.exe")).is_err(), "renamed while held");
+            assert!(std::fs::rename(&dir, base.join("moved")).is_err(), "folder moved while held");
+            assert_eq!(std::fs::read(&exe).unwrap(), b"MZ original");
+            // (relecture) un telechargement qui se termine a cote (Chrome renomme .crdownload) n'est pas bloque
+            std::fs::write(dir.join("x.crdownload"), b"x").unwrap();
+            std::fs::rename(dir.join("x.crdownload"), dir.join("x.zip")).expect("a rename next to the held exe");
+        }
+        std::fs::rename(&exe, dir.join("old.exe")).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (relecture) Un exe renomme pendant qu'il tourne : QueryFullProcessImageNameW donne le nouveau nom (current_exe
+    /// garderait l'ancien chemin, ou un autre exe y aurait ete pose).
+    #[test]
+    fn the_image_path_follows_a_rename() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+        let base = std::env::temp_dir().join(format!("uwl-f18r-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let exe = base.join("ping-copy.exe");
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe).args(["-n", "5", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let moved = base.join("moved-aside.exe");
+        std::fs::rename(&exe, &moved).unwrap();
+        let mut buf = vec![0u16; 1024];
+        let mut n = buf.len() as u32;
+        unsafe { QueryFullProcessImageNameW(HANDLE(child.as_raw_handle()), PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n) }.unwrap();
+        let seen = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(seen.ends_with("moved-aside.exe"), "{seen}");
+        assert!(super::own_image().is_some());
+    }
+
+    #[test]
+    fn the_running_exe_can_be_held_and_still_started() {
+        let me = std::env::current_exe().unwrap();
+        let _h = super::hold(&me).unwrap();
+        let st = std::process::Command::new(&me).arg("--list").output().unwrap();
+        assert!(st.status.success(), "the held exe did not start");
     }
 }
 

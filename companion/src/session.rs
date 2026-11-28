@@ -266,6 +266,8 @@ struct Conn<'a> {
     presence_used: bool,
     /// (11 nov.) hello {role:"presence"} : la page Music, qui ne peut que poser la presence Discord
     presence_only: bool,
+    /// (24 nov.) les codes MIDI deja donnes a ce studio : dit une fois au journal
+    codes_said: bool,
     /// (12 nov., mcu.rs) la surface Mackie Control de Logic Pro : la generation de ses booleens deja dite a ce studio
     surface_gen: u64,
     /// ce studio a demande la table (« mixer ») : il en recoit les changements, au plus un par MIXER_EVERY ; la
@@ -1062,6 +1064,16 @@ impl<'a> Conn<'a> {
             }
             // (25 oct.) les plugins Uppwind Link du DAW (plugin_link)
             ClientMsg::Instances => self.send_text(crate::plugin_link::instances_json()),
+            // (24 nov., audit M3) les codes du chemin MIDI des scripts installes : seulement a un studio appaire (on n'arrive
+            // ici qu'apres sa preuve ; la page Music est arretee plus haut)
+            ClientMsg::MidiCodes => {
+                let codes = if self.sh.demo { Vec::new() } else { crate::setup::midi_codes() };
+                if !self.codes_said {
+                    self.codes_said = true;
+                    crate::log(&format!("gave {} MIDI link code(s) to the studio", codes.len()));
+                }
+                self.send_text(json!({ "type": "midicodes", "codes": codes }).to_string())
+            }
             ClientMsg::Midi { to, events } => match crate::plugin_link::send_midi(&to, &events) {
                 Ok(_) => Ok(()),
                 Err(e) => self.send_text(protocol::error("midi", &e)),
@@ -1138,6 +1150,20 @@ impl<'a> Conn<'a> {
                 };
                 if over {
                     return self.send_text(protocol::error("link", "too many link messages: slow down"));
+                }
+                // (24 nov., relecture, probleme 9) BIND peut ajouter une piste d'aide sans armement : sa propre limite, basse
+                let binds = protocol::link_bind_count(&sysex);
+                if binds > 0 {
+                    static B: std::sync::Mutex<protocol::BindBudget> = std::sync::Mutex::new(protocol::BindBudget { since: None, n: 0 });
+                    if !B.lock().unwrap_or_else(|e| e.into_inner()).take(Instant::now(), binds) {
+                        log_refused("REFUSED a BIND from the studio: more than 48 in 10 s");
+                        // le refus dans le protocole du lien : le studio rejette chaque BIND tout de suite (link.js)
+                        let replies = protocol::link_refusals_of(&sysex, &[protocol::LINK_BIND], "too many links to the DAW in 10 s: wait a few seconds");
+                        if !replies.is_empty() {
+                            return self.send_text(json!({ "type": "link", "sysex": replies }).to_string());
+                        }
+                        return self.send_text(protocol::error("link", "too many BIND messages: wait a few seconds"));
+                    }
                 }
                 match self.link.as_ref().unwrap().send(sysex) {
                     Ok(()) => Ok(()),
@@ -1293,7 +1319,7 @@ impl<'a> Conn<'a> {
         let (tx, rx) = mpsc::sync_channel(FX_OUT_QUEUE);
         self.fx.push(FxStream { stream: k, fx, gen, rate, rx, seq: 0, budget: rate as f64 * FX_BURST_SECONDS, at: Instant::now(), got: 0, sent: 0, over: 0, full: 0 });
         let reply = self.host_tx.clone();
-        std::thread::spawn(move || {
+        let work = move || {
             #[cfg(any(windows, target_os = "macos"))]
             let r = crate::host::fx_live(fx, rate, gen, tx);
             #[cfg(not(any(windows, target_os = "macos")))]
@@ -1303,7 +1329,15 @@ impl<'a> Conn<'a> {
                 Err(e) => json!({ "type": "host", "action": "fx-live", "stream": k, "id": fx, "gen": gen, "on": false, "error": e, "n": n }),
             };
             let _ = reply.send(m.to_string());
-        });
+        };
+        // (F21) le meme plafond que les autres demandes a l'hote (64 en tout, 8 par plugin) : au-dela, refuse sans fil
+        #[cfg(any(windows, target_os = "macos"))]
+        if !crate::host::spawn_placed(Some(fx), work) {
+            self.fx.retain(|s| s.gen != gen);
+            return self.send_text(json!({ "type": "host", "action": "fx-live", "stream": k, "id": fx, "gen": gen, "on": false, "error": "the companion is busy: too many requests at once", "n": n }).to_string());
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        std::thread::spawn(work);
         Ok(())
     }
 
@@ -1754,11 +1788,16 @@ impl Drop for Slot {
 /// de main : une rafale de connexions a moitie ouvertes ne fait pas pousser les fils sans fin). Au-dela : fermee.
 pub fn serve(listener: TcpListener, sh: Arc<Shared>, max: usize) {
     let active = Arc::new(AtomicUsize::new(0));
+    let unproven = crate::evict::Unproven::new();
     let mut refused: u64 = 0;
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if active.load(Ordering::SeqCst) >= max {
+                // (24 nov., relecture, probleme 7) toutes les places prises : la plus ancienne connexion qui n'a pas prouve
+                // le code est fermee, et la nouvelle entre (une connexion appairee n'est jamais fermee ainsi). Au plus le
+                // double des places a la fois, le temps que les fils des connexions fermees finissent.
+                let n = active.load(Ordering::SeqCst);
+                if n >= max && (n >= 2 * max || !unproven.evict_oldest()) {
                     refused += 1;
                     if refused == 1 || refused % 100 == 0 {
                         log_refused(&format!("REFUSED a connection: {max} are already open ({refused} refused so far)"));
@@ -1767,10 +1806,10 @@ pub fn serve(listener: TcpListener, sh: Arc<Shared>, max: usize) {
                     continue;
                 }
                 active.fetch_add(1, Ordering::SeqCst);
-                let (sh, slot) = (sh.clone(), Slot(active.clone()));
+                let (sh, slot, ticket) = (sh.clone(), Slot(active.clone()), unproven.enter(&s));
                 std::thread::spawn(move || {
                     let _slot = slot;
-                    run(s, sh);
+                    run(s, sh, ticket);
                 });
             }
             Err(e) => log_refused(&format!("accept: {e}")),
@@ -1779,7 +1818,7 @@ pub fn serve(listener: TcpListener, sh: Arc<Shared>, max: usize) {
 }
 
 /// Une connexion, du premier octet a la fermeture.
-pub fn run(stream: TcpStream, sh: Arc<Shared>) {
+pub fn run(stream: TcpStream, sh: Arc<Shared>, mut ticket: crate::evict::Ticket) {
     // les gestes partent tout de suite (pas d'algorithme de Nagle sur les petits messages)
     let _ = stream.set_nodelay(true);
     // (9 nov., audit F2) la generation des codes avant meme de lire le jeton : un nouveau code pendant la poignee de main
@@ -1828,6 +1867,7 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
         presence_gen: 0,
         presence_used: false,
         presence_only: false,
+        codes_said: false,
         surface_gen: 0,
         mixer_used: false,
         mixer_gen: 0,
@@ -1931,6 +1971,9 @@ pub fn run(stream: TcpStream, sh: Arc<Shared>) {
                 }
                 guard.success();
                 drop(guard);
+                // (24 nov., probleme 7) prouve : plus jamais fermee pour laisser entrer une autre connexion (des maintenant,
+                // pas apres le hello : une fermeture entre les deux couperait un studio qui vient de s'appairer)
+                ticket.proved();
                 if version.unwrap_or(0) != PROTOCOL_VERSION {
                     crate::log(&format!("note: the studio speaks protocol {:?}, the companion {PROTOCOL_VERSION}", version));
                 }
@@ -2372,6 +2415,35 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(back, "the slot of the closed connection is free again");
+    }
+
+    /// (24 nov., relecture, probleme 7) toutes les places prises par des clients lents qui ne prouvent rien : la plus
+    /// ancienne laisse sa place, et le vrai studio s'appaire ; une connexion appairee n'est jamais fermee pour une autre
+    #[test]
+    fn slow_unpaired_clients_make_way_and_a_paired_one_stays() {
+        let port = server_with(true, 50, 3);
+        let (mut paired, _) = pair_v2(port);
+        let slow: Vec<std::net::TcpStream> = (0..2)
+            .map(|_| {
+                let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                std::io::Write::write_all(&mut s, b"G").unwrap();
+                s
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(1100));
+        let t0 = Instant::now();
+        let (_studio, _) = pair_v2(port);
+        assert!(t0.elapsed() < Duration::from_secs(2), "the real studio paired at once");
+        let mut b = [0u8; 1];
+        let mut first = &slow[0];
+        let _ = first.set_read_timeout(Some(Duration::from_secs(2)));
+        assert_eq!(std::io::Read::read(&mut first, &mut b).unwrap_or(0), 0, "the oldest slow client was closed");
+        // toutes les places tenues par des connexions appairees (la premiere, le studio) et la seconde lente : une autre
+        // connexion lente prend la place de celle-ci, jamais celle d'une appairee
+        let _more = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        paired.send(Message::text(r#"{"type":"ping","t":1}"#.to_string())).unwrap();
+        assert_eq!(text_of(&mut paired, "pong")["type"], "pong", "the first paired studio is still connected");
     }
 
     #[test]
@@ -2848,6 +2920,37 @@ mod tests {
         p.extend_from_slice(&[0u8; 32]);
         ws.send(Message::binary(p)).unwrap();
         assert_eq!(close_code(&mut ws), Some(CLOSE_PROTOCOL));
+    }
+
+    /// (relecture F21) Les places d'un plugin heberge sont prises (8) : fx-live pour lui est refuse « busy », sans fil ;
+    /// les places rendues, il repart.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn fx_live_waits_for_a_place_like_every_host_request() {
+        let (port, _sh) = server_shared(true, true, 50, MAX_CONNECTIONS, None, false);
+        let (mut ws, _) = pair_v2(port);
+        let id = 4_000_021u32;
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let hold_rx = Arc::new(std::sync::Mutex::new(hold_rx));
+        let mut held = 0;
+        while held < 64 {
+            let rx = hold_rx.clone();
+            if !crate::host::spawn_placed(Some(id), move || {
+                let _ = rx.lock().unwrap().recv();
+            }) {
+                break;
+            }
+            held += 1;
+        }
+        assert_eq!(held, crate::host::MAX_PER_PLUGIN);
+        ws.send(Message::text(json!({"type": "host", "action": "fx-live", "id": id, "rate": 48000, "stream": 9, "n": 1}).to_string())).unwrap();
+        let r = text_where(&mut ws, "host", |v| v["action"] == "fx-live");
+        assert!(r["error"].as_str().unwrap_or("").contains("busy"), "{r}");
+        drop(hold_tx);
+        std::thread::sleep(Duration::from_millis(200));
+        ws.send(Message::text(json!({"type": "host", "action": "fx-live", "id": id, "rate": 48000, "stream": 9, "n": 2}).to_string())).unwrap();
+        let r = text_where(&mut ws, "host", |v| v["action"] == "fx-live" && v["n"] == 2);
+        assert!(!r["error"].as_str().unwrap_or("").contains("busy"), "{r}");
     }
 
     /// (19 nov., etape 3b) Un effet en direct arrete (fx-stop) : ses paquets encore en route sont jetes, la connexion

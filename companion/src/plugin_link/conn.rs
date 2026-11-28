@@ -83,7 +83,7 @@ fn refuse_wrong(s: &mut TcpStream, hub: &Hub, what: &str, who: &p::Hello) {
     }
 }
 
-pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr) {
+pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr, mut ticket: crate::evict::Ticket) {
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
@@ -164,6 +164,7 @@ pub fn run(mut s: TcpStream, hub: Arc<Hub>, peer: SocketAddr) {
         refuse_wrong(&mut s, &hub, "proof", &hello);
         return;
     }
+    ticket.proved(); // (24 nov., probleme 7) prouve : plus fermee pour une autre connexion
     let serial = hub.next_serial();
     let inst = Arc::new(Instance {
         id: hello.instance,

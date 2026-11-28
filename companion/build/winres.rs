@@ -4,13 +4,33 @@
 //! (assets/uppwind-link.ico, le disque d'Uppwind Records) et le bloc de version (le Gestionnaire des taches et les
 //! Proprietes du fichier disent « Uppwind Link », Uppwind, la version ; l'assistant y lit la version d'une copie
 //! installee). Un fichier .res est une suite d'entrees que link.exe prend en entree comme un .obj.
-//! Et, pour les pages de l'interface (src/ui/), le disque en base64 (ui_assets.rs dans OUT_DIR).
+//! (F11) Et le manifeste (MANIFEST). Et, pour les pages de l'interface (src/ui/), le disque en base64 (ui_assets.rs dans OUT_DIR).
 
 use std::path::{Path, PathBuf};
 
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
 const RT_VERSION: u16 = 16;
+const RT_MANIFEST: u16 = 24;
+
+/// (F11) Le manifeste : asInvoker (jamais d'invite d'administrateur deduite du nom de l'exe ; l'elevation reste
+/// explicite, plugin_install/elevate.rs), PerMonitorV2 (ce que main.rs demande deja au demarrage) et Windows 10/11.
+const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false"/></requestedPrivileges></security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application><supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/></application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
 const LANG_EN_US: u16 = 0x0409;
 
 fn pad4(b: &mut Vec<u8>) {
@@ -114,6 +134,8 @@ fn resources(ico: &[u8], major: u16, minor: u16, patch: u16, version: &str) -> V
     }
     entry(&mut out, RT_GROUP_ICON, 1, 0x1030, LANG_EN_US, &group);
     entry(&mut out, RT_VERSION, 1, 0x0030, LANG_EN_US, &version_info(major, minor, patch, version));
+    // id 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID) : celui que Windows lit au lancement d'un exe
+    entry(&mut out, RT_MANIFEST, 1, 0x0030, LANG_EN_US, MANIFEST.as_bytes());
     out
 }
 
