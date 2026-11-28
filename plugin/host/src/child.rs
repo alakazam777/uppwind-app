@@ -49,10 +49,75 @@ pub enum UiEv {
     HideEditor,
 }
 
+/// (audit F8) Le canal du protocole : la sortie standard d'origine, mise de cote par `private_stdout` avant que le
+/// module ne soit charge. La sortie standard que voit le plugin (printf, std::cout) va alors a la sortie d'erreur :
+/// une ligne qu'il ecrit ne peut plus passer pour un message de l'hote.
+static PROTO: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
 pub(crate) fn out(v: Value) {
-    let mut o = std::io::stdout().lock();
-    let _ = writeln!(o, "{v}");
-    let _ = o.flush();
+    let mut g = PROTO.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_mut() {
+        Some(f) => {
+            let _ = writeln!(f, "{v}");
+            let _ = f.flush();
+        }
+        None => {
+            let mut o = std::io::stdout().lock();
+            let _ = writeln!(o, "{v}");
+            let _ = o.flush();
+        }
+    }
+}
+
+/// (relecture F8) Le canal du protocole est la (sans lui, l'enfant ne charge rien : personne ne l'entendrait).
+fn has_proto() -> bool {
+    PROTO.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// (audit F8) Met la sortie standard de cote pour le protocole (PROTO) et la remplace par la sortie d'erreur. A appeler
+/// avant de charger le module. Sous Windows, le C runtime d'un plugin lit la poignee standard quand sa DLL se charge :
+/// il recoit celle d'erreur.
+pub fn private_stdout() {
+    let mut g = PROTO.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_some() {
+        return;
+    }
+    let _ = std::io::stdout().flush();
+    // (relecture F8) Windows : le CRT partage (ucrtbase, /MD) note la poignee de sa sortie standard une fois pour
+    // toutes, avant main ; la changer ensuite ne sert a rien. Le compagnon lance donc l'enfant avec sa sortie standard
+    // sur NUL, et lui donne le protocole a part : un tuyau qu'il copie lui-meme dans l'enfant (DuplicateHandle, rien
+    // n'est herite), dont la valeur arrive en premiere ligne de l'entree standard : {"proto":N}.
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::io::FromRawHandle;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_err() {
+            return;
+        }
+        let Some(n) = serde_json::from_str::<Value>(line.trim()).ok().and_then(|v| v["proto"].as_u64()).filter(|n| *n != 0) else { return };
+        *g = Some(std::fs::File::from_raw_handle(n as usize as _));
+    }
+    #[cfg(unix)]
+    unsafe {
+        use std::os::fd::FromRawFd;
+        extern "C" {
+            fn dup(fd: i32) -> i32;
+            fn dup2(from: i32, to: i32) -> i32;
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_SETFD: i32 = 2;
+        const FD_CLOEXEC: i32 = 1;
+        let fd = dup(1);
+        if fd < 0 {
+            return;
+        }
+        // un programme que le plugin lancerait n'en herite pas
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        if dup2(2, 1) < 0 {
+            return;
+        }
+        *g = Some(std::fs::File::from_raw_fd(fd));
+    }
 }
 
 /// Le texte hexadecimal d'un identifiant de classe (16 octets → 32 chiffres minuscules).
@@ -141,6 +206,10 @@ pub fn scan_main(module: &Path) -> i32 {
         hard_exit(3);
     });
     safe_dll_search();
+    private_stdout();
+    if !has_proto() {
+        return 2;
+    }
     match Module::load(module) {
         Ok(m) => {
             let list: Vec<Value> = classes(&m)
@@ -411,6 +480,10 @@ fn write_state(dir: &Path, path: &Path, blob: &[u8]) -> std::io::Result<()> {
 
 pub fn host_main(a: HostArgs) -> i32 {
     safe_dll_search();
+    private_stdout();
+    if !has_proto() {
+        return 2;
+    }
     // (20 nov., relecture de securite) une panique arrete l'enfant aussitot : derouler le fil de l'interface liberait le
     // plugin pendant que le fil audio ou celui du direct l'appelle encore (ses pointeurs bruts, SendBox). Seulement dans
     // l'enfant : les plugins Uppwind Link charges par un DAW gardent leur comportement.

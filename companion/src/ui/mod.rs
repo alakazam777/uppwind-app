@@ -215,12 +215,20 @@ pub fn shot_path() -> Option<PathBuf> {
 }
 
 /// Le dossier des donnees de WebView2 d'une fenetre d'installation ou de desinstallation : dans le bac a sable, sinon
-/// un dossier temporaire a ce processus (efface a la fin).
+/// un dossier a ce processus (efface a la fin) sous %LOCALAPPDATA%\Uppwind Link Setup (ou UWC_INSTALL_ROOT), a cote du
+/// dossier de l'application et pas dedans : la desinstallation l'efface, et une installation annulee n'en laisse pas.
+/// (27 nov.) plus dans %TEMP% : un profil WebView2 dans le dossier temporaire est un signe que relevent les bacs a sable
+/// d'analyse (Hybrid Analysis, api-25) ; %TEMP% seulement si LOCALAPPDATA manque.
 pub fn setup_data_dir() -> PathBuf {
     match crate::wizard::sandbox() {
         Some(d) => d.join("setup-webview"),
-        None => std::env::temp_dir().join("Uppwind Link Setup").join(format!("wv-{}", std::process::id())),
+        None => setup_data_parent(crate::install::Dirs::from_env().ok().as_ref(), &std::env::temp_dir()).join(format!("wv-{}", std::process::id())),
     }
+}
+
+/// (pure) Le dossier parent de `setup_data_dir` : `<local>\Uppwind Link Setup`, sinon `<temp>\Uppwind Link Setup`.
+fn setup_data_parent(dirs: Option<&crate::install::Dirs>, temp: &Path) -> PathBuf {
+    dirs.map(|d| d.local.as_path()).unwrap_or(temp).join("Uppwind Link Setup")
 }
 
 /// Efface un dossier de donnees de WebView2 (ses processus le lachent une seconde apres la fermeture) ; s'il est encore
@@ -597,6 +605,15 @@ mod tests {
         assert!(h.len() < 2 * 1024 * 1024, "NavigateToString takes at most 2 MB");
         let s = html(ipc::Page::Status, &n, Some("window.x=1"));
         assert!(s.contains("data-page=\"status\"") && s.contains(&format!("<script nonce=\"{n}\">window.x=1</script>")));
+    }
+
+    #[test]
+    fn the_setup_webview_data_is_under_localappdata_not_temp() {
+        let d = crate::install::Dirs { local: PathBuf::from(r"C:\L"), roaming: PathBuf::from(r"C:\R") };
+        assert_eq!(setup_data_parent(Some(&d), Path::new(r"C:\T")), Path::new(r"C:\L").join("Uppwind Link Setup"));
+        assert_eq!(setup_data_parent(None, Path::new(r"C:\T")), Path::new(r"C:\T").join("Uppwind Link Setup"));
+        // remove_data_dir efface aussi le parent vide : il garde ce nom
+        assert!(setup_data_parent(Some(&d), Path::new(r"C:\T")).ends_with("Uppwind Link Setup"));
     }
 
     #[test]

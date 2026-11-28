@@ -40,6 +40,7 @@ mod discord;
 #[cfg(any(windows, target_os = "macos"))]
 mod host;
 mod encode;
+mod evict;
 mod input;
 mod install;
 mod link_relay;
@@ -377,7 +378,7 @@ fn parse_args() -> Result<Args, String> {
                 println!("Uppwind Link companion {}. {NOTICE}", env!("CARGO_PKG_VERSION"));
                 println!("uppwind-companion [--list | --probe TITLE [--seconds S]] [--port N] [--new-token] [--capture wgc|dwm|print] [--dev-origins] [--allow-origin URL] [--studio-origin URL|none] [--state-file PATH] [--demo] [--test-window [--test-window-at X,Y] [--test-window-unaware] [--test-window-ghost]] [--bench TITLE [--bench-clicks \"x,y;x,y\"] [--bench-out DIR]] [--background] [--plugin-port N | --no-plugins] [--no-midi-ports (macOS)] [--logic-view show|controls|editor (macOS)]");
                 println!("  Studio origin accepted by default: {} (only that one). --dev-origins adds http://localhost and http://127.0.0.1 on ports 5174 and 5747; --allow-origin adds one https:// or local origin (for your own development server only).", security::default_studio_origin());
-                println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH] | --stop-midi-ports (macOS) | --check-update [--download DIR]");
+                println!("uppwind-companion --install | --uninstall | --autostart on|off [--background] | --stop | --pairing-code [--state-file PATH] | --stop-midi-ports (macOS) | --check-update [--download DIR] | --verify-release DIR --release-tag vX.Y.Z | --update-keys");
                 if cfg!(target_os = "macos") {
                     println!("  macOS: the MIDI ports live in a small helper process that outlives the companion (DAWs keep them across restarts). --stop leaves it running; --stop-midi-ports and --uninstall stop it (the ports go).");
                 }
@@ -954,7 +955,7 @@ fn main() {
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     // (27 oct.) un autre compagnon tourne deja : le studio essaie les ports dans l'ordre et peut lui parler a lui
     for (pid, path) in install::other_companions() {
-        println!("Another companion is running (pid {pid}, {path}): the studio may connect to it instead of this one (port {port}). Stop them all with: uppwind-companion --stop");
+        println!("Another companion is running (pid {pid}, {path}): the studio may connect to it instead of this one (port {port}). Stop it from its own window, or with `uppwind-companion --stop` run from its folder (a companion only stops the copies in its own folder).");
     }
     let allow = match &args.studio {
         None => security::Allowlist::new(args.dev_origins, &args.allow),

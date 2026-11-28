@@ -40,6 +40,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & ./plugin/target/release/uwl-bundle.exe --out plugin/target/release/bundled
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # the build date of a release (RELEASING.md step 4): the commit date in place of the /Brepro hash
+          python -I dev/pe_timestamp.py 'plugin/target/release/bundled/Uppwind Link.vst3/Contents/x86_64-win/Uppwind Link.vst3'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           $bundle = Join-Path $env:GITHUB_WORKSPACE 'plugin\target\release\bundled\Uppwind Link.vst3'
           "UWL_PLUGIN_BUNDLE=$bundle" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       # from the repository folder, so that cargo reads .cargo/config.toml (the same flags as a release), with the
@@ -51,6 +54,8 @@ jobs:
       - name: The companion installs the plugins it carries, byte for byte, and removes them
         run: |
           cargo build --release --locked --manifest-path companion/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -I dev/pe_timestamp.py companion/target/release/uppwind-companion.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $vst3 = Join-Path $env:RUNNER_TEMP 'vst3-check'
           & ./companion/target/release/uppwind-companion.exe --install-plugins --plugins-dir $vst3

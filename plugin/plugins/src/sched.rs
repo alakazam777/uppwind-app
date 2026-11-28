@@ -13,6 +13,15 @@ pub const CAPACITY: usize = 2048;
 /// toutes d'un coup) ; les note off, CC et pitch bend passent toujours.
 pub const STALE_MS: f64 = 500.0;
 
+/// (audit F9, relecture) Les dernieres places de la reserve ne prennent que des note off (0x80, ou 0x90 a velocite 0) :
+/// ni note on, ni CC, ni pitch bend. Et un note off refuse quand meme (reserve pleine) est du : il sort au debut du bloc
+/// suivant si sa note est tenue (`owed`), sans allocation.
+pub const OFF_RESERVE: usize = 256;
+
+/// (audit F9) Un message prevu plus loin que ca dans le futur est refuse par le fil reseau (link.rs) : il occuperait
+/// une place de la reserve sans fin.
+pub const MAX_AHEAD_MS: f64 = 10_000.0;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Pending {
     t: f64,
@@ -50,6 +59,8 @@ pub struct Scheduler {
     len: usize,
     /// les notes tenues : un bit par note, par canal
     held: [u128; 16],
+    /// (relecture F9) les note off refuses faute de place : relaches au prochain bloc
+    owed: [u128; 16],
     pub stats: SchedStats,
 }
 
@@ -66,7 +77,7 @@ fn is_note_on(p: &Pending) -> bool {
 impl Scheduler {
     /// Alloue la reserve (a la creation du plugin, pas dans le fil audio).
     pub fn new() -> Scheduler {
-        Scheduler { buf: vec![Pending::default(); CAPACITY].into_boxed_slice(), len: 0, held: [0; 16], stats: SchedStats::default() }
+        Scheduler { buf: vec![Pending::default(); CAPACITY].into_boxed_slice(), len: 0, held: [0; 16], owed: [0; 16], stats: SchedStats::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -79,8 +90,12 @@ impl Scheduler {
 
     /// Ranger un message par instant (a instant egal : l'ordre d'arrivee). Reserve pleine : false, compte.
     pub fn insert(&mut self, t: f64, n: u32, len: u8, data: [u8; 3]) -> bool {
-        if self.len == CAPACITY {
+        let off = data[0] & 0xf0 == 0x80 || (data[0] & 0xf0 == 0x90 && data[2] == 0);
+        if self.len == CAPACITY || (!off && self.len >= CAPACITY - OFF_RESERVE) {
             self.stats.overflow += 1;
+            if off {
+                self.owed[(data[0] & 0x0f) as usize] |= 1u128 << (data[1] & 0x7f);
+            }
             return false;
         }
         // les messages arrivent presque toujours dans l'ordre : on cherche depuis la fin
@@ -98,7 +113,24 @@ impl Scheduler {
     /// Tous les messages qui tombent avant la fin de ce bloc ([t0, t0 + frames × per)), dans l'ordre : `emit` pour
     /// chacun. Un message en retard sort au debut du bloc (decalage 0) et son retard est compte.
     pub fn take_due(&mut self, t0: f64, per: f64, frames: usize, mut emit: impl FnMut(Out)) {
-        if frames == 0 || self.len == 0 {
+        if frames == 0 {
+            return;
+        }
+        // (relecture F9) les note off refuses faute de place, d'abord, pour les notes encore tenues
+        for ch in 0..16 {
+            // (deuxieme relecture) seuls les bits emis sortent de `owed` : une note pas encore jouee (son note on attend
+            // dans la reserve) garde son relachement du, joue au bloc qui suit son note on
+            let mut bits = self.owed[ch] & self.held[ch];
+            self.owed[ch] &= !self.held[ch];
+            while bits != 0 {
+                let key = bits.trailing_zeros() as u8;
+                bits &= bits - 1;
+                self.held[ch] &= !(1u128 << key);
+                self.stats.emitted += 1;
+                emit(Out { offset: 0, len: 3, data: [0x80 | ch as u8, key, 0], n: 0, t: t0, late_ms: 0.0 });
+            }
+        }
+        if self.len == 0 {
             return;
         }
         let end = t0 + frames as f64 * per;
@@ -131,6 +163,7 @@ impl Scheduler {
     /// notes tenues (des note off au debut du bloc).
     pub fn panic(&mut self, mut emit: impl FnMut(Out)) {
         self.len = 0;
+        self.owed = [0; 16];
         self.stats.panics += 1;
         for ch in 0..16 {
             let mut bits = self.held[ch];
@@ -156,6 +189,71 @@ impl Scheduler {
             0xb0 if p.data[1] == 120 || p.data[1] == 123 => self.held[ch] = 0,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod f9_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_reserve_still_takes_the_note_offs() {
+        let mut s = Scheduler::new();
+        let mut i = 0;
+        while s.insert(1000.0 + i as f64, i, 3, [0x90, 60, 100]) {
+            i += 1;
+        }
+        assert_eq!(s.len(), CAPACITY - OFF_RESERVE, "note ons stop before the reserve");
+        for k in 0..OFF_RESERVE as u32 {
+            assert!(s.insert(5000.0, k, 3, [0x80, 60, 0]), "a note off is refused");
+        }
+        assert!(!s.insert(5000.0, 0, 3, [0x80, 60, 0]), "a full reserve takes nothing");
+    }
+
+    #[test]
+    fn the_reserve_is_for_note_offs_only_and_a_refused_one_is_still_played() {
+        let mut s = Scheduler::new();
+        // une note jouee et tenue
+        assert!(s.insert(0.0, 0, 3, [0x90, 64, 100]));
+        s.take_due(0.0, 1.0, 1, |_| {});
+        assert_eq!(s.held_count(), 1);
+        // des CC remplissent tout ce qu'ils peuvent : la reserve leur est fermee
+        let mut i = 0;
+        while s.insert(1e6 + i as f64, i, 3, [0xb0, 1, 0]) {
+            i += 1;
+        }
+        assert_eq!(s.len(), CAPACITY - OFF_RESERVE, "CCs stop before the reserve");
+        for k in 0..OFF_RESERVE as u32 {
+            assert!(s.insert(2e6, k, 3, [0x90, 10, 0]), "a note off (0x90 velocity 0) is refused");
+        }
+        // pleine : le note off de la note tenue est refuse... mais du, et il sort au bloc suivant
+        assert!(!s.insert(10.0, 0, 3, [0x80, 64, 0]));
+        let mut out = Vec::new();
+        s.take_due(1.0, 1.0, 1, |o| out.push(o.data));
+        assert_eq!(out, vec![[0x80, 64, 0]], "the held note is released");
+        assert_eq!(s.held_count(), 0);
+    }
+
+    #[test]
+    fn a_refused_note_off_waits_for_its_note_on_still_to_come() {
+        let mut s = Scheduler::new();
+        // le note on de 64 attend dans le futur (t = 50)
+        assert!(s.insert(50.0, 0, 3, [0x90, 64, 100]));
+        let mut i = 0;
+        while s.insert(1e6 + i as f64, i, 3, [0x80, 1, 0]) {
+            i += 1;
+        }
+        // pleine : son note off est refuse, et du
+        assert!(!s.insert(60.0, 0, 3, [0x80, 64, 0]));
+        let mut out = Vec::new();
+        s.take_due(0.0, 1.0, 10, |o| out.push(o.data));
+        assert!(out.is_empty(), "nothing due yet: {out:?}");
+        // le note on joue (bloc 50..60), puis le note off du au bloc suivant
+        s.take_due(50.0, 1.0, 10, |o| out.push(o.data));
+        assert_eq!(out, vec![[0x90, 64, 100]]);
+        s.take_due(60.0, 1.0, 10, |o| out.push(o.data));
+        assert_eq!(out[1], [0x80, 64, 0], "the note is released after all");
+        assert_eq!(s.held_count(), 0);
     }
 }
 
@@ -222,10 +320,11 @@ mod tests {
     #[test]
     fn a_full_reserve_refuses_and_counts() {
         let mut s = Scheduler::new();
+        // (relecture F9) des note off : eux seuls entrent dans les dernieres places
         for i in 0..CAPACITY {
-            assert!(s.insert(5000.0 + i as f64, i as u32, 3, [0xb0, 1, 0]));
+            assert!(s.insert(5000.0 + i as f64, i as u32, 3, [0x80, 1, 0]));
         }
-        assert!(!s.insert(1.0, 0, 3, [0xb0, 1, 0]));
+        assert!(!s.insert(1.0, 0, 3, [0x80, 1, 0]));
         assert_eq!(s.stats.overflow, 1);
     }
 

@@ -53,8 +53,8 @@ pub fn trial() -> bool {
 /// Les options lues ici : main.rs (parse_args) les saute ; Some(true) : suivie d'une valeur.
 pub fn is_flag(a: &str) -> Option<bool> {
     match a {
-        "--sandbox" | "--ui-preview" | "--shot" | "--download" => Some(true),
-        "--app" | "--replace" | "--quiet" | "--wizard" | "--version" | "--smoke-test" | "--self-update" | "--show" | "--check-update" => Some(false),
+        "--sandbox" | "--ui-preview" | "--shot" | "--download" | "--verify-release" | "--release-tag" => Some(true),
+        "--app" | "--replace" | "--quiet" | "--wizard" | "--version" | "--smoke-test" | "--self-update" | "--show" | "--check-update" | "--update-keys" => Some(false),
         _ => None,
     }
 }
@@ -140,6 +140,17 @@ pub fn early(raw: &[String]) -> Early {
     // (11 nov., update.rs) l'exe telecharge et verifie par la fenetre d'etat d'une version d'avant : il s'installe
     if has("--check-update") {
         return Early::Exit(crate::update::console(value_of("--download").as_deref().map(Path::new)));
+    }
+    // (24 nov., audit E2) les fichiers d'une release, verifies hors ligne avec les cles de cette version (RELEASING.md)
+    if has("--verify-release") {
+        let (Some(dir), Some(tag)) = (value_of("--verify-release"), value_of("--release-tag")) else {
+            eprintln!("--verify-release needs a folder and --release-tag v<x>.<y>.<z>");
+            return Early::Exit(2);
+        };
+        return Early::Exit(crate::update::verify_release_console(Path::new(&dir), &tag));
+    }
+    if has("--update-keys") {
+        return Early::Exit(crate::update::update_keys_console());
     }
     if has(crate::update::SELF_UPDATE_FLAG) {
         return Early::Exit(self_update(has("--show")));

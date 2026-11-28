@@ -141,6 +141,9 @@ pub enum ClientMsg {
     Link { sysex: Option<Vec<String>>, stop: Option<bool> },
     /// (25 oct.) le diagnostic du chemin sans loopMIDI : l'entree de chaque piste de Live et ses Notes (ROUTES) → routes
     Routes,
+    /// (24 nov., audit M3) les codes du chemin MIDI des scripts que le compagnon a installes (uwl_secret.py) → midicodes
+    /// {codes}. Le studio appaire en a besoin pour prouver le code au script de FL (qui n'a que loopMIDI), sans le coller.
+    MidiCodes,
     /// (9 nov., audit F2) le studio se desappaire : le compagnon change de code (l'ancien ne marche plus), repond
     /// « unpaired », puis ferme toutes les connexions appairees avec l'ancien code (4403)
     Unpair,
@@ -182,6 +185,42 @@ pub const LINK_ARMED_ONLY: &[u8] = &[0x42, 0x44, 0x36];
 /// Au plus tant de morceaux du lien par seconde et par connexion (une rafale d'ADD figeait Live).
 pub const MAX_LINK_CHUNKS_PER_SEC: u32 = 64;
 
+/// (24 nov., relecture, probleme 9) BIND peut creer une piste d'aide dans Live sans armement : au plus MAX_LINK_BINDS
+/// par LINK_BIND_WINDOW, toutes connexions confondues (session.rs). Un vrai studio en envoie un par piste reliee (16 au
+/// plus) a chaque liste ou rechargement : 48, trois reliaisons completes.
+pub const LINK_BIND: u8 = 0x20;
+pub const MAX_LINK_BINDS: u32 = 48;
+pub const LINK_BIND_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Le nombre de BIND d'un message du lien.
+pub fn link_bind_count(chunks: &[String]) -> u32 {
+    chunks.iter().filter(|h| link_chunk_ok(h) && link_chunk_cmd(h) == Some(LINK_BIND)).count() as u32
+}
+
+/// Le compte des BIND sur la fenetre en cours. `take` dit si `n` BIND de plus passent (sinon, rien n'est compte).
+#[derive(Default)]
+pub struct BindBudget {
+    pub since: Option<std::time::Instant>,
+    pub n: u32,
+}
+
+impl BindBudget {
+    pub fn take(&mut self, now: std::time::Instant, n: u32) -> bool {
+        if self.since.is_none_or(|t| now.duration_since(t) >= LINK_BIND_WINDOW) {
+            self.since = Some(now);
+            self.n = 0;
+        }
+        if n == 0 {
+            return true;
+        }
+        if self.n.saturating_add(n) > MAX_LINK_BINDS {
+            return false;
+        }
+        self.n += n;
+        true
+    }
+}
+
 /// La commande d'un morceau du lien (deja verifie par `link_chunk_ok`) : l'octet qui suit F0 7D 55 57 <version>.
 pub fn link_chunk_cmd(h: &str) -> Option<u8> {
     h.get(10..12).and_then(|c| u8::from_str_radix(c, 16).ok())
@@ -191,10 +230,15 @@ pub fn link_chunk_cmd(h: &str) -> Option<u8> {
 /// 01 7F <req> 00 01 {"code":"unsupported","msg":…} F7), un par demande refusee, pour que le studio la rejette tout de
 /// suite avec ce texte (link.js), au lieu d'attendre sa reponse 20 s.
 pub fn link_refusals(chunks: &[String], msg: &str) -> Vec<String> {
+    link_refusals_of(chunks, LINK_ARMED_ONLY, msg)
+}
+
+/// (24 nov., probleme 9) La meme reponse pour les commandes `cmds` (BIND au-dela de sa limite).
+pub fn link_refusals_of(chunks: &[String], cmds: &[u8], msg: &str) -> Vec<String> {
     let mut reqs: Vec<u8> = Vec::new();
     for h in chunks.iter().filter(|h| link_chunk_ok(h)) {
         let (Some(cmd), Some(req)) = (link_chunk_cmd(h), h.get(12..14).and_then(|c| u8::from_str_radix(c, 16).ok())) else { continue };
-        if LINK_ARMED_ONLY.contains(&cmd) && req != 0 && !reqs.contains(&req) {
+        if cmds.contains(&cmd) && req != 0 && !reqs.contains(&req) {
             reqs.push(req);
         }
     }
@@ -484,6 +528,7 @@ mod tests {
         );
         assert!(parse(r#"{"type":"audio"}"#).is_err(), "an action is needed");
         assert_eq!(parse(r#"{"type":"instances"}"#), Ok(ClientMsg::Instances));
+        assert_eq!(parse(r#"{"type":"midicodes"}"#), Ok(ClientMsg::MidiCodes));
         assert_eq!(
             parse(r#"{"type":"midi","to":"00000000000000ab","events":[{"t":12.5,"d":[144,60,100],"n":3},{"d":[128,60,0]}]}"#),
             Ok(ClientMsg::Midi {
@@ -543,6 +588,17 @@ mod tests {
         assert!(link_needs_arming(&[chunk("10"), chunk("42")]), "an ADD in the message");
         assert!(link_needs_arming(&[chunk("44")]) && link_needs_arming(&[chunk("36")]));
         assert!(!link_needs_arming(&[chunk("10"), chunk("30"), chunk("50"), chunk("20")]), "LIST, SET, TEMPO, BIND");
+        // (24 nov., relecture, probleme 9) BIND : 48 par 10 s, toutes connexions confondues ; le refus dans le protocole du lien
+        let r = link_refusals_of(&[chunk("20"), chunk("10")], &[LINK_BIND], "too many");
+        assert_eq!((r.len(), &r[0][..18]), (1, "f07d5557017f010001"), "one ERROR, for the BIND's request");
+        assert_eq!(link_bind_count(&[chunk("20"), chunk("10"), chunk("20"), "f07d555701200100f7".into()]), 2, "a malformed one does not count");
+        let t = std::time::Instant::now();
+        let mut b = BindBudget::default();
+        assert!(b.take(t, 32) && b.take(t, 16), "48 pass");
+        assert!(!b.take(t + std::time::Duration::from_secs(9), 1), "the 49th within 10 s does not");
+        assert!(b.take(t, 0), "a message without BIND always passes");
+        assert!(b.take(t + LINK_BIND_WINDOW, 48), "a new window");
+        assert!(!b.take(t + LINK_BIND_WINDOW, 1));
         // (24 nov., relecture) le refus : un ERROR du protocole, par demande refusee (son numero), lisible par le studio
         let r = link_refusals(&[chunk("10"), chunk("42")], "needs \"Remote control\"");
         assert_eq!(r.len(), 1);

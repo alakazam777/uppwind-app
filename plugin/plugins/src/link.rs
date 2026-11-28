@@ -49,8 +49,16 @@ pub struct LinkInfo {
 
 /// Le port et le secret des plugins, ecrits par le compagnon (« pluginPort », « pluginSecret »). Jamais d'autre
 /// machine : l'adresse est toujours 127.0.0.1, quoi que dise le fichier.
+pub const MAX_STATE_FILE: u64 = 64 * 1024;
+
 pub fn read_link(path: &Path) -> Result<LinkInfo, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("no companion state file at {} ({e})", path.display()))?;
+    // (audit F9) au plus 64 Ko : ce fichier tient en quelques centaines d'octets, et ce code tourne dans le DAW
+    let mut raw = String::new();
+    {
+        use std::io::Read;
+        let f = std::fs::File::open(path).map_err(|e| format!("no companion state file at {} ({e})", path.display()))?;
+        f.take(MAX_STATE_FILE).read_to_string(&mut raw).map_err(|e| format!("cannot read the companion state file ({e})"))?;
+    }
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|_| "the companion state file is not JSON".to_string())?;
     // (29 oct.) le compagnon retire pluginPort quand il s'arrete proprement : son absence veut d'abord dire « arrete »
     let port = v["pluginPort"].as_u64().filter(|p| (1..=65535).contains(p)).ok_or_else(|| "no pluginPort in the companion state file: the companion is not running, or it is an older companion, or it runs with --no-plugins".to_string())?;
@@ -401,10 +409,17 @@ fn send(c: &mut Conn, out: &mut Vec<u8>) -> bool {
     ok
 }
 
-/// Lire ce qui est arrive (Notes : des EVENTS ; les deux : BYE). false : la connexion est finie.
-fn pump_in(c: &mut Conn, on_frame: &mut dyn FnMut(u8, &[u8]) -> bool) -> bool {
+/// (audit F9) Au plus tant de lectures par passage : un pair qui envoie sans arret ne retient pas le fil reseau, qui
+/// revient voir `stop` (le DAW qui retire le plugin attend ce fil).
+pub const PUMP_READS: usize = 16;
+
+/// Lire ce qui est arrive (Notes : des EVENTS ; les deux : BYE). false : la connexion est finie (ou le plugin part).
+fn pump_in(c: &mut Conn, stop: &AtomicBool, on_frame: &mut dyn FnMut(u8, &[u8]) -> bool) -> bool {
     let mut buf = [0u8; 16 * 1024];
-    loop {
+    for _ in 0..PUMP_READS {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
         match c.s.read(&mut buf) {
             Ok(0) => return false,
             Ok(n) => {
@@ -428,6 +443,7 @@ fn pump_in(c: &mut Conn, on_frame: &mut dyn FnMut(u8, &[u8]) -> bool) -> bool {
             Err(_) => return false,
         }
     }
+    true
 }
 
 fn run(sh: Arc<Shared>, mut io: Io) {
@@ -575,14 +591,20 @@ fn run(sh: Arc<Shared>, mut io: Io) {
                 }
                 let sh2 = &sh;
                 let off = offset;
-                alive = pump_in(c, &mut |t, body| match t {
+                alive = pump_in(c, &sh.stop, &mut |t, body| match t {
                     p::ty::EVENTS => {
                         if p::decode_events_into(body, &mut events).is_err() {
                             return false;
                         }
+                        let horizon = clock::now_ms() + crate::sched::MAX_AHEAD_MS;
                         for e in &events {
-                            // ms depuis 1970 → l'horloge du plugin
-                            if !ev.push(Wire { t: e.t_ms - off, n: e.n, len: e.len, data: e.data }) {
+                            // ms depuis 1970 → l'horloge du plugin ; (audit F9) trop loin dans le futur : refuse, compte
+                            let t = e.t_ms - off;
+                            if t > horizon {
+                                sh2.overflow.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            if !ev.push(Wire { t, n: e.n, len: e.len, data: e.data }) {
                                 sh2.overflow.fetch_add(1, Ordering::Relaxed);
                             }
                         }

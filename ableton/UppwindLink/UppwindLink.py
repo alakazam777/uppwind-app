@@ -87,9 +87,14 @@ except ImportError:
 
 from .link_core import LinkCore
 from .editor_core import EditorCore, EDITOR_VERSION
-from .editor_channel import LocalChannel
+from .editor_channel import LocalChannel, load_midi_secret
+from . import uwlink_protocol as _P
+try:
+    from . import uwl_secret as _companion_secret      # (24 nov.) ecrit par le compagnon a cote du script
+except Exception:
+    _companion_secret = None
 
-SCRIPT_VERSION = "1.3.2"  # (24 nov.) 1.3.2 : le canal local refuse un jeton non ASCII, son fichier ecrit par un temporaire neuf
+SCRIPT_VERSION = "1.4.0"  # (24 nov.) 1.4.0 : le chemin MIDI authentifie (code, uwl_secret.py) ; 1.3.3 : la file de sortie MIDI bornee ; 1.3.2 : le canal local refuse un jeton non ASCII
 TAG = "[Uppwind Link]"
 CHANNEL_PRIORITY = 2          # le vrai script sert le canal local avant le script de dev (priorite 1)
 LINK_TRANSPORT = 2            # (25 oct.) le fichier d'etat le dit au compagnon : LINK et ROUTES sont servis ici ;
@@ -115,8 +120,10 @@ class UppwindLinkSurface(_Base):
     def __init__(self, c_instance):
         _Base.__init__(self, c_instance)
         self._uw_c = c_instance
+        secret, secret_from = load_midi_secret(_P, log=self._uw_log, companion=_companion_secret)
         self._uw_core = LinkCore(song=self._uw_song, send=self._uw_send, log=self._uw_log, now=time.time,
-                             browser=self._uw_browser, version=self._uw_version)
+                             browser=self._uw_browser, version=self._uw_version, secret=secret,
+                             secret_from=secret_from, show=self._uw_show)
         # les fenetres des plugins (le compagnon) : a part, et jamais au prix du lien MIDI
         self._uw_editor = None
         self._uw_chan = None
@@ -138,6 +145,7 @@ class UppwindLinkSurface(_Base):
             self._uw_chan = None
         self._uw_start_fast()
         self._uw_log("v%s ready. Waiting for Uppwind Studio." % SCRIPT_VERSION)
+        self._uw_core.say_code(force=True)
 
     # -- (26 oct.) La lecture rapide du canal ------------------------------------------------------------------
     def _uw_start_fast(self):
@@ -206,6 +214,12 @@ class UppwindLinkSurface(_Base):
 
     def _uw_send(self, midi_bytes):
         self._uw_c.send_midi(midi_bytes)
+
+    def _uw_show(self, msg):
+        try:
+            self._uw_c.show_message(msg)
+        except Exception:
+            pass
 
     def _uw_log(self, msg):
         self._uw_log_raw("%s %s" % (TAG, msg))

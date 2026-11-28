@@ -15,4 +15,7 @@ rustflags = [
     "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
     # a reproducible build: no build time stamped into the exe
     "-C", "link-arg=/Brepro",
+    # (F11) Control Flow Guard: an indirect call may only land on a function the compiler listed, not anywhere an
+    # attacker wrote an address (the C runtime linked above is built with it too)
+    "-C", "control-flow-guard",
 ]

@@ -82,6 +82,7 @@ class World(object):
         self.docs = False
         self.editors = []        # (19 nov.) channels.showEditor : (index, valeur)
         self.hint = ""
+        self.hints = []          # (24 nov.) ui.setHintMsg : ce que le script a mis dans la barre d'aide
         self.in_sysex = False    # (19 nov.) vrai pendant le traitement d'un SysEx (showEditor y est interdit ici)
 
     def add(self, name, plugin=None, ctype=2, color=0x5F7581, vst=False, vol=0.78125, pan=0.0, muted=False, port=-2,
@@ -244,6 +245,7 @@ def make_modules(w):
     ui = types.ModuleType("ui")
     ui.getProgTitle = lambda: w.title
     ui.getHintMsg = lambda: w.hint     # (19 nov.) la barre d'aide : le dernier reglage touche
+    ui.setHintMsg = lambda m: w.hints.append(m)
     ui.getVersion = lambda mode=4: (2026, 1, 0, 5123)[mode] if mode < 4 else "Producer Edition v2026.1.0 [build 5123]"
     return {"channels": ch, "plugins": pl, "device": dev, "general": gen, "mixer": mx, "ui": ui, "midi": MIDI}
 
@@ -262,8 +264,16 @@ class Ev(object):
 class Rig(object):
     """Le script charge contre un faux FL, et un faux studio qui lui parle."""
 
-    def __init__(self, api=40, setup=None):
+    def __init__(self, api=40, setup=None, secret_code=None):
         self.w = World(api)
+        # (24 nov.) uwl_secret.py, comme si le compagnon l'avait ecrit a cote du script (None : pas de fichier)
+        sys.modules.pop("uwl_secret", None)
+        if secret_code is not None:
+            mod = types.ModuleType("uwl_secret")
+            mod.SECRET = secret_code
+            sys.modules["uwl_secret"] = mod
+        self.key = None
+        self.ctr = 0
         if setup:
             setup(self.w)
         else:
@@ -279,7 +289,19 @@ class Rig(object):
         self.s._now = lambda: self.w.t
         self.rx = P.Reassembler()
         self.req = 0
+        self.printed = []
+        self.s._log = lambda m: self.printed.append(m)
         self.s.OnInit()
+        sys.modules.pop("uwl_secret", None)
+
+    def chunks(self, cmd, req, data=None, signed=None):
+        """(24 nov.) les morceaux d'un message du studio : signe des que la session est ouverte (sauf HELLO, AUTH, ERROR)"""
+        if signed is None:
+            signed = self.key is not None and cmd not in (P.HELLO, P.AUTH, P.ERROR)
+        if signed:
+            self.ctr += 1
+            return P.encode_signed(cmd, req, data or {}, self.key, self.ctr)
+        return P.encode_message(cmd, req, data or {})
 
     def advance(self, seconds, idle=True):
         steps = max(1, int(round(seconds / 0.02)))
@@ -289,11 +311,11 @@ class Rig(object):
                 self.s.OnIdle()
             self.w.tick()
 
-    def send(self, cmd, data=None, req=None):
+    def send(self, cmd, data=None, req=None, signed=None):
         if req is None:
             self.req = P.next_req(self.req)
             req = self.req
-        for chunk in P.encode_message(cmd, req, data or {}):
+        for chunk in self.chunks(cmd, req, data, signed):
             ev = Ev(0xF0, sysex=chunk)
             self.w.in_sysex = True
             try:
@@ -328,10 +350,22 @@ class Rig(object):
         self.s.OnMidiMsg(ev)
         return ev
 
-    def hello(self):
-        cmd, req, data = self.ask(P.HELLO, {"v": 1, "app": "Uppwind Studio"})
-        assert cmd == P.HELLO_ACK
-        return data
+    def hello(self, caps=("auth",), code=None):
+        """(24 nov.) HELLO puis AUTH avec le code du script (code : un autre code, pour les essais) -> HELLO_ACK et
+        AUTH_ACK reunis (sans la preuve)"""
+        cmd, req, data = self.ask(P.HELLO, {"v": 1, "app": "Uppwind Studio", "caps": list(caps)})
+        assert cmd == P.HELLO_ACK and "project" not in data and "bpm" not in data, data
+        secret = P.secret_of(code) if code else self.s.S.secret
+        assert data["auth"]["kid"] == P.key_id(self.s.S.secret)
+        ns = P.new_nonce()
+        cmd, req, ack = self.ask(P.AUTH, {"n": ns, "p": P.studio_proof(secret, data["auth"]["n"], ns)})
+        assert cmd == P.AUTH_ACK, (cmd, ack)
+        assert P.proof_ok(ack["p"], P.daw_proof(secret, data["auth"]["n"], ns))
+        self.key = P.session_key(secret, data["auth"]["n"], ns)
+        self.ctr = 0
+        out = dict(data)
+        out.update(dict((k, v) for k, v in ack.items() if k != "p"))
+        return out
 
     def bind(self, slot, i):
         return self.ask(P.BIND, {"slot": slot, "id": i})
@@ -378,6 +412,7 @@ def params_lists_the_named_parameters_of_a_plugin_paged():
 @test
 def param_set_moves_the_plugin_parameter_without_pickup():
     r = params_rig()
+    r.bind(1, 1)
     r.send(P.PARAM_SET, {"id": 1, "p": 10, "v": 0.25}, req=0)
     r.replies()
     assert r.w.params == [(1, 10, 0.25)], r.w.params
@@ -385,6 +420,319 @@ def param_set_moves_the_plugin_parameter_without_pickup():
     out = r.replies()
     assert [c for c, q, d in out] == [P.ERROR], out
     assert r.w.params == [(1, 10, 0.25)], r.w.params
+
+
+@test
+def param_set_only_reaches_a_linked_or_watched_instrument():
+    # (24 nov., audit M3) un plugin du projet que le studio n'a ni lie ni suivi : refuse, rien ne bouge
+    def setup(w):
+        w.add("TAL", "TAL U-No-LX-V2", vst=True, pnames={10: "filter cutoff"})
+        w.add("Serum", "Serum", vst=True, pnames={3: "osc A level"})
+    r = Rig(setup=setup)
+    r.hello()
+    r.send(P.PARAM_SET, {"id": 1, "p": 3, "v": 0.5}, req=0)
+    out = r.replies()
+    assert [(c, d["code"]) for c, q, d in out] == [(P.ERROR, P.ERR_UNSUPPORTED)], out
+    assert r.w.params == [], r.w.params
+    # lie (BIND) : accepte ; l'autre plugin, toujours non
+    r.bind(2, 0)
+    r.send(P.PARAM_SET, {"id": 0, "p": 10, "v": 0.5}, req=0)
+    r.send(P.PARAM_SET, {"id": 1, "p": 3, "v": 0.5}, req=0)
+    r.replies()
+    assert r.w.params == [(0, 10, 0.5)], r.w.params
+    # suivi (PARAM_WATCH) : accepte
+    r.send(P.PARAM_WATCH, {"id": 1}, req=0)
+    r.send(P.PARAM_SET, {"id": 1, "p": 3, "v": 0.25}, req=0)
+    r.replies()
+    assert r.w.params[-1] == (1, 3, 0.25), r.w.params
+    # delie, plus suivi : de nouveau refuse
+    r.send(P.UNBIND, {"slot": 2}, req=0)
+    r.send(P.PARAM_WATCH, {}, req=0)
+    r.replies()
+    n = len(r.w.params)
+    r.send(P.PARAM_SET, {"id": 0, "p": 10, "v": 0.9}, req=0)
+    r.send(P.PARAM_SET, {"id": 1, "p": 3, "v": 0.9}, req=0)
+    r.replies()
+    assert len(r.w.params) == n, r.w.params
+
+
+# -- 24 nov. (1.5.0, audit M3) : le chemin MIDI authentifie -----------------------------------------------------
+def gain_vol(g):
+    import math
+    return math.log(10.0 * g + 1.0) / math.log(11.0)
+
+
+def attacker(r, cmd, data=None, req=7, signed_with=None, ctr=1):
+    """Un autre programme sur le port loopMIDI (ou une page avec « MIDI avec SysEx ») : il ne connait pas le secret."""
+    chunks = (P.encode_signed(cmd, req, data or {}, signed_with, ctr) if signed_with is not None
+              else P.encode_message(cmd, req, data or {}))
+    for chunk in chunks:
+        ev = Ev(0xF0, sysex=chunk)
+        r.s.OnMidiMsg(ev)
+        assert ev.handled
+    return [x for x in r.replies() if x[1] == req]
+
+
+@test
+def nothing_is_obeyed_without_the_code():
+    r = Rig()
+    for cmd, data in ((P.LIST, {}), (P.BIND, {"slot": 1, "id": 1}), (P.SET, {"id": 1, "vol": 0.0, "mute": True}),
+                      (P.PARAM_SET, {"id": 1, "p": 10, "v": 1}), (P.TEMPO, {"bpm": 60}), (P.PING, {"t": 1}),
+                      (P.EDITOR, {"id": 1, "open": True}), (P.PARAM_WATCH, {"id": 1})):
+        rep = attacker(r, cmd, data)
+        assert [(c, d["code"]) for c, q, d in rep] == [(P.ERROR, P.ERR_AUTH)], (P.command_name(cmd), rep)
+    r.advance(0.2)
+    assert not r.s.S.binds and r.w.params == [] and r.w.tempo == 140000 and r.s.S.editor is None
+    assert r.s.S.pw is None and not r.w.chans[1]["muted"]
+    # un mauvais code : AUTH refuse, pas de session ; le code est redit au Script output
+    r.advance(r.s.CODE_EVERY + 1, idle=False)                         # le code se redit au plus toutes les 20 s
+    n = len(r.printed)
+    _c, _q, d = r.ask(P.HELLO, {"v": 1, "caps": ["auth"]})
+    wrong = P.secret_of("AAAA-AAAA-AAAA-AAAA-AAAA-AAAA")
+    ns = P.new_nonce()
+    rep = attacker(r, P.AUTH, {"n": ns, "p": P.studio_proof(wrong, d["auth"]["n"], ns)}, req=8)
+    assert rep[0][0] == P.ERROR and rep[0][2]["code"] == P.ERR_AUTH and "Wrong MIDI link code" in rep[0][2]["msg"], rep
+    assert r.s.S.key is None and not r.s.S.session
+    # (relecture) la barre d'aide le redit ; le Script output ne l'a ecrit qu'une fois, au lancement
+    assert P.code_of(r.s.S.secret) in r.w.hints[-1], r.w.hints
+    assert len([m for m in r.printed if P.code_of(r.s.S.secret) in m]) == 1, r.printed
+    # l'offre ne vaut qu'une fois : rejouer un AUTH juste apres un echec ne marche pas non plus
+    good = P.studio_proof(r.s.S.secret, d["auth"]["n"], ns)
+    rep = attacker(r, P.AUTH, {"n": ns, "p": good}, req=9)
+    assert rep[0][2]["code"] == P.ERR_AUTH and r.s.S.key is None, rep
+
+
+@test
+def an_unproven_hello_never_breaks_the_session():
+    r = Rig()
+    r.hello()
+    r.bind(1, 1)
+    r.send(P.SET, {"id": 1, "vol": 0.5, "mute": True})
+    r.advance(0.5)
+    assert r.w.chans[1]["muted"] is True
+    # un HELLO d'un autre programme : un nonce, rien d'autre (avant le 24 nov. : tout etait delie et rendu)
+    rep = attacker(r, P.HELLO, {"v": 1, "caps": ["auth"]})
+    assert rep[0][0] == P.HELLO_ACK and "project" not in rep[0][2], rep
+    r.advance(0.5)
+    assert 1 in r.s.S.binds and r.w.chans[1]["muted"] is True
+    # le vrai studio continue avec sa cle
+    assert r.ask(P.PING, {"t": 5})[0] == P.PONG
+    # un AUTH faux sur cette offre : refuse, la session continue
+    ns = P.new_nonce()
+    attacker(r, P.AUTH, {"n": ns, "p": "0" * 64}, req=11)
+    assert r.ask(P.PING, {"t": 6})[0] == P.PONG and 1 in r.s.S.binds
+
+
+@test
+def signed_commands_cannot_be_replayed_forged_or_reused_by_another_session():
+    r = Rig()
+    r.hello()
+    r.bind(1, 1)
+    # une commande capturee sur le port, puis renvoyee : refusee (le compteur ne monte pas)
+    r.req = P.next_req(r.req)
+    captured = r.chunks(P.SET, 0, {"id": 1, "mute": True})
+    for c in captured:
+        r.s.OnMidiMsg(Ev(0xF0, sysex=c))
+    r.advance(0.5)
+    assert r.w.chans[1]["muted"] is True
+    r.send(P.SET, {"id": 1, "mute": False})
+    r.advance(0.5)
+    assert r.w.chans[1]["muted"] is False
+    for c in captured:
+        r.s.OnMidiMsg(Ev(0xF0, sysex=c))
+    r.advance(0.5)
+    assert r.w.chans[1]["muted"] is False, "replayed"
+    # une signature d'une autre cle, un compteur plus haut : refusee
+    rep = attacker(r, P.SET, {"id": 1, "mute": True}, signed_with=b"k" * 32, ctr=10 ** 6)
+    r.advance(0.5)
+    assert rep and rep[0][2]["code"] == P.ERR_AUTH and r.w.chans[1]["muted"] is False, rep
+    # un corps modifie : refuse
+    t = P.decode_chunks(r.chunks(P.SET, 0, {"id": 1, "mute": False})).get("text")
+    forged = t.replace('"mute":false', '"mute":true ')
+    for c in P._chunks(P.SET, 0, forged.encode("ascii")):
+        r.s.OnMidiMsg(Ev(0xF0, sysex=c))
+    r.advance(0.5)
+    assert r.w.chans[1]["muted"] is False, "forged"
+    # le studio rechargé : une nouvelle session, l'ancienne cle ne vaut plus rien
+    old_key, old_ctr = r.key, r.ctr
+    r.hello()
+    rep = attacker(r, P.PING, {"t": 1}, req=12, signed_with=old_key, ctr=old_ctr + 100)
+    assert rep[0][2]["code"] == P.ERR_AUTH, rep
+    # et le journal ne prend pas une ligne par refus
+    before = len(r.printed)
+    for i in range(50):
+        attacker(r, P.LIST, {}, req=13)
+    assert len([m for m in r.printed[before:] if "refused" in m]) <= 1, r.printed[before:]
+
+
+@test
+def an_old_studio_is_told_to_reload_and_an_offer_expires():
+    r = Rig()
+    _c, _q, d = r.ask(P.HELLO, {"v": 1, "app": "Uppwind Studio"})      # un studio d'avant le 24 nov. : pas de cap auth
+    assert d["auth"]["kid"] == P.key_id(r.s.S.secret)
+    assert any("reload its page" in m for m in r.printed), r.printed
+    rep = attacker(r, P.LIST, {}, req=20)
+    assert rep[0][2]["code"] == P.ERR_AUTH and "Reload Uppwind Studio" in rep[0][2]["msg"], rep
+    # une rafale de HELLO sans cap, d'ERROR et de mauvais AUTH : le journal ne grossit pas d'une ligne par message
+    before = len(r.printed)
+    for i in range(40):
+        attacker(r, P.HELLO, {"v": 1}, req=30)
+        attacker(r, P.ERROR, {"code": "x", "msg": "spam %d" % i}, req=0)
+        attacker(r, P.AUTH, {"n": "1" * 32, "p": "2" * 64}, req=31)
+    assert len(r.printed) - before <= 6, r.printed[before:]
+    # une offre de plus de 30 s ne vaut plus
+    _c, _q, d = r.ask(P.HELLO, {"v": 1, "caps": ["auth"]})
+    r.advance(P.AUTH_PENDING_MS / 1000.0 + 1, idle=False)
+    ns = P.new_nonce()
+    rep = attacker(r, P.AUTH, {"n": ns, "p": P.studio_proof(r.s.S.secret, d["auth"]["n"], ns)}, req=21)
+    assert rep[0][2]["code"] == P.ERR_AUTH and r.s.S.key is None, rep
+
+
+@test
+def the_code_comes_from_uwl_secret_py_or_is_drawn_at_start_and_shown():
+    # sans uwl_secret.py : un code tire au lancement, dit au Script output
+    a, b = Rig(), Rig()
+    assert a.s.S.secret_from == "session" and len(a.s.S.secret) == P.SECRET_BYTES and a.s.S.secret != b.s.S.secret
+    assert any(P.code_of(a.s.S.secret) in m and "paste it in Uppwind Studio" in m for m in a.printed), a.printed
+    # uwl_secret.py (le compagnon) : son code, et le studio qui le connait se connecte. (Relecture) Ce code ne
+    # s'affiche jamais, ni au Script output ni dans la barre d'aide : seulement son id
+    code = "MZXW-6YTB-OI2D-EMRT-GQ3D-KNZW"
+    r = Rig(secret_code=code)
+    assert r.s.S.secret_from == "companion" and r.s.S.secret == P.secret_of(code)
+    assert r.hello(code=code)["daw"] == "FL Studio"
+    flat = code.replace("-", "")
+    assert not [m for m in r.printed + r.w.hints if code in m or flat in m], (r.printed, r.w.hints)
+    assert any(r.s.S.kid in m and "companion" in m for m in r.printed), r.printed
+    # un uwl_secret.py abime : un code pour cette session, et on le dit
+    r = Rig(secret_code="not a code")
+    assert r.s.S.secret_from == "session" and any("no valid code" in m for m in r.printed), r.printed
+
+
+@test
+def a_new_session_keeps_the_mix_and_drops_only_what_the_studio_does_not_take_back():
+    # (24 nov., relecture, point 1) un AUTH juste sur une session ouverte (le studio qui se reconnecte, un autre
+    # onglet) : rien n'est rendu tout de suite ; les slots repris (BIND) restent, les autres tombent apres STALE_AFTER
+    r = Rig()
+    r.w.chans[1]["vol"] = 0.5
+    r.w.chans[2]["vol"] = 0.4
+    r.hello()
+    r.bind(1, 1)
+    r.bind(2, 2)
+    r.send(P.SET, {"id": 1, "vol": 0.9})
+    r.send(P.SET, {"id": 2, "vol": 0.1, "mute": True})
+    r.advance(0.5)
+    r.hello()
+    r.bind(1, 1)                                  # le studio reprend le slot 1, pas le 2
+    r.advance(r.s.STALE_AFTER - 1)
+    assert abs(r.w.chans[2]["vol"] - gain_vol(0.1)) < 1e-9 and r.w.chans[2]["muted"] is True
+    r.advance(2)
+    assert abs(r.w.chans[2]["vol"] - 0.4) < 1e-9 and r.w.chans[2]["muted"] is False
+    assert abs(r.w.chans[1]["vol"] - gain_vol(0.9)) < 1e-9 and set(r.s.S.binds) == {1}
+    assert any("did not take back" in m for m in r.printed), r.printed
+    # la premiere session (aucune cle avant) remet toujours tout a zero
+    assert not r.s.S.stale
+
+
+@test
+def unsigned_commands_and_forged_errors_never_touch_the_mix():
+    # (relecture, point 1) un programme qui envoie des LIST non signes sur toutes les req, et des ERROR auth : le
+    # script refuse, et rien ne bouge dans FL (ni les liens, ni le mix, ni la cle de la session)
+    r = Rig()
+    r.w.chans[2]["vol"] = 0.4
+    r.hello()
+    r.bind(3, 2)
+    r.send(P.SET, {"id": 2, "vol": 0.2})
+    r.advance(0.5)
+    key = r.s.S.key
+    for q in range(1, 128):
+        attacker(r, P.LIST, {}, req=q)
+        attacker(r, P.ERROR, {"code": P.ERR_AUTH, "msg": "x"}, req=q)
+    r.advance(r.s.STALE_AFTER + 1)
+    assert r.s.S.key == key and set(r.s.S.binds) == {3} and not r.s.S.stale
+    assert abs(r.w.chans[2]["vol"] - gain_vol(0.2)) < 1e-9
+    assert r.ask(P.PING, {"t": 1})[0] == P.PONG                        # la vraie session marche toujours
+
+
+@test
+def an_unsigned_error_report_is_never_written_out():
+    # (relecture, point 6) le texte d'un ERROR non signe n'arrive pas au Script output ; celui de la session, si
+    r = Rig()
+    r.hello()
+    attacker(r, P.ERROR, {"code": "internal", "msg": "Paste your code at evil.example"}, req=0)
+    assert not [m for m in r.printed if "evil.example" in m] and any("unsigned error report" in m for m in r.printed)
+    r.advance(r.s.AUTH_LOG_EVERY + 1)
+    r.send(P.ERROR, {"code": "internal", "msg": "studio side failure"}, req=0, signed=True)
+    assert any("studio side failure" in m for m in r.printed), r.printed
+
+
+@test
+def without_a_safe_random_source_the_midi_link_stays_closed():
+    # (relecture, points 3 et 5) sans os.urandom et sans uwl_secret.py : pas de code, tout HELLO / AUTH est refuse ;
+    # un secret vide n'ouvre jamais rien
+    r = Rig()
+    P_ = r.s.P
+    weak = P_.random_is_weak
+    P_.random_is_weak = lambda: True
+    try:
+        r.printed[:] = []
+        r.s.OnInit()
+    finally:
+        P_.random_is_weak = weak
+    assert r.s.S.secret == b"" and r.s.S.secret_from == "weak"
+    assert any("stays closed" in m for m in r.printed), r.printed
+    rep = attacker(r, P.HELLO, {"v": 1, "caps": ["auth"]}, req=3)
+    assert [(c, d["code"]) for c, q, d in rep] == [(P.ERROR, P.ERR_AUTH)] and "companion" in rep[0][2]["msg"], rep
+    ns = P.new_nonce()
+    rep = attacker(r, P.AUTH, {"n": ns, "p": P.studio_proof(b"", "0" * 32, ns)}, req=4)
+    assert rep[0][2]["code"] == P.ERR_AUTH and r.s.S.key is None, rep
+    # avec uwl_secret.py (le compagnon), le hasard faible ne ferme rien : le secret ne vient pas de lui
+    r = Rig(secret_code="MZXW-6YTB-OI2D-EMRT-GQ3D-KNZW")  # gitleaks:allow (a made-up test code)
+    assert r.hello(code="MZXW-6YTB-OI2D-EMRT-GQ3D-KNZW")["daw"] == "FL Studio"
+
+
+@test
+def the_code_shows_only_to_a_studio_that_can_ask_for_it():
+    # (relecture, point 2) un HELLO sans la cap 'auth' (un vieux studio, ou n'importe quel programme) ne met pas le
+    # code dans la barre d'aide
+    r = Rig()
+    r.advance(r.s.CODE_EVERY + 1)
+    n = len(r.w.hints)
+    attacker(r, P.HELLO, {"v": 1, "caps": []}, req=5)
+    assert len(r.w.hints) == n, r.w.hints
+    attacker(r, P.HELLO, {"v": 1, "caps": ["auth"]}, req=6)
+    assert len(r.w.hints) == n + 1 and P.code_of(r.s.S.secret) in r.w.hints[-1]
+
+
+@test
+def the_output_queue_is_bounded_under_a_burst_of_list():
+    # (24 nov., audit F3 des scripts) une rafale de LIST sans que FL ait le temps d'envoyer : la file s'arrete a OUT_MAX
+    # morceaux, chaque message y est entier ou absent, et le journal le dit sans une ligne par message
+    def setup(w):
+        for i in range(400):
+            w.add("Instrument number %03d with a long name" % i, "Some Very Long Plugin Name %d" % i, vst=True)
+    r = Rig(setup=setup)
+    r.hello()
+    r.replies()
+    printed = []
+    r.s._log = lambda m: printed.append(m)
+    burst = 0
+    while burst < 60:
+        r.req = P.next_req(r.req)
+        for chunk in r.chunks(P.LIST, r.req, {}):
+            r.s.OnMidiMsg(Ev(0xF0, sysex=chunk))
+        burst += 1
+        assert len(r.s.S.out) <= r.s.OUT_MAX, len(r.s.S.out)
+    dropped_lines = [m for m in printed if "dropped" in m]
+    assert len(dropped_lines) == 1, dropped_lines
+    # ce qui est parti puis reste en file se recolle en messages entiers (aucun morceau orphelin)
+    got = []
+    for _ in range(10):
+        got += r.replies()
+    assert got and all(c == P.LIST_REPLY for c, q, d in got), [c for c, q, d in got][:5]
+    assert not r.s.S.out, len(r.s.S.out)
+    # la file videe, le script repond de nouveau
+    cmd, req, d = r.ask(P.PING, {"t": 1})
+    assert cmd == P.PONG
 
 
 @test
@@ -476,7 +824,7 @@ def hello_ack_describes_fl_honestly():
     d = r.hello()
     assert d["daw"] == "FL Studio"
     assert d["project"] == "Night drive", d
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params"], d["caps"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params", "auth"], d["caps"]
     assert d["bpm"] == 140, d
     for cap in ("plugins", "add", "remove"):
         assert cap not in d["caps"]
@@ -627,15 +975,18 @@ def unbind_and_hello_restore_what_fl_had():
     assert r.w.notes[-1] == (2, 50, 0), r.w.notes                   # note relachee
     assert abs(r.w.chans[2]["vol"] - 0.6) < 1e-9 and r.w.chans[2]["pan"] == 0.3
     assert r.w.chans[2]["muted"] is False
-    # un nouveau HELLO (le studio rechargé) remet tout comme avant aussi
+    # (relecture) une nouvelle session (le studio recharge) : rien ne bouge tout de suite ; ce qu'il ne relie pas
+    # dans STALE_AFTER s retrouve ce que FL avait
     r.bind(4, 2)
     r.send(P.SET, {"id": 2, "vol": 0.2, "mute": True})
     r.advance(0.5)
     r.hello()
     r.advance(0.5)
+    assert abs(r.w.chans[2]["vol"] - gain_vol(0.2)) < 1e-9 and r.w.chans[2]["muted"] is True
+    r.advance(r.s.STALE_AFTER + 0.5)
     assert abs(r.w.chans[2]["vol"] - 0.6) < 1e-9 and r.w.chans[2]["muted"] is False
     r.midi(0x93, 50, 100)
-    assert r.w.notes[-1] == (2, 50, 0)                               # plus de lien apres HELLO
+    assert r.w.notes[-1] == (2, 50, 0)                               # plus de lien
 
 
 @test
@@ -814,12 +1165,12 @@ def ping_pong_and_foreign_or_looped_sysex():
     rep = r.replies()
     assert rep[0][0] == P.ERROR and rep[0][1] == 9 and rep[0][2]["code"] == "version", rep
     # OnSysEx apres OnMidiMsg pour le meme message : traite une fois
-    chunk = P.encode_message(P.PING, 20, {"t": 1})[0]
+    chunk = r.chunks(P.PING, 20, {"t": 1})[0]
     r.s.OnMidiMsg(Ev(0xF0, sysex=chunk))
     r.s.OnSysEx(Ev(0xF0, sysex=chunk))
     assert len(r.replies()) == 1
     # une version de FL qui ne passe le SysEx qu'a OnSysEx
-    chunk = P.encode_message(P.PING, 21, {"t": 2})[0]
+    chunk = r.chunks(P.PING, 21, {"t": 2})[0]
     ev = Ev(0xF0, sysex=chunk)
     r.s.OnSysEx(ev)
     assert ev.handled and r.replies()[0][:2] == (P.PONG, 21)
@@ -841,7 +1192,7 @@ def no_output_port_means_a_clear_hint_not_a_crash():
 def older_api_without_global_indexes_still_works():
     r = Rig(api=30)
     d = r.hello()
-    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params"]
+    assert d["caps"] == ["list", "bind", "set", "audition", "tempo", "notes", "editor", "params", "auth"]
     r.bind(1, 1)
     r.midi(0x90, 60, 100)
     assert r.w.notes == [(1, 60, 100)]
@@ -854,8 +1205,8 @@ def older_api_without_global_indexes_still_works():
 def tempo_rig(caps=("tempo",), docs=False):
     r = Rig()
     r.w.docs = docs
-    cmd, _req, d = r.ask(P.HELLO, {"v": 1, "app": "Uppwind Studio", "caps": list(caps)})
-    assert cmd == P.HELLO_ACK and d["bpm"] == 140, d
+    d = r.hello(caps=("auth",) + tuple(caps))
+    assert d["bpm"] == 140, d
     return r
 
 

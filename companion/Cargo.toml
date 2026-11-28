@@ -2,11 +2,11 @@
 # Copyright (C) 2026 Uppwind
 [package]
 name = "uppwind-companion"
-version = "0.4.15"
+version = "0.4.16"
 edition = "2021"
 description = "Uppwind Link companion: shows the windows of the plugins hosted in Ableton Live inside Uppwind Studio, plays them, and brings the DAW's sound back."
 license = "GPL-3.0-or-later"
-repository = "https://github.com/alakazam777/uppwind-app"
+repository = "https://github.com/kaonaya-studio/uppwind-app"
 publish = false
 
 # Peu de dependances, sous licences MIT, Apache-2.0, Unlicense et IJG (jpeg-encoder) : la liste complete, avec leurs
@@ -14,7 +14,8 @@ publish = false
 #   windows (Microsoft) : EnumWindows, Windows.Graphics.Capture, PrintWindow, Direct3D 11 ;
 #   tungstenite : le serveur WebSocket (synchrone, un fil par connexion) ;
 #   jpeg-encoder : les images (Rust pur) ;
-#   serde / serde_json : les messages ; getrandom : le jeton d'appairage (la meme version que tungstenite, 0.4).
+#   serde / serde_json : les messages ; getrandom : le jeton d'appairage (la meme version que tungstenite, 0.4) ;
+#   minisign-verify : la signature des mises a jour (update.rs).
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +27,9 @@ uwl-proto = { path = "../plugin/proto" }
 # (19 nov.) heberger les plugins VST3 sans DAW (host.rs ; les processus enfants --plug-host, --plug-scan) : le code
 # d'hote partage avec l'hote d'essai (plugin/host, crate vst3 MIT OR Apache-2.0)
 uwl-vst3host = { path = "../plugin/host" }
+# (24 nov., audit E2) la signature des mises a jour (update.rs) : SHA256SUMS signe au format minisign (Ed25519, cle
+# gardee hors ligne). Verification seulement, sans dependance, MIT (Frank Denis ; celle du module de mise a jour de Tauri)
+minisign-verify = "0.3"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

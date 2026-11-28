@@ -578,7 +578,7 @@ mod tests {
         assert!(matches!(s.on_request(Request::Update).last(), Some(Out::Run(Job::Update { show: true }))));
         assert!(matches!(s.on_request(Request::AutoUpdate(false))[0], Out::Run(Job::AutoUpdate(false))));
         assert!(matches!(s.on_request(Request::Window(WinAction::Minimize))[0], Out::Window(WinAction::Minimize)));
-        let rel = crate::update::Release { tag: "v9.0.0".into(), version: "9.0.0".into(), exe_size: 1, exe_sha256: None };
+        let rel = crate::update::Release { tag: "v9.0.0".into(), version: "9.0.0".into(), exe_size: 1, exe_sha256: None, urls: Default::default() };
         let out = s.on_done(Done::UpdateChecked { auto: false, result: Ok(crate::update::Check { release: rel, newer: true }) });
         assert_eq!(sends(&out)[0]["text"], "Uppwind Link 9.0.0 is available.");
         let out = s.on_done(Done::Updating(Err("bad sum".into())));

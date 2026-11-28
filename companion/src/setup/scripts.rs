@@ -11,7 +11,10 @@
 //!   - une version installee plus recente que celle de l'exe n'est pas remplacee (sauf --force) ;
 //!   - la User Library (Live) et le dossier de donnees (FL) doivent deja exister : `--setup` ne cree pas de
 //!     bibliotheque sur un disque debranche ;
-//!   - un fichier .uppwind-link-install.json dans le dossier installe dit quelle version le compagnon y a mise.
+//!   - un fichier .uppwind-link-install.json dans le dossier installe dit quelle version le compagnon y a mise ;
+//!   - (24 nov., audit M3) uwl_secret.py : le code du chemin MIDI de ce script (15 octets au hasard, 24 caracteres en
+//!     base 32), ecrit a l'installation et GARDE d'une mise a jour a l'autre ; le studio appaire le demande au compagnon
+//!     (midicodes). Le script l'importe : FL ne lui laisse ouvrir aucun fichier, mais il importe les modules voisins.
 
 use super::Mode;
 use serde::Serialize;
@@ -22,6 +25,90 @@ mod embedded {
 }
 
 pub const MARKER: &str = ".uppwind-link-install.json";
+/// (24 nov.) le code du chemin MIDI, a cote du script (uwlink_protocol.py : secret_of)
+pub const SECRET_FILE: &str = "uwl_secret.py";
+/// (24 nov., relecture) le temporaire de write_secret : cree prive, puis renomme a la place de SECRET_FILE
+pub const SECRET_TMP: &str = "uwl_secret.py.tmp";
+pub const SECRET_BYTES: usize = 15;
+const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// 15 octets → « ABCD-EFGH-IJKL-MNOP-QRST-UVWX » (le code_of de uwlink_protocol.py, octet pour octet)
+pub fn code_of(secret: &[u8; SECRET_BYTES]) -> String {
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut chars = String::with_capacity(24);
+    for &x in secret {
+        acc = (acc << 8) | x as u32;
+        bits += 8;
+        while bits >= 5 {
+            chars.push(B32[((acc >> (bits - 5)) & 31) as usize] as char);
+            bits -= 5;
+        }
+        acc &= (1 << bits) - 1;
+    }
+    chars.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
+}
+
+/// Un code (tirets, espaces, casse indifferents) → sa forme ecrite, ou None
+pub fn normalize_code(code: &str) -> Option<String> {
+    let t: String = code.chars().filter(|c| !matches!(c, '-' | ' ' | '\t')).map(|c| c.to_ascii_uppercase()).collect();
+    if t.len() != 24 || !t.bytes().all(|b| B32.contains(&b)) {
+        return None;
+    }
+    Some(t.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-"))
+}
+
+/// Le code d'un uwl_secret.py (la ligne SECRET = "…"), ou None
+pub fn parse_secret(src: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(src).ok()?;
+    let line = s.lines().find(|l| l.trim_start().starts_with("SECRET = \""))?;
+    let v = line.trim_start().strip_prefix("SECRET = \"")?;
+    normalize_code(&v[..v.find('"')?])
+}
+
+pub fn read_secret(dir: &Path) -> Option<String> {
+    std::fs::read(dir.join(SECRET_FILE)).ok().and_then(|b| parse_secret(&b))
+}
+
+pub fn new_code() -> Result<String, String> {
+    let mut b = [0u8; SECRET_BYTES];
+    getrandom::fill(&mut b).map_err(|e| format!("no system random source ({e})"))?;
+    Ok(code_of(&b))
+}
+
+/// Ecrit uwl_secret.py avec ce code. (24 nov., relecture) Par un temporaire cree neuf et deja prive (0600 sur un Mac :
+/// jamais un instant lisible par les autres comptes), puis renomme a la place de l'ancien (d'un coup : un echec ne perd
+/// pas le code d'avant). Sous Windows, aucun controle d'acces n'est pose : le fichier a ceux de son dossier (SECURITY.md).
+pub fn write_secret(dir: &Path, code: &str) -> Result<(), String> {
+    use std::io::Write;
+    let p = dir.join(SECRET_FILE);
+    let tmp = dir.join(SECRET_TMP);
+    let text = format!(
+        "# -*- coding: utf-8 -*-\n# Uppwind Link: the MIDI link code of this script, written by the Uppwind Link companion when it installed\n\
+         # the script. Uppwind Studio gets it from the companion it is paired with. Keep it private: whoever has it can\n\
+         # drive this script through the MIDI port. Delete this file to get a new code at the next install.\nSECRET = \"{code}\"\n"
+    );
+    let _ = std::fs::remove_file(&tmp);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let written = o.open(&tmp).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, &p)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot write {} ({e})", p.display()));
+    }
+    if read_secret(dir).as_deref() != Some(code) {
+        return Err(format!("{} does not read back as written", p.display()));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -187,7 +274,7 @@ pub fn inspect(b: &Bundle, dir: &Path, library: &Path) -> Target {
             .flatten()
             .filter(|e| e.path().is_file())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n != MARKER && !n.ends_with(".pyc") && !b.files.iter().any(|(f, _)| f == n))
+            .filter(|n| n != MARKER && n != SECRET_FILE && n != SECRET_TMP && !n.ends_with(".pyc") && !b.files.iter().any(|(f, _)| f == n))
             .collect();
         extra.sort();
         for n in extra {
@@ -236,11 +323,20 @@ pub fn plan(t: &mut Target, mode: Mode, force: bool, backups: &Path, stamp: &str
 }
 
 pub(crate) fn copy_dir(from: &Path, to: &Path) -> std::io::Result<u64> {
+    copy_dir_but(from, to, &[])
+}
+
+/// copy_dir sans ces fichiers du premier niveau. (24 nov., relecture) Les sauvegardes ne gardent pas uwl_secret.py : un
+/// code ne doit pas s'accumuler hors du dossier du script (apply le relit avant, et le remet).
+fn copy_dir_but(from: &Path, to: &Path, skip: &[&str]) -> std::io::Result<u64> {
     std::fs::create_dir_all(to)?;
     let mut n = 0;
     for e in std::fs::read_dir(from)? {
         let e = e?;
         let p = e.path();
+        if skip.iter().any(|s| e.file_name().to_str() == Some(*s)) {
+            continue;
+        }
         if e.file_type()?.is_dir() {
             n += copy_dir(&p, &to.join(e.file_name()))?;
         } else {
@@ -286,13 +382,21 @@ fn back_up_and_clear(dir: &Path, backup: &Path) -> Result<String, String> {
     if backup.exists() {
         return Err(format!("the backup folder {} already exists", backup.display()));
     }
-    let n = copy_dir(dir, backup).map_err(|e| format!("cannot copy {} to {} ({e})", dir.display(), backup.display()))?;
-    if count_files(backup) != count_files(dir) {
+    let skip = [SECRET_FILE, SECRET_TMP];
+    let n = copy_dir_but(dir, backup, &skip).map_err(|e| format!("cannot copy {} to {} ({e})", dir.display(), backup.display()))?;
+    let skipped = skip.iter().filter(|s| dir.join(s).is_file()).count() as u64;
+    if count_files(backup) + skipped != count_files(dir) {
         return Err(format!("the copy in {} is incomplete: nothing was changed", backup.display()));
     }
+    let code = read_secret(dir);
     if let Err(e) = std::fs::remove_dir_all(dir) {
-        // a moitie efface : on remet ce qui manque depuis la copie
+        // a moitie efface : on remet ce qui manque depuis la copie (et le code, que la copie n'a pas)
         let _ = copy_dir(backup, dir);
+        if let Some(c) = &code {
+            if read_secret(dir).as_deref() != Some(c.as_str()) {
+                let _ = write_secret(dir, c);
+            }
+        }
         return Err(format!("cannot remove {} ({e}); its files were put back from {}", dir.display(), backup.display()));
     }
     Ok(format!("copied {} ({n} file{}) to {}", dir.display(), if n == 1 { "" } else { "s" }, backup.display()))
@@ -326,7 +430,14 @@ pub fn apply(t: &Target) -> Result<Vec<String>, String> {
 /// `apply` avec un autre jeu de fichiers (les essais : une ecriture qui echoue).
 pub fn apply_with(t: &Target, b: &Bundle) -> Result<Vec<String>, String> {
     let mut did = Vec::new();
+    // (24 nov.) le code du chemin MIDI d'avant : garde (le studio le connait deja), jamais remplace par une mise a jour
+    let kept = read_secret(&t.dir);
     match t.action {
+        Action::None if t.status == Status::UpToDate && kept.is_none() => {
+            // un script a jour sans code (installe a la main, ou par un compagnon d'avant le 24 nov.) : on lui en donne un
+            write_secret(&t.dir, &new_code()?)?;
+            did.push(format!("gave {} its MIDI link code ({SECRET_FILE})", t.dir.display()));
+        }
         Action::None | Action::Skip => {}
         Action::Remove => {
             let bk = t.backup.as_ref().ok_or("no backup folder planned")?;
@@ -344,13 +455,24 @@ pub fn apply_with(t: &Target, b: &Bundle) -> Result<Vec<String>, String> {
                 let _ = std::fs::remove_dir_all(&t.dir);
                 let back = match &t.backup {
                     Some(bk) if bk.exists() => match copy_dir(bk, &t.dir) {
-                        Ok(_) => format!("; the previous folder was put back from {}", bk.display()),
+                        Ok(_) => {
+                            // (relecture) la sauvegarde n'a pas le code : on le remet
+                            if let Some(c) = &kept {
+                                let _ = write_secret(&t.dir, c);
+                            }
+                            format!("; the previous folder was put back from {}", bk.display())
+                        }
                         Err(e2) => format!("; putting the previous folder back failed too ({e2}): it is in {}", bk.display()),
                     },
                     _ => String::new(),
                 };
                 return Err(format!("{e}{back}"));
             }
+            let code = match &kept {
+                Some(c) => c.clone(),
+                None => new_code()?,
+            };
+            write_secret(&t.dir, &code)?;
             did.push(format!("{} {} {} in {}", if t.action == Action::Install { "installed" } else { "updated" }, b.folder, b.version(), t.dir.display()));
         }
     }
@@ -360,6 +482,40 @@ pub fn apply_with(t: &Target, b: &Bundle) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_midi_code_is_the_scripts_own_byte_for_byte() {
+        // les memes codes que link-protocol.js et uwlink_protocol.py (fixtures/auth.json)
+        let fix: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/auth.json")).unwrap();
+        let mut n = 0;
+        for c in fix["cases"].as_array().unwrap() {
+            match c["kind"].as_str().unwrap() {
+                "code" => {
+                    let hex = c["secret"].as_str().unwrap();
+                    let mut b = [0u8; SECRET_BYTES];
+                    for (i, x) in b.iter_mut().enumerate() {
+                        *x = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+                    }
+                    assert_eq!(code_of(&b), c["code"].as_str().unwrap());
+                    assert_eq!(normalize_code(&c["code"].as_str().unwrap().to_lowercase()).as_deref(), c["code"].as_str());
+                    n += 1;
+                }
+                "bad-code" => {
+                    if let Some(s) = c["code"].as_str() {
+                        assert_eq!(normalize_code(s), None, "{s}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(n >= 4);
+        let a = new_code().unwrap();
+        assert_ne!(a, new_code().unwrap());
+        assert_eq!(normalize_code(&a).as_deref(), Some(a.as_str()));
+        assert_eq!(parse_secret(b"# x\nSECRET = \"mzxw 6ytb-oi2d-emrt-gq3d-knzw\"\n").as_deref(), Some("MZXW-6YTB-OI2D-EMRT-GQ3D-KNZW"));
+        assert_eq!(parse_secret(b"SECRET = \"nope\"\n"), None);
+        assert_eq!(parse_secret(b"\xff\xfe"), None);
+    }
 
     #[test]
     fn the_scripts_are_embedded_with_their_version() {

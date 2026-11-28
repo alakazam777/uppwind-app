@@ -461,10 +461,10 @@
                 check('Update automatically', !!U.auto, (v) => send('autoupdate', { on: v }), {
                     disabled: !running || !U.supported || U.auto_available === false,
                     sub: !U.supported ? 'Updates from the app are for Windows: download the new version from its release page.'
-                        : U.auto_available === false ? 'Not available yet: updates are not signed yet, so an update is installed only when you click Update.'
+                        : U.auto_available === false ? 'Not available in this build: it knows no update signing key, so it cannot check an update.'
                         : 'Checks GitHub every 6 hours and installs a newer version by itself, while the studio is not connected. Off until you tick it.',
                 }),
-                h('p', { class: 'uw-small' }, 'Updates are the only time Uppwind Link itself goes on the internet, and only to its GitHub releases (github.com/alakazam777/uppwind-app). Show on Discord, when you turn it on, hands what you play to the Discord app on this computer, and Discord publishes it on your profile. Each download is checked against the SHA-256 published with the release before it is installed. The program is not code-signed yet, so the check proves the file is the one published there, not who published it.')));
+                h('p', { class: 'uw-small' }, 'Updates are the only time Uppwind Link itself goes on the internet, and only to its GitHub releases (github.com/kaonaya-studio/uppwind-app, asked for by the repository's number rather than its name, so a renamed account cannot send it elsewhere). Show on Discord, when you turn it on, hands what you play to the Discord app on this computer, and Discord publishes it on your profile. Before an update is even downloaded, its list of SHA-256 must carry the signature of Uppwind, made with a key kept offline (never on GitHub), for that very version; then the download must match that list. A release without that signature is refused.')));
         return [
             h('div', { class: 'uw-row uw-settings-head' }, h('h1', { class: 'uw-grow' }, 'Settings'), btn('Done', () => toggleSettings(false), 'uw-btn-sm uw-btn-primary')),
             h('p', { class: 'uw-lede' }, 'Only this window changes these settings: the studio cannot.'),

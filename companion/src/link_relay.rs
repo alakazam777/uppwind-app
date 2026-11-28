@@ -174,6 +174,8 @@ fn run(state: Option<PathBuf>, rx: Receiver<In>, wake: Sender<In>, tx: Sender<Li
     }
     let mut token = String::new();
     let mut port = 0u16;
+    // (relecture F6) le processus de Live qui a ecrit le fichier : revu avant chaque envoi du jeton
+    let mut writer: Option<crate::live::Writer> = None;
     let mut queue: Vec<String> = Vec::new();
     let mut dropped = 0u64;
     let mut retry_at = Instant::now();
@@ -255,9 +257,10 @@ fn run(state: Option<PathBuf>, rx: Receiver<In>, wake: Sender<In>, tx: Sender<Li
                 continue;
             }
             match crate::live::link_target_at(&path) {
-                Ok((p, t, level)) => {
+                Ok((p, t, level, w)) => {
                     port = p;
                     token = t;
+                    writer = w;
                     let mut s = lock(&shared);
                     s.target = Some(SocketAddr::from(([127, 0, 0, 1], p)));
                     s.level = level;
@@ -281,6 +284,28 @@ fn run(state: Option<PathBuf>, rx: Receiver<In>, wake: Sender<In>, tx: Sender<Li
                     continue;
                 }
             }
+        }
+        // (relecture F6) Live est-il toujours la ? Sinon, plus rien ne part (ni le jeton) : le port peut etre a un autre
+        if writer.as_ref().is_some_and(|w| !w.alive()) {
+            writer = None;
+            token.clear();
+            queue.clear();
+            retry_at = now + DOWN_RETRY;
+            let first = {
+                let mut s = lock(&shared);
+                s.pending.clear();
+                s.idle_busy = false;
+                s.more = false;
+                s.target = None;
+                let f = s.up != Some(false);
+                s.up = Some(false);
+                f
+            };
+            crate::log("link relay: Live's process is gone: nothing more is sent to its port");
+            if first && tx.send(LinkOut::Down(crate::live::GONE.to_string())).is_err() {
+                return;
+            }
+            continue;
         }
         let target = SocketAddr::from(([127, 0, 0, 1], port));
         // les commandes du studio : tout de suite, sans attendre le releve en route
@@ -435,6 +460,53 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         all
+    }
+
+    /// (relecture F6) Live meurt pendant une session de lien, un autre programme repond sur son port : apres la mort,
+    /// plus aucun paquet (ni le jeton) n'y part, et le studio recoit « down ».
+    #[test]
+    fn the_relay_stops_sending_when_live_dies() {
+        let path = temp_state("gone");
+        let mut live = if cfg!(windows) {
+            std::process::Command::new("PING.EXE").args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap()
+        } else {
+            std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap()
+        };
+        std::thread::sleep(Duration::from_millis(1100));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        std::fs::write(&path, json!({"port": port, "token": "t0k", "link": 1, "pid": live.id(), "started": now}).to_string()).unwrap();
+        let dead = Arc::new(AtomicBool::new(false));
+        let d = dead.clone();
+        let srv = std::thread::spawn(move || {
+            // l'imposteur repond a tout avec le bon numero : le relais ne voit jamais d'echec
+            let mut after = 0;
+            let mut buf = [0u8; 9000];
+            sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(3) {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+                let req: Value = serde_json::from_slice(&buf[..n]).unwrap();
+                if d.load(Ordering::SeqCst) {
+                    after += 1;
+                }
+                sock.send_to(json!({"id": req["id"], "ok": true, "out": [], "more": false}).to_string().as_bytes(), from).unwrap();
+            }
+            after
+        });
+        let r = Relay::start(Some(path.clone())).unwrap();
+        collect(&r, |a| a.contains(&LinkOut::Up));
+        live.kill().unwrap();
+        live.wait().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        dead.store(true, Ordering::SeqCst);
+        let _ = r.send(vec![HELLO.into()]);
+        let got = collect(&r, |a| a.iter().any(|o| matches!(o, LinkOut::Down(_))));
+        assert!(got.iter().any(|o| matches!(o, LinkOut::Down(e) if e.contains("gone"))), "{got:?}");
+        assert_eq!(srv.join().unwrap(), 0, "packets went to the port after Live died");
+        drop(r);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
